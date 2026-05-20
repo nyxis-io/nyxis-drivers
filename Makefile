@@ -1,9 +1,11 @@
 # Nyxis language drivers (MIT). Core compiler and conformance vectors: ../nyxis
 
-CORE ?= ../nyxis
-FIXTURE_DIR     ?= ../nyxis/bench/fixtures
+# Monorepo: ../nyxis sibling. Split-repo CI clones core to ./nyxis.
+CORE ?= $(if $(wildcard $(CURDIR)/nyxis/rust),nyxis,../nyxis)
+FIXTURE_DIR     ?= $(CORE)/bench/fixtures
 FIXTURE_COUNT   ?= 1000
-FIXTURE_OUT     := $(shell d="$(FIXTURE_DIR)"; mkdir -p "$$d" out/fixtures 2>/dev/null; \
+# CI exports FIXTURE_OUT; ?= keeps env override (plain := would ignore it).
+FIXTURE_OUT     ?= $(shell d="$(FIXTURE_DIR)"; mkdir -p "$$d" out/fixtures 2>/dev/null; \
 	if touch "$$d/.nxs_wprobe" 2>/dev/null; then rm -f "$$d/.nxs_wprobe"; printf '%s' "$$d"; \
 	elif touch out/fixtures/.nxs_wprobe 2>/dev/null; then rm -f out/fixtures/.nxs_wprobe; \
 	echo "nyxis: not writable: $$d — using out/fixtures" 1>&2; printf '%s' out/fixtures; \
@@ -72,11 +74,11 @@ fix-ruby:
 	rubocop ruby/nxs.rb ruby/test.rb ruby/bench.rb --config ruby/.rubocop.yml --no-color --cache false -A
 
 test-ruby:
-	ruby ruby/test.rb $(FIXTURE_OUT)
+	ruby ruby/test.rb $(abspath $(FIXTURE_OUT))
 
 test-ruby-ci: test-ruby
 	bash ruby/ext/build.sh
-	ruby ruby/bench_c.rb $(FIXTURE_OUT)
+	ruby ruby/bench_c.rb $(abspath $(FIXTURE_OUT))
 
 lint-php:
 	@command -v composer >/dev/null 2>&1 || { echo "Install Composer: https://getcomposer.org/" >&2; exit 1; }
@@ -86,14 +88,23 @@ lint-php:
 fix-php: lint-php
 
 test-php:
-	php php/test.php $(FIXTURE_OUT)
+	php php/test.php $(abspath $(FIXTURE_OUT))
 
 test-php-ci: test-php
 	bash php/nxs_ext/build.sh
-	php -d extension=php/nxs_ext/modules/nxs.so php/test.php $(FIXTURE_OUT)
+	php -d extension=php/nxs_ext/modules/nxs.so php/test.php $(abspath $(FIXTURE_OUT))
 
 lint-c:
-	@command -v cppcheck >/dev/null 2>&1 || brew install cppcheck
+	@command -v cppcheck >/dev/null 2>&1 || { \
+	  if command -v apt-get >/dev/null 2>&1; then \
+	    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+	    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cppcheck; \
+	  elif command -v brew >/dev/null 2>&1; then \
+	    brew install cppcheck; \
+	  else \
+	    echo "cppcheck required (apt install cppcheck or brew install cppcheck)" >&2; exit 1; \
+	  fi; \
+	}
 	cppcheck --error-exitcode=1 --suppress=missingIncludeSystem c/nxs.c c/nxs.h
 
 test-c:
