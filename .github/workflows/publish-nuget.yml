@@ -16,7 +16,7 @@ jobs:
 
       - uses: ./.github/actions/setup-core
         with:
-          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN || github.token }}
+          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN }}
 
       - uses: actions/setup-dotnet@v4
         with:

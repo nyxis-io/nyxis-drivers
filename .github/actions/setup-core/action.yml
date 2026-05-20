@@ -6,23 +6,29 @@ inputs:
     required: false
     default: '1000'
   token:
-    description: PAT with read access to nyxis-io/nyxis (defaults to github.token)
-    required: false
-    default: ${{ github.token }}
+    description: PAT with read access to private nyxis-io/nyxis
+    required: true
 runs:
   using: composite
   steps:
-    - name: Require cross-repo token for private nyxis core
+    - name: Verify token can access nyxis-io/nyxis
       shell: bash
+      env:
+        TOKEN: ${{ inputs.token }}
       run: |
-        if [ -z "${{ inputs.token }}" ]; then
-          echo "::error::Set repository secret NYXIS_CI_AUTOMATION_TOKEN (PAT with read access to nyxis-io/nyxis) for driver CI."
+        code=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer ${TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          https://api.github.com/repos/nyxis-io/nyxis)
+        if [ "$code" != "200" ]; then
+          echo "::error::NYXIS_CI_AUTOMATION_TOKEN cannot read nyxis-io/nyxis (HTTP ${code}). Use a classic PAT with repo scope or a fine-grained token with Contents:Read on both repos."
           exit 1
         fi
 
     - uses: actions/checkout@v4
       with:
         repository: nyxis-io/nyxis
+        ref: main
         path: nyxis
         token: ${{ inputs.token }}
 
