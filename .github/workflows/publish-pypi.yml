@@ -6,6 +6,10 @@ on:
     tags:
       - 'python/**'
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
@@ -26,28 +30,18 @@ jobs:
 
       - run: make test-py-ci
 
-      - name: Require PyPI token
-        env:
-          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          if [ -z "${PYPI_API_TOKEN}" ]; then
-            echo "::error::Add repository secret PYPI_API_TOKEN (PyPI API token for project nyxis)."
-            exit 1
-          fi
-
       - name: Install build tools
-        run: pip install build twine
+        run: pip install build
 
       - name: Build sdist and wheel
         working-directory: py
         run: python -m build
 
+      # Requires a PyPI trusted publisher for nyxis-io/nyxis-drivers (workflow: publish-pypi.yml).
       - name: Publish to PyPI
-        working-directory: py
-        run: twine upload dist/*
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: py/dist
 
       - name: Smoke test (install from registry)
         run: |

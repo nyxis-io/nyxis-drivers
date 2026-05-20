@@ -6,9 +6,15 @@ on:
     tags:
       - 'csharp/**'
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,25 +30,29 @@ jobs:
 
       - run: make test-csharp
         env:
-          FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
           DOTNET_FRAMEWORK: net9.0
 
       - name: Pack
         working-directory: csharp
         run: dotnet pack -c Release -p:NxsTargetFramework=net9.0 -o ./nupkg
 
-      - name: Require NuGet API key
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      - name: Require NuGet.org username
         run: |
-          if [ -z "${NUGET_API_KEY}" ]; then
-            echo "::error::Add repository secret NUGET_API_KEY (nuget.org API key)."
+          if [ -z "${{ vars.NUGET_USERNAME }}" ]; then
+            echo "::error::Set repository variable NUGET_USERNAME to your nuget.org account (trusted publishing owner)."
             exit 1
           fi
 
+      # Requires a NuGet.org trusted publisher for nyxis-io/nyxis-drivers (workflow: publish-nuget.yml).
+      - name: NuGet login (OIDC)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USERNAME }}
+
       - name: Publish to NuGet
         working-directory: csharp
-        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ steps.nuget-login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Smoke test (install from registry)
         run: |
