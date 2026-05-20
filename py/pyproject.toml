@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nyxis"
+version = "1.0.0"
+description = "Zero-copy reader for the Nyxis (NXS) binary format"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Micael Malta" }]
+requires-python = ">=3.10"
+keywords = ["nxs", "binary", "serialization", "zero-copy", "nyxis"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: System :: Archiving :: Compression",
+]
+
+[project.urls]
+Homepage = "https://github.com/nyxis-io/nyxis-drivers"
+Repository = "https://github.com/nyxis-io/nyxis-drivers"
+Documentation = "https://github.com/nyxis-io/nyxis/blob/main/SPEC.md"
+
+[tool.setuptools]
+# Flat layout: top-level modules (not a nxs/ package directory)
+py-modules = ["nxs", "nxs_writer"]
+
+[tool.setuptools.package-data]
+# Keys must be package/module names or "*"; empty string is invalid (setuptools validation).
+"*" = ["*.pyi"]

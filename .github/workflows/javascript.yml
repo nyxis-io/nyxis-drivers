@@ -1,0 +1,36 @@
+name: JavaScript
+
+on:
+  push:
+    branches: [main]
+    paths: ['js/**', 'Makefile', '.github/workflows/javascript.yml']
+    tags:
+      - 'js/**'
+  pull_request:
+    paths: ['js/**', 'Makefile', '.github/workflows/javascript.yml']
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: make lint-js
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-js-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-js

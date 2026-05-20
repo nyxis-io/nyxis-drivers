@@ -1,0 +1,64 @@
+name: Publish npm
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'js/**'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-publish-npm-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-js
+
+      - name: Require npm token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN}" ]; then
+            echo "::error::Add repository secret NPM_TOKEN — use a granular access token with Publish access for the nyxis package (CI cannot enter npm 2FA OTP). See https://docs.npmjs.com/about-two-factor-authentication"
+            exit 1
+          fi
+
+      - name: Publish
+        working-directory: js
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Smoke test (install from registry)
+        # Wait out npm's index propagation (can lag ~30-60s after publish).
+        run: |
+          mkdir /tmp/smoke-npm && cd /tmp/smoke-npm
+          npm init -y
+          for i in 1 2 3 4 5 6; do
+            if npm install nyxis; then
+              ok=1; break
+            fi
+            echo "registry not ready yet (attempt $i), sleeping 20s"
+            sleep 20
+          done
+          [ "${ok:-0}" = "1" ] || { echo '::error::npm install failed after retries'; exit 1; }
+          node -e "import('nyxis').then(m => { console.log('ok', Object.keys(m)) })"

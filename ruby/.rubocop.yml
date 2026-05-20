@@ -1,0 +1,57 @@
+AllCops:
+  NewCops: enable
+  TargetRubyVersion: 3.2
+  SuggestExtensions: false
+
+Layout/LineLength:
+  Max: 120
+
+# Binary wire parsers use short names and dense bit logic.
+Naming/MethodParameterName:
+  MinNameLength: 1
+Naming/VariableNumber:
+  Enabled: false
+
+Metrics/BlockLength:
+  Exclude:
+    - "test.rb"
+    - "bench.rb"
+
+Metrics/ClassLength:
+  Max: 220
+
+Metrics/MethodLength:
+  Max: 200
+
+Metrics/AbcSize:
+  Max: 200
+
+Metrics/CyclomaticComplexity:
+  Max: 25
+
+Metrics/PerceivedComplexity:
+  Max: 25
+
+Style/Documentation:
+  Enabled: false
+
+Style/FormatString:
+  Enabled: false
+
+Style/FormatStringToken:
+  Enabled: false
+
+Style/BitwisePredicate:
+  Enabled: false
+
+Lint/UselessConstantScoping:
+  Enabled: false
+
+Naming/BlockForwarding:
+  Enabled: false
+
+Style/ArgumentsForwarding:
+  Enabled: false
+
+Lint/AmbiguousOperatorPrecedence:
+  Enabled: false

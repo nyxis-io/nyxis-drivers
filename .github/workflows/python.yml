@@ -1,0 +1,37 @@
+name: Python
+
+on:
+  push:
+    branches: [main]
+    paths: ['py/**', 'Makefile', '.github/workflows/python.yml']
+    tags:
+      - 'python/**'
+  pull_request:
+    paths: ['py/**', 'Makefile', '.github/workflows/python.yml']
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - run: python -m pip install ruff
+      - run: make lint-py
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-py-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-py-ci

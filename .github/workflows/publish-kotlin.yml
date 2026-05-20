@@ -1,0 +1,74 @@
+name: Publish Kotlin (Maven Central)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'kotlin/**'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-publish-kotlin-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-kotlin
+
+      - name: Require Central Portal + signing secrets
+        env:
+          CENTRAL_USERNAME: ${{ secrets.CENTRAL_USERNAME }}
+          CENTRAL_PASSWORD: ${{ secrets.CENTRAL_PASSWORD }}
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          GPG_SIGNING_PASSWORD: ${{ secrets.GPG_SIGNING_PASSWORD }}
+        run: |
+          missing=
+          [ -z "${CENTRAL_USERNAME}" ] && missing="${missing} CENTRAL_USERNAME"
+          [ -z "${CENTRAL_PASSWORD}" ] && missing="${missing} CENTRAL_PASSWORD"
+          [ -z "${GPG_SIGNING_KEY}" ] && missing="${missing} GPG_SIGNING_KEY"
+          [ -z "${GPG_SIGNING_PASSWORD}" ] && missing="${missing} GPG_SIGNING_PASSWORD"
+          if [ -n "${missing}" ]; then
+            echo "::error::Add repository secrets:${missing} (Sonatype Central Portal user token + GPG). Generate at https://central.sonatype.com → View account → Generate User Token."
+            exit 1
+          fi
+
+      - name: Derive release version from tag
+        id: ver
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          case "${TAG}" in
+            kotlin/v*) V="${TAG#kotlin/v}" ;;
+            *)         V="${TAG#v}" ;;
+          esac
+          echo "RELEASE_VERSION=${V}" >> "$GITHUB_ENV"
+          echo "Resolved RELEASE_VERSION=${V}"
+
+      - name: Publish to Maven Central (Central Portal)
+        working-directory: kotlin
+        run: ./gradlew publishToMavenCentral --no-daemon --no-configuration-cache
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.GPG_SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.GPG_SIGNING_PASSWORD }}
+          RELEASE_VERSION: ${{ env.RELEASE_VERSION }}

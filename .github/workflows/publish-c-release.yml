@@ -1,0 +1,73 @@
+name: Publish C Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to build (e.g. c/v1.0.0)'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'c/**'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Build and test
+        working-directory: c
+        run: |
+          make
+          echo "C build succeeded"
+
+      - name: Create release tarball
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          case "${TAG}" in
+            c/v*) VERSION="${TAG#c/v}" ;;
+            *) VERSION="${TAG#v}" ;;
+          esac
+          TARDIR="nxs-c-${VERSION}"
+          mkdir "${TARDIR}"
+          cp c/nxs.h c/nxs.c c/CMakeLists.txt c/README.md "${TARDIR}/"
+          tar czf "nxs-c-${VERSION}.tar.gz" "${TARDIR}"
+          echo "TARBALL=nxs-c-${VERSION}.tar.gz" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          name: "NXS C library v${{ env.VERSION }}"
+          body: |
+            ## NXS C library v${{ env.VERSION }}
+
+            Single-header + single-source C library for reading NXB files.
+
+            ### Usage
+
+            ```bash
+            tar xzf nxs-c-${{ env.VERSION }}.tar.gz
+            gcc -o myapp myapp.c nxs-c-${{ env.VERSION }}/nxs.c -I nxs-c-${{ env.VERSION }}
+            ```
+
+            ### CMake
+
+            ```cmake
+            add_subdirectory(nxs-c-${{ env.VERSION }})
+            target_link_libraries(myapp PRIVATE nxs)
+            ```
+          files: ${{ env.TARBALL }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,6 @@
+<Project>
+  <!-- dotnet format does not accept -p:; CI sets DOTNET_FRAMEWORK=net9.0 in env. -->
+  <PropertyGroup>
+    <NxsTargetFramework Condition="'$(NxsTargetFramework)' == '' and '$(DOTNET_FRAMEWORK)' != ''">$(DOTNET_FRAMEWORK)</NxsTargetFramework>
+  </PropertyGroup>
+</Project>

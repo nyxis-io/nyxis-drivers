@@ -1,0 +1,34 @@
+{
+  "name": "nyxis",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "JavaScript reader for the Nyxis (NXS) binary format",
+  "main": "nxs.js",
+  "files": [
+    "nxs.js",
+    "nxs_writer.js",
+    "wasm.js",
+    "wasm/nxs_reducers.wasm"
+  ],
+  "exports": {
+    ".": "./nxs.js",
+    "./writer": "./nxs_writer.js",
+    "./wasm": "./wasm.js",
+    "./wasm/nxs_reducers.wasm": "./wasm/nxs_reducers.wasm"
+  },
+  "scripts": {
+    "test": "node test.js",
+    "lint": "eslint --max-warnings 0 nxs.js nxs_writer.js wasm.js test.js test_wasm.js"
+  },
+  "devDependencies": {
+    "eslint": "^9.15.0",
+    "globals": "^15.12.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nyxis-io/nyxis-drivers.git"
+  },
+  "license": "MIT",
+  "author": "Micael Malta",
+  "keywords": ["nxs", "binary", "serialization", "zero-copy", "nyxis"]
+}

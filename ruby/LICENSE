@@ -1,0 +1,53 @@
+Business Source License 1.1
+
+Licensor: Nyxis Authors
+
+Licensed Work: Nyxis, including all source code, documentation, examples,
+conformance vectors, tools, packages, and other files in this repository,
+unless a file states a different license.
+
+Additional Use Grant:
+
+You may use the Licensed Work in production free of charge only if the legal
+entity using the Licensed Work meets at least one of these conditions:
+
+1. The entity generates less than US$1,000,000 in annual gross revenue; or
+2. The entity processes less than 100 GB of data per calendar month using the
+   Licensed Work.
+
+If neither condition is true, production use is not granted under this license.
+Any production use by that entity is a license violation unless the entity has
+a separate commercial license from the Licensor.
+
+Non-production use, including development, testing, evaluation, benchmarking,
+research, and personal use, is permitted under the Business Source License 1.1.
+
+Change Date: 2030-05-20
+
+Change License: MIT License
+
+For information about alternative licensing or commercial terms, contact the
+Licensor.
+
+Terms
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited production
+use.
+
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensed Work will be licensed under the
+Change License, and the rights granted under this License will terminate.
+
+If your use of the Licensed Work does not comply with this License, you must
+cease use immediately. Your rights under this License terminate automatically if
+you violate this License.
+
+The Licensed Work is provided "as is", without warranty of any kind, express or
+implied, including but not limited to the warranties of merchantability, fitness
+for a particular purpose, and noninfringement. In no event will the Licensor be
+liable for any claim, damages, or other liability, whether in an action of
+contract, tort, or otherwise, arising from, out of, or in connection with the
+Licensed Work or the use or other dealings in the Licensed Work.

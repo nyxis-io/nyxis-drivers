@@ -1,0 +1,39 @@
+name: Kotlin
+
+on:
+  push:
+    branches: [main]
+    paths: ['kotlin/**', 'Makefile', '.github/workflows/kotlin.yml']
+    tags:
+      - 'kotlin/**'
+  pull_request:
+    paths: ['kotlin/**', 'Makefile', '.github/workflows/kotlin.yml']
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: make lint-kotlin
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-kotlin-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-kotlin

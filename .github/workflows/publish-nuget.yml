@@ -1,0 +1,72 @@
+name: Publish NuGet
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'csharp/**'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: rust-publish-nuget-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: rust-
+
+      - run: make fixtures FIXTURE_COUNT=1000
+      - run: make test-csharp
+        env:
+          DOTNET_FRAMEWORK: net9.0
+
+      - name: Pack
+        working-directory: csharp
+        run: dotnet pack -c Release -p:NxsTargetFramework=net9.0 -o ./nupkg
+
+      - name: Require NuGet API key
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          if [ -z "${NUGET_API_KEY}" ]; then
+            echo "::error::Add repository secret NUGET_API_KEY (nuget.org API key)."
+            exit 1
+          fi
+
+      - name: Publish to NuGet
+        working-directory: csharp
+        run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Smoke test (install from registry)
+        run: |
+          set +e
+          VERSION=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' csharp/nxs.csproj | head -1)
+          mkdir /tmp/smoke-nuget && cd /tmp/smoke-nuget
+          dotnet new console -n SmokeTest
+          cd SmokeTest
+          # NuGet.org v3 registration often lags 30s–minutes after push
+          for attempt in $(seq 1 36); do
+            dotnet add package nyxis --version "${VERSION}" >/dev/null 2>&1
+            if [ $? -eq 0 ]; then
+              echo "Smoke test: package installable (attempt ${attempt})"
+              exit 0
+            fi
+            echo "Waiting for NuGet index (attempt ${attempt}/36)..."
+            sleep 10
+          done
+          echo "::error::Nyxis ${VERSION} not yet visible on NuGet.org — indexing delay exceeded ~6 minutes"
+          exit 1
