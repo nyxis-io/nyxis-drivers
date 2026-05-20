@@ -9,7 +9,7 @@ on:
         type: string
   push:
     tags:
-      - 'c/**'
+      - 'c/v*'
 
 jobs:
   build-and-release:
