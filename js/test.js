@@ -234,7 +234,7 @@ test("stream reader rejects invalid object length", () => {
   const bad = new Uint8Array(bytes);
   let objOffset = -1;
   for (let i = 32; i + 4 <= bad.length; i++) {
-    if (bad[i] === 0x4F && bad[i + 1] === 0x53 && bad[i + 2] === 0x58 && bad[i + 3] === 0x4E) {
+    if (bad[i] === 0x4F && bad[i + 1] === 0x58 && bad[i + 2] === 0x59 && bad[i + 3] === 0x4E) {
       objOffset = i;
       break;
     }
