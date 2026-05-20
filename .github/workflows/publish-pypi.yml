@@ -17,6 +17,8 @@ jobs:
           ref: ${{ github.event.release.tag_name || github.ref }}
 
       - uses: ./.github/actions/setup-core
+        with:
+          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN || github.token }}
 
       - uses: actions/setup-python@v5
         with:

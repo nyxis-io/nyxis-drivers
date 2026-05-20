@@ -5,13 +5,26 @@ inputs:
     description: Number of records per fixture file
     required: false
     default: '1000'
+  token:
+    description: PAT with read access to nyxis-io/nyxis (defaults to github.token)
+    required: false
+    default: ${{ github.token }}
 runs:
   using: composite
   steps:
+    - name: Require cross-repo token for private nyxis core
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.token }}" ]; then
+          echo "::error::Set repository secret NYXIS_CI_AUTOMATION_TOKEN (PAT with read access to nyxis-io/nyxis) for driver CI."
+          exit 1
+        fi
+
     - uses: actions/checkout@v4
       with:
         repository: nyxis-io/nyxis
         path: nyxis
+        token: ${{ inputs.token }}
 
     - uses: dtolnay/rust-toolchain@stable
 

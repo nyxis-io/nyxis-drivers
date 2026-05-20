@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-core
+        with:
+          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN || github.token }}
 
       - uses: shivammathur/setup-php@v2
         with:
