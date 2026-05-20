@@ -14,7 +14,8 @@
     <Version>1.0.0</Version>
     <Authors>Micael Malta</Authors>
     <Description>Zero-copy reader for the Nyxis (NXS) binary format. Provides O(1) random access to typed records via the tail-index.</Description>
-    <PackageLicenseExpression>BUSL-1.1</PackageLicenseExpression>
+    <!-- NuGet rejects non-OSI expressions (e.g. BUSL); ship the full license text instead. -->
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageProjectUrl>https://github.com/nyxis-io/nyxis-drivers</PackageProjectUrl>
     <RepositoryUrl>https://github.com/nyxis-io/nyxis-drivers</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
@@ -25,5 +26,6 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" Condition="Exists('README.md')" />
+    <None Include="..\LICENSE" Pack="true" PackagePath="\" />
   </ItemGroup>
 </Project>
