@@ -14,23 +14,15 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
 
+      - uses: ./.github/actions/setup-core
+
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-publish-ruby-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-ruby
+        env:
+          FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
 
       - name: Require RubyGems API key
         env:

@@ -9,27 +9,19 @@ on:
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.release.tag_name || github.ref }}
 
+      - uses: ./.github/actions/setup-core
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-publish-pypi-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-py-ci
 
       - name: Require PyPI token

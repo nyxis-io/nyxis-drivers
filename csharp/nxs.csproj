@@ -15,8 +15,8 @@
     <Authors>Micael Malta</Authors>
     <Description>Zero-copy reader for the Nyxis (NXS) binary format. Provides O(1) random access to typed records via the tail-index.</Description>
     <PackageLicenseExpression>BUSL-1.1</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/nyxis/nyxis</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/nyxis/nyxis</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/nyxis-io/nyxis-drivers</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/nyxis-io/nyxis-drivers</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>nxs;binary;serialization;zero-copy;nyxis</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>

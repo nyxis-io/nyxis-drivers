@@ -12,8 +12,12 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-core
 
       - uses: actions/setup-java@v4
         with:
@@ -23,17 +27,4 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - run: make lint-kotlin
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-kotlin-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-kotlin

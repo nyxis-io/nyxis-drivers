@@ -12,23 +12,12 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
 
-      - run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - uses: ./.github/actions/setup-core
 
       - run: make lint-c
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-c-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-c

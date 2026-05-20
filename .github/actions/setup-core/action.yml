@@ -1,0 +1,28 @@
+name: Setup Nyxis core
+description: Check out nyxis-io/nyxis and generate bench/fixtures for driver CI
+inputs:
+  fixture_count:
+    description: Number of records per fixture file
+    required: false
+    default: '1000'
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: nyxis-io/nyxis
+        path: nyxis
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          nyxis/rust/target
+        key: rust-fixtures-${{ hashFiles('nyxis/rust/Cargo.lock') }}
+        restore-keys: rust-fixtures-
+
+    - run: make -C nyxis fixtures FIXTURE_COUNT=${{ inputs.fixture_count }}
+      shell: bash

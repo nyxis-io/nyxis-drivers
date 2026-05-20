@@ -12,25 +12,16 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-core
 
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.3'
 
       - run: make lint-php
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-php-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-php-ci

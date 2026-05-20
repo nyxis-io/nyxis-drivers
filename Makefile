@@ -24,6 +24,7 @@ fix: fix-js fix-py fix-go fix-ruby fix-php fix-c fix-swift fix-csharp
 test: test-js test-py test-go test-ruby test-php test-c test-swift test-kotlin test-csharp
 
 fixtures:
+	@test -d "$(CORE)/rust" || { echo "CORE=$(CORE) missing; clone nyxis-io/nyxis as sibling or set CORE=nyxis in CI" >&2; exit 1; }
 	$(MAKE) -C $(CORE) fixtures FIXTURE_DIR=$(abspath $(FIXTURE_DIR)) FIXTURE_COUNT=$(FIXTURE_COUNT)
 
 lint-js:
@@ -46,11 +47,11 @@ fix-py:
 	cd py && ruff check --select E,W,F --ignore E501,E701,E702 --fix .
 
 test-py:
-	cd py && python test_nxs.py ../$(FIXTURE_OUT)
+	cd py && python test_nxs.py $(abspath $(FIXTURE_OUT))
 
 test-py-ci: test-py
 	cd py && bash build_ext.sh
-	cd py && python test_c_ext.py ../$(FIXTURE_OUT)
+	cd py && python test_c_ext.py $(abspath $(FIXTURE_OUT))
 
 lint-go:
 	@cd go && { fmt=$$(gofmt -l .); [ -z "$$fmt" ] || { printf 'run gofmt -w on:\n%s\n' "$$fmt"; exit 1; }; }
@@ -96,7 +97,7 @@ lint-c:
 	cppcheck --error-exitcode=1 --suppress=missingIncludeSystem c/nxs.c c/nxs.h
 
 test-c:
-	cd c && make test -s && ./test ../$(FIXTURE_OUT)
+	cd c && make test -s && ./test $(abspath $(FIXTURE_OUT))
 
 lint-swift:
 	@command -v swiftlint >/dev/null 2>&1 || brew install swiftlint
@@ -107,13 +108,13 @@ fix-swift:
 	cd swift && swiftlint --fix --strict --cache-path .swiftlint-cache Sources/NXS
 
 test-swift:
-	cd swift && swift run nxs-test ../$(FIXTURE_OUT)
+	cd swift && swift run nxs-test $(abspath $(FIXTURE_OUT))
 
 lint-kotlin:
 	cd kotlin && JAVA_HOME=$(JAVA_HOME) PATH="$(JAVA_HOME)/bin:$$PATH" ./gradlew ktlintCheck -q
 
 test-kotlin:
-	cd kotlin && JAVA_HOME=$(JAVA_HOME) PATH=$(JAVA_HOME)/bin:$$PATH ./gradlew run --args="../$(FIXTURE_OUT)" -q
+	cd kotlin && JAVA_HOME=$(JAVA_HOME) PATH=$(JAVA_HOME)/bin:$$PATH ./gradlew run --args="$(abspath $(FIXTURE_OUT))" -q
 
 lint-csharp:
 	cd csharp && DOTNET_FRAMEWORK=$(DOTNET_FRAMEWORK) dotnet format nxs.csproj --verify-no-changes --severity warn
@@ -122,4 +123,4 @@ fix-csharp:
 	cd csharp && DOTNET_FRAMEWORK=$(DOTNET_FRAMEWORK) dotnet format nxs.csproj
 
 test-csharp:
-	cd csharp && dotnet run -p:NxsTargetFramework=$(DOTNET_FRAMEWORK) -- ../$(FIXTURE_OUT)
+	cd csharp && dotnet run -p:NxsTargetFramework=$(DOTNET_FRAMEWORK) -- $(abspath $(FIXTURE_OUT))

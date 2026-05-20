@@ -14,7 +14,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/micaelmalta/nyxis/go"
+	nxs "github.com/nyxis-io/nyxis-drivers/go"
 )
 
 type record struct {

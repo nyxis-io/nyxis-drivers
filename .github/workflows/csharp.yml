@@ -12,29 +12,17 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
+      DOTNET_FRAMEWORK: net9.0
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-core
 
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0'
 
       - run: make lint-csharp
-        env:
-          DOTNET_FRAMEWORK: net9.0
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-csharp-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-csharp
-        env:
-          DOTNET_FRAMEWORK: net9.0

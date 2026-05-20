@@ -12,22 +12,12 @@ on:
 jobs:
   ci:
     runs-on: macos-15
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
 
-      - run: brew install swiftlint 2>/dev/null || true
+      - uses: ./.github/actions/setup-core
+
       - run: make lint-swift
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: rust-swift-${{ hashFiles('rust/Cargo.lock') }}
-          restore-keys: rust-
-
-      - run: make fixtures FIXTURE_COUNT=1000
       - run: make test-swift
