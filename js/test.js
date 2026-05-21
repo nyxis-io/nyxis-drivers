@@ -446,6 +446,8 @@ test("columnar — null bitmap uses integer byte index (colGetF64)", async () =>
   assertClose(r.colGetF64("score", 0), 1, 1e-9, "row 0");
   assertClose(r.colGetF64("score", 7), 8, 1e-9, "row 7");
   assertEq(r.colGetF64("score", 19), 20, "row 19");
+  const sum = r.colSumF64("score");
+  assertClose(sum, 210, 1e-9, "dense col sum 1..20");
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);

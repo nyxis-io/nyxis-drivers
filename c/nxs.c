@@ -90,7 +90,7 @@ static int pax_find_page(const nxs_reader_t *r, uint32_t rec, int *local_idx) {
     if (r->page_count == 0) return -1;
     int lo = 0, hi = (int)r->page_count - 1;
     while (lo <= hi) {
-        int mid = (lo + hi) / 2;
+        int mid = lo + (hi - lo) / 2;
         uint64_t start = r->page_rec_start[mid];
         uint32_t count = r->page_rec_count[mid];
         if (rec < start) {
@@ -252,8 +252,10 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
             r->page_offset = calloc(r->page_count, sizeof(uint64_t));
             r->page_length = calloc(r->page_count, sizeof(uint32_t));
             if (!r->page_index || !r->page_rec_start || !r->page_rec_count ||
-                !r->page_offset || !r->page_length)
+                !r->page_offset || !r->page_length) {
+                pax_free_pages(r);
                 return NXS_ERR_ALLOC;
+            }
             for (uint32_t i = 0; i < r->page_count; i++) {
                 size_t e = r->tail_start + (size_t)i * PAX_TAIL_ENTRY_BYTES;
                 if (e + PAX_TAIL_ENTRY_BYTES > size) return NXS_ERR_OUT_OF_BOUNDS;
@@ -656,24 +658,15 @@ const void* nxs_page_col_buffer(nxs_page_t *page, const char *field, size_t *out
     if (poff + 24 > r->size) return NULL;
     if (rd_u32(r->data + poff) != MAGIC_PAGE) return NULL;
     uint16_t fc = rd_u16(r->data + poff + 20);
-    size_t body = poff + 24;
-    for (int fi = 0; fi < (int)fc && fi < slot; fi++) {
-        uint64_t blen = r->col_buf_len[fi];
-        if (blen == 0) {
-            uint32_t rc = r->page_rec_count[pi];
-            size_t bm = null_bitmap_bytes(rc);
-            body += bm + (size_t)rc * 8u;
-        } else {
-            body += (size_t)blen;
-        }
-    }
-    /* walk columns inside page */
+    if (slot < 0 || slot >= (int)fc) return NULL;
     uint32_t rc = r->page_rec_count[pi];
+    size_t body = poff + 24;
     for (int fi = 0; fi < slot; fi++) {
         size_t bm = null_bitmap_bytes(rc);
         body += bm + (size_t)rc * 8u;
     }
     size_t bm = null_bitmap_bytes(rc);
+    if (body + bm + (size_t)rc * 8u > r->size) return NULL;
     *out_len = (size_t)rc * 8u;
     return r->data + body + bm;
 }

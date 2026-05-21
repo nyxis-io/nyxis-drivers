@@ -34,26 +34,26 @@ const (
 // Reader parses the preamble, schema, and tail-index of a .nxb buffer.
 // The data sector is not walked — records load lazily via Record(i).
 type Reader struct {
-	data        []byte
-	Version     uint16
-	Flags       uint16
-	DictHash    uint64
-	TailPtr     uint64
-	Keys        []string
-	KeySigils   []byte
-	keyIndex    map[string]int
-	recordCount uint32
-	tailStart   int
-	layout      Layout
-	colBufOff   []uint64
-	colBufLen   []uint64
-	pageCount   uint32
+	data         []byte
+	Version      uint16
+	Flags        uint16
+	DictHash     uint64
+	TailPtr      uint64
+	Keys         []string
+	KeySigils    []byte
+	keyIndex     map[string]int
+	recordCount  uint32
+	tailStart    int
+	layout       Layout
+	colBufOff    []uint64
+	colBufLen    []uint64
+	pageCount    uint32
 	pageSizeHint uint32
-	pageIndex   []uint32
+	pageIndex    []uint32
 	pageRecStart []uint64
 	pageRecCount []uint32
-	pageOffset  []uint64
-	pageLength  []uint32
+	pageOffset   []uint64
+	pageLength   []uint32
 }
 
 // NewReader validates the file header and extracts the schema and tail-index
@@ -189,7 +189,7 @@ type Object struct {
 	reader           *Reader
 	offset           int
 	recordIndex      uint32 // columnar/PAX record index
-	stage            int // 0=untouched, 1=bitmask located, 2=rank cached
+	stage            int    // 0=untouched, 1=bitmask located, 2=rank cached
 	bitmaskStart     int
 	offsetTableStart int
 	// Stage 2 caches:

@@ -400,12 +400,12 @@ export class NxsReader {
   _sumF64DenseColumn(values, n) {
     let i = 0;
     let a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-    const end16 = n - (n % 16);
-    for (; i < end16; i += 16) {
+    const end4 = n - (n % 4);
+    for (; i < end4; i += 4) {
       a0 += rdF64(values, i * 8);
-      a1 += rdF64(values, (i + 4) * 8);
-      a2 += rdF64(values, (i + 8) * 8);
-      a3 += rdF64(values, (i + 12) * 8);
+      a1 += rdF64(values, (i + 1) * 8);
+      a2 += rdF64(values, (i + 2) * 8);
+      a3 += rdF64(values, (i + 3) * 8);
     }
     let sum = a0 + a1 + a2 + a3;
     for (; i < n; i++) sum += rdF64(values, i * 8);

@@ -16,6 +16,7 @@ const (
 	footerPaxBytes = 28
 
 	colTailEntryBytes = 20
+	paxTailEntryBytes = 28
 )
 
 // Layout identifies the data-sector organization.
@@ -97,8 +98,8 @@ func (r *Reader) parsePAXFooter() error {
 		r.pageOffset = make([]uint64, r.pageCount)
 		r.pageLength = make([]uint32, r.pageCount)
 		for i := uint32(0); i < r.pageCount; i++ {
-			e := r.tailStart + int(i)*28
-			if e+28 > len(r.data) {
+			e := r.tailStart + int(i)*paxTailEntryBytes
+			if e+paxTailEntryBytes > len(r.data) {
 				return fmt.Errorf("ERR_OUT_OF_BOUNDS: PAX tail entry")
 			}
 			r.pageIndex[i] = binary.LittleEndian.Uint32(r.data[e:])
