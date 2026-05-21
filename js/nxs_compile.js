@@ -2,7 +2,7 @@
  * In-browser `.nxs` → `.nxb` compile (WASM) and fetch helper for DevTools-friendly
  * text/plain loads. Build WASM via: bash build_compile_wasm.sh
  */
-import init, { compile_nxs } from "./nxs_compile_wasm.js";
+import init, { compile_nxs, compile_nxs_columnar } from "./nxs_compile_wasm.js";
 import { NxsReader } from "./nxs.js";
 
 let wasmReady = null;
@@ -22,6 +22,19 @@ function ensureWasm() {
 export async function compileNxsText(source) {
   await ensureWasm();
   return compile_nxs(source);
+}
+
+/**
+ * Compile record blocks as columnar `.nxb` (layout forced; omit `@layout` pragma).
+ * @param {string} source
+ * @returns {Promise<Uint8Array>}
+ */
+export async function compileNxsColumnar(source) {
+  await ensureWasm();
+  if (typeof compile_nxs_columnar === "function") {
+    return compile_nxs_columnar(source);
+  }
+  return compile_nxs(`@layout columnar\n${source}`);
 }
 
 /**

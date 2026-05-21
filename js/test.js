@@ -419,5 +419,36 @@ test("Query combinators — or/not work correctly", () => {
   assertEq(ltCount + gtCount + eqCount, 1000, "lt + gt + eq = total");
 });
 
+test("columnar layout — colSumF64 and colBuffer (conformance vector)", () => {
+  const colPath = join(fixtureDir, "../../conformance/columnar_flat8_dense_100.nxb");
+  const alt = join(fixtureDir, "../conformance/columnar_flat8_dense_100.nxb");
+  const path = existsSync(colPath) ? colPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const r = new NxsReader(readFileSync(path));
+  assertEq(r.layout, "columnar", "layout");
+  assertEq(r.recordCount, 100, "record count");
+  const sum = r.colSumF64("score");
+  assertClose(sum, 747, 1e-6, "col sum score");
+  const { values, count } = r.colBuffer("score");
+  assertEq(count, 100, "buffer count");
+  assertEq(values.length, 800, "value bytes");
+});
+
+test("columnar — null bitmap uses integer byte index (colGetF64)", async () => {
+  const wasmPath = join(fixtureDir, "nxs_compile_wasm_bg.wasm");
+  if (!existsSync(wasmPath)) return;
+  const { default: init, compile_nxs_columnar } = await import("./nxs_compile_wasm.js");
+  await init(readFileSync(wasmPath));
+  const lines = [];
+  for (let i = 0; i < 20; i++) lines.push(`r${i} { score: ~${i + 1} }`);
+  const bytes = await compile_nxs_columnar(lines.join("\n"));
+  const r = new NxsReader(bytes);
+  assertClose(r.colGetF64("score", 0), 1, 1e-9, "row 0");
+  assertClose(r.colGetF64("score", 7), 8, 1e-9, "row 7");
+  assertEq(r.colGetF64("score", 19), 20, "row 19");
+  const sum = r.colSumF64("score");
+  assertClose(sum, 210, 1e-9, "dense col sum 1..20");
+});
+
 console.log(`\n${passed} passed, ${failed} failed\n`);
 process.exit(failed > 0 ? 1 : 0);

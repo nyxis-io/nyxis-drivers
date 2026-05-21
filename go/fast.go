@@ -143,6 +143,12 @@ func f64(b []byte, off int) float64 {
 // has a uniform schema. If uniformity does not hold, the result is undefined
 // (field values from other slots may be summed). Use SumF64 for the safe path.
 func (r *Reader) SumF64Fast(key string) float64 {
+	if r.layout == LayoutColumnar {
+		return r.colSumF64Dense(key)
+	}
+	if r.layout == LayoutPAX {
+		return r.ColSumF64(key)
+	}
 	slot, ok := r.keyIndex[key]
 	if !ok {
 		panic("nxs: key not in schema")

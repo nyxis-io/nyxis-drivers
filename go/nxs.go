@@ -27,21 +27,33 @@ const (
 	flagSchemaEmbedded uint16 = 0x0002
 )
 
+// Layout values are defined in col.go (LayoutRow, LayoutColumnar, LayoutPAX).
+
 // ── Reader ───────────────────────────────────────────────────────────────────
 
 // Reader parses the preamble, schema, and tail-index of a .nxb buffer.
 // The data sector is not walked — records load lazily via Record(i).
 type Reader struct {
-	data        []byte
-	Version     uint16
-	Flags       uint16
-	DictHash    uint64
-	TailPtr     uint64
-	Keys        []string
-	KeySigils   []byte
-	keyIndex    map[string]int
-	recordCount uint32
-	tailStart   int
+	data         []byte
+	Version      uint16
+	Flags        uint16
+	DictHash     uint64
+	TailPtr      uint64
+	Keys         []string
+	KeySigils    []byte
+	keyIndex     map[string]int
+	recordCount  uint32
+	tailStart    int
+	layout       Layout
+	colBufOff    []uint64
+	colBufLen    []uint64
+	pageCount    uint32
+	pageSizeHint uint32
+	pageIndex    []uint32
+	pageRecStart []uint64
+	pageRecCount []uint32
+	pageOffset   []uint64
+	pageLength   []uint32
 }
 
 // NewReader validates the file header and extracts the schema and tail-index
@@ -64,13 +76,6 @@ func NewReader(data []byte) (*Reader, error) {
 		DictHash: binary.LittleEndian.Uint64(data[8:16]),
 		TailPtr:  binary.LittleEndian.Uint64(data[16:24]),
 	}
-	if r.TailPtr == 0 {
-		if len(data) < 44 {
-			return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: streamable footer")
-		}
-		r.TailPtr = binary.LittleEndian.Uint64(data[len(data)-12 : len(data)-4])
-	}
-
 	// Schema
 	if r.Flags&flagSchemaEmbedded != 0 {
 		schemaEnd, err := r.readSchema(32)
@@ -82,12 +87,9 @@ func NewReader(data []byte) (*Reader, error) {
 		}
 	}
 
-	// Tail-index
-	if int(r.TailPtr)+4 > len(data) {
-		return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: tail index")
+	if err := r.parseLayoutTail(); err != nil {
+		return nil, err
 	}
-	r.recordCount = binary.LittleEndian.Uint32(data[r.TailPtr : r.TailPtr+4])
-	r.tailStart = int(r.TailPtr) + 4
 	return r, nil
 }
 
@@ -173,7 +175,9 @@ func (r *Reader) Record(i int) *Object {
 	if i < 0 || i >= int(r.recordCount) {
 		panic(fmt.Sprintf("nxs: record %d out of [0, %d)", i, r.recordCount))
 	}
-	// Each tail-index entry: u16 keyId + u64 offset = 10 bytes
+	if r.layout != LayoutRow {
+		return &Object{reader: r, offset: i, recordIndex: uint32(i)}
+	}
 	abs := binary.LittleEndian.Uint64(r.data[r.tailStart+i*10+2 : r.tailStart+i*10+10])
 	return &Object{reader: r, offset: int(abs)}
 }
@@ -184,7 +188,8 @@ func (r *Reader) Record(i int) *Object {
 type Object struct {
 	reader           *Reader
 	offset           int
-	stage            int // 0=untouched, 1=bitmask located, 2=rank cached
+	recordIndex      uint32 // columnar/PAX record index
+	stage            int    // 0=untouched, 1=bitmask located, 2=rank cached
 	bitmaskStart     int
 	offsetTableStart int
 	// Stage 2 caches:
@@ -373,6 +378,21 @@ func (o *Object) GetI64BySlot(slot int) (int64, bool) {
 }
 
 func (o *Object) GetF64BySlot(slot int) (float64, bool) {
+	if o.reader.layout != LayoutRow {
+		bm, vals, err := o.reader.colFieldParts(slot)
+		if err != nil {
+			return 0, false
+		}
+		ri := o.recordIndex
+		if !colBit(bm, ri) {
+			return 0, false
+		}
+		off := int(ri) * 8
+		if off+8 > len(vals) {
+			return 0, false
+		}
+		return math.Float64frombits(binary.LittleEndian.Uint64(vals[off : off+8])), true
+	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
 		return 0, false
@@ -445,6 +465,9 @@ func scanOffset(data []byte, objOffset, slot int) int {
 // SumF64 returns the sum of the f64 field `key` across every top-level record.
 // Allocation-free hot loop.
 func (r *Reader) SumF64(key string) float64 {
+	if r.layout != LayoutRow {
+		return r.ColSumF64(key)
+	}
 	slot, ok := r.keyIndex[key]
 	if !ok {
 		panic("nxs: key not in schema")

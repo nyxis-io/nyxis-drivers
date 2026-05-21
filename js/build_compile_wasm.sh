@@ -11,7 +11,10 @@ fi
 
 cargo build --release --target wasm32-unknown-unknown --features wasm --lib -p nyxis
 
-WASM_BIN="$ROOT/nyxis/rust/target/wasm32-unknown-unknown/release/nxs.wasm"
+WASM_BIN="$ROOT/nyxis/rust/target-wasm/wasm32-unknown-unknown/release/nxs.wasm"
+if [[ ! -f "$WASM_BIN" ]]; then
+  WASM_BIN="$ROOT/nyxis/rust/target/wasm32-unknown-unknown/release/nxs.wasm"
+fi
 if [[ ! -f "$WASM_BIN" ]]; then
   echo "error: expected $WASM_BIN" >&2
   exit 1
