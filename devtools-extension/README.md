@@ -24,6 +24,7 @@ Chrome / Firefox extension that registers a **Nyxis** sidebar in Developer Tools
 | Tab exists, empty / “bridge not ready” | Select **Nyxis** again after DevTools fully opens, or reload the extension. |
 | Tab works, never decodes | DevTools must be **open before** the request. Use **Network** → reload page → pick a `.nxb` row. |
 | Explorer loads `.nxs` only | That path compiles in-page; wire traffic is text. Load a `.nxb` fixture URL instead. |
+| Stale decode after refresh | Fixed: panel clears on `devtools.network.onNavigated` when the inspected page reloads. |
 
 ## How it works
 

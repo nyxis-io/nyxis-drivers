@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nyxis Inspector",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Decode .nxb network responses to human-readable .nxs in DevTools",
   "devtools_page": "devtools.html",
   "background": {

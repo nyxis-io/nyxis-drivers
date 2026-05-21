@@ -29,9 +29,22 @@ function setStatus(text, isError = false) {
   metaEl.classList.toggle("error", isError);
 }
 
+function clearPanel(message) {
+  lastText = "";
+  viewerEl.textContent = "";
+  viewerEl.classList.remove("error");
+  copyBtn.disabled = true;
+  setStatus(message ?? "Waiting for an .nxb response in the Network tab…");
+}
+
 function onMessage(msg) {
   if (msg.type === "PANEL_STATUS") {
     setStatus(msg.message ?? "", !msg.connected);
+    return;
+  }
+
+  if (msg.type === "CLEAR_VIEWER") {
+    clearPanel("Page navigated — waiting for a new .nxb response…");
     return;
   }
 

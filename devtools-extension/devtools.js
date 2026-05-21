@@ -34,6 +34,13 @@ function broadcast(msg) {
   }
 }
 
+function clearViewer(reason) {
+  broadcast({
+    type: "CLEAR_VIEWER",
+    meta: { reason },
+  });
+}
+
 /**
  * DevTools returns response bodies as a string; encoding is often "base64" for binary.
  * @param {string} content
@@ -98,6 +105,11 @@ function inspectRequest(request) {
 }
 
 NETWORK.onRequestFinished.addListener(inspectRequest);
+
+// Inspected page reload/navigation — DevTools stays open; drop stale decode.
+NETWORK.onNavigated.addListener(() => {
+  clearViewer("navigated");
+});
 
 broadcast({
   type: "PANEL_STATUS",
