@@ -1,0 +1,89 @@
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  font-family: "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding: 8px 10px;
+  background: #252526;
+  border-bottom: 1px solid #3c3c3c;
+  flex-shrink: 0;
+}
+
+.brand {
+  font-weight: 600;
+  color: #4fc1ff;
+}
+
+.meta {
+  flex: 1;
+  min-width: 200px;
+  color: #9cdcfe;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta code {
+  color: #ce9178;
+}
+
+.actions {
+  display: flex;
+  gap: 6px;
+}
+
+button {
+  background: #3c3c3c;
+  color: #d4d4d4;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: #4a4a4a; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.viewer {
+  flex: 1;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  white-space: pre;
+  tab-size: 2;
+  color: #d4d4d4;
+}
+
+.viewer.wrap { white-space: pre-wrap; word-break: break-word; }
+
+.viewer:empty::before {
+  content: "Waiting for an .nxb response in the Network tab…";
+  color: #6a6a6a;
+}
+
+.hint {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: #6a6a6a;
+  border-top: 1px solid #3c3c3c;
+}
+
+.hint code { color: #9cdcfe; }
+
+.error { color: #f48771; }

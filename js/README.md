@@ -6,6 +6,34 @@ Zero-copy `.nxb` reader for Node.js and the browser. Single ES module file, no d
 
 Node.js 18+ or any modern browser. No npm install required.
 
+## Decode `.nxb` to `.nxs` text (DevTools / audit)
+
+```js
+import { decodeToNxs, isNxbBuffer } from "./nxs_decode.js";
+
+const buf = await fetch("data.nxb").then(r => r.arrayBuffer());
+if (isNxbBuffer(buf)) console.log(decodeToNxs(buf));
+```
+
+Or install the **[Nyxis Inspector](../devtools-extension/)** Chrome/Firefox extension — it decodes `.nxb` Network responses in a custom DevTools panel without server changes.
+
+## Compile `.nxs` in the browser (DevTools-friendly)
+
+Fetch source as `text/plain` (readable in Network → Response), compile to `.nxb` in WASM, then read zero-copy:
+
+```js
+import { loadNxsDataset, compileNxsText } from "./nxs_compile.js";
+
+const { reader, buffer, sourceText } = await loadNxsDataset("/examples/user_profile.nxs");
+console.log(reader.recordCount, reader.record(0).getStr("username"));
+```
+
+Build the WASM compiler (from repo root, requires Rust + `wasm-bindgen-cli`):
+
+```bash
+bash js/build_compile_wasm.sh
+```
+
 ## Read a file
 
 ```js

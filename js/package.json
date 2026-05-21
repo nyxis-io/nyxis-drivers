@@ -7,12 +7,18 @@
   "files": [
     "nxs.js",
     "nxs_writer.js",
+    "nxs_compile.js",
+    "nxs_compile_wasm.js",
+    "nxs_compile_wasm_bg.wasm",
+    "nxs_decode.js",
     "wasm.js",
     "wasm/nxs_reducers.wasm"
   ],
   "exports": {
     ".": "./nxs.js",
     "./writer": "./nxs_writer.js",
+    "./compile": "./nxs_compile.js",
+    "./decode": "./nxs_decode.js",
     "./wasm": "./wasm.js",
     "./wasm/nxs_reducers.wasm": "./wasm/nxs_reducers.wasm"
   },

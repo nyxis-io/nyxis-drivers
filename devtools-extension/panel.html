@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Nyxis Inspector</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header class="toolbar">
+    <div class="brand">Nyxis Inspector</div>
+    <div class="meta" id="meta">Load a page and fetch a <code>.nxb</code> file — decoded <code>.nxs</code> appears here.</div>
+    <div class="actions">
+      <button type="button" id="copy" disabled>Copy</button>
+      <button type="button" id="wrap" title="Toggle line wrap">Wrap</button>
+    </div>
+  </header>
+  <pre id="viewer" class="viewer" aria-label="Decoded NXS source"></pre>
+  <footer class="hint">
+    Sniffs Network responses ending in <code>.nxb</code> or NYXB magic (<code>0x4E595842</code>).
+    Bi-modal: wire <code>.nxb</code> on the network, audit as <code>.nxs</code> here.
+  </footer>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

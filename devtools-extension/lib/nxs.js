@@ -1,0 +1,1001 @@
+// NXS Reader — zero-copy .nxb parser for JavaScript
+// Implements the Nyxis v1.1 binary wire format spec.
+//
+// Usage:
+//   import { NxsReader } from "./nxs.js";
+//   const buf = await fetch("data.nxb").then(r => r.arrayBuffer());
+//   const reader = new NxsReader(buf);
+//   console.log(reader.recordCount);           // how many top-level records
+//   const obj = reader.record(42);              // O(1) jump to record #42
+//   console.log(obj.get("username"));           // decode field only on access
+//
+// The reader does NOT materialize the whole file. Each call to `record()`
+// returns a lightweight view; `.get(key)` decodes a single field on demand.
+
+const MAGIC_FILE   = 0x4E595842; // NYXB
+const MAGIC_OBJ    = 0x4E59584F; // NYXO
+const MAGIC_LIST   = 0x4E59584C; // NYXL
+const MAGIC_FOOTER = 0x2153584E; // NXS!
+
+const SIGIL_INT     = 0x3D; // =
+const SIGIL_FLOAT   = 0x7E; // ~
+const SIGIL_BOOL    = 0x3F; // ?
+const SIGIL_KEYWORD = 0x24; // $
+const SIGIL_STR     = 0x22; // "
+const SIGIL_TIME    = 0x40; // @
+const SIGIL_BINARY  = 0x3C; // <
+const SIGIL_LINK    = 0x26; // &
+const SIGIL_NULL    = 0x5E; // ^
+
+/** Exposes all wire sigil bytes for spec parity (keeps otherwise-unused constants live). */
+export const WIRE_SIGILS = Object.freeze({
+  int: SIGIL_INT,
+  float: SIGIL_FLOAT,
+  bool: SIGIL_BOOL,
+  keyword: SIGIL_KEYWORD,
+  str: SIGIL_STR,
+  time: SIGIL_TIME,
+  binary: SIGIL_BINARY,
+  link: SIGIL_LINK,
+  null: SIGIL_NULL,
+});
+
+// ── Error types ─────────────────────────────────────────────────────────────
+
+export class NxsError extends Error {
+  constructor(code, msg) { super(`${code}: ${msg}`); this.code = code; }
+}
+
+// Shared TextDecoder for the unicode fallback path.
+const _utf8Decoder = new TextDecoder("utf-8");
+
+/**
+ * TextDecoder.decode() refuses to accept a Uint8Array backed by a
+ * SharedArrayBuffer. When we detect that case, copy the slice into a regular
+ * ArrayBuffer before decoding. The cost is one tiny allocation on the fallback
+ * path; worth it to make NXS usable from Web Workers that share their buffer.
+ */
+function _decodeMaybeShared(bytes, offset, end) {
+  const view = bytes.subarray(offset, end);
+  const buf = bytes.buffer;
+  // `buffer.constructor === SharedArrayBuffer` is the reliable check; older
+  // engines don't even define the global, so guard the reference.
+  if (typeof SharedArrayBuffer !== "undefined" && buf instanceof SharedArrayBuffer) {
+    const copy = new Uint8Array(view.length);
+    copy.set(view);
+    return _utf8Decoder.decode(copy);
+  }
+  return _utf8Decoder.decode(view);
+}
+
+/**
+ * Fast UTF-8 decode that specialises on the all-ASCII hot path (our string
+ * data is typically usernames/emails/short codes). Scans for a high bit; if
+ * none, uses String.fromCharCode which is ~10x faster than TextDecoder for
+ * ASCII. Falls back to TextDecoder for anything with multibyte characters.
+ */
+function decodeUtf8Fast(bytes, offset, length) {
+  // Quick ASCII scan — if any byte has high bit set, bail to TextDecoder.
+  const end = offset + length;
+  let i = offset;
+  // Unroll 4-at-a-time for V8 to hoist
+  const end4 = offset + (length & ~3);
+  while (i < end4) {
+    if ((bytes[i] | bytes[i+1] | bytes[i+2] | bytes[i+3]) & 0x80) {
+      return _decodeMaybeShared(bytes, offset, end);
+    }
+    i += 4;
+  }
+  while (i < end) {
+    if (bytes[i] & 0x80) {
+      return _decodeMaybeShared(bytes, offset, end);
+    }
+    i++;
+  }
+  // All ASCII — build the string directly. For longer strings fromCharCode.apply
+  // beats iteration; for short strings either is fine, so pick apply.
+  if (length < 1024) {
+    return String.fromCharCode.apply(null, bytes.subarray(offset, end));
+  }
+  // Very long strings: chunked apply to avoid argument-list size limits.
+  let s = "";
+  for (let p = offset; p < end; p += 4096) {
+    s += String.fromCharCode.apply(null, bytes.subarray(p, Math.min(p + 4096, end)));
+  }
+  return s;
+}
+
+// ── Inline little-endian reads ───────────────────────────────────────────────
+//
+// DataView.getUint16/getFloat64 etc. cross a VM boundary on each call. For the
+// hot loop, direct integer arithmetic on the Uint8Array inlines in V8, and
+// Float64 reads through an aliased Float64Array are faster than DataView.
+//
+// An 8-byte scratch buffer is shared for float reads. Not thread-safe, but
+// Node/the-browser runs one JS thread per isolate so that's fine.
+
+const _scratchBuf = new ArrayBuffer(8);
+const _scratchU8  = new Uint8Array(_scratchBuf);
+const _scratchF64 = new Float64Array(_scratchBuf);
+
+function rdU16(bytes, off) {
+  return bytes[off] | (bytes[off + 1] << 8);
+}
+
+function rdU32(bytes, off) {
+  return (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+}
+
+function rdI64Safe(bytes, off) {
+  // Two 32-bit reads combined into a JS number. Safe for |v| < 2^53.
+  const lo = (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+  const hi =  (bytes[off + 4] | (bytes[off + 5] << 8) | (bytes[off + 6] << 16) | (bytes[off + 7] << 24)) | 0;
+  return hi * 0x100000000 + lo;
+}
+
+function rdF64(bytes, off) {
+  // Copy 8 bytes into the aliased Float64Array; read [0].
+  _scratchU8[0] = bytes[off];
+  _scratchU8[1] = bytes[off + 1];
+  _scratchU8[2] = bytes[off + 2];
+  _scratchU8[3] = bytes[off + 3];
+  _scratchU8[4] = bytes[off + 4];
+  _scratchU8[5] = bytes[off + 5];
+  _scratchU8[6] = bytes[off + 6];
+  _scratchU8[7] = bytes[off + 7];
+  return _scratchF64[0];
+}
+
+function rdU64AsNumber(bytes, off) {
+  // For offsets inside file size — safe up to 2^53.
+  const lo = rdU32(bytes, off);
+  const hi = rdU32(bytes, off + 4);
+  return hi * 0x100000000 + lo;
+}
+
+// ── MurmurHash3-64 (schema integrity check) ──────────────────────────────────
+
+function murmur3_64(bytes, offset, length) {
+  const C1 = 0xFF51AFD7ED558CCDn;
+  const C2 = 0xC4CEB9FE1A85EC53n;
+  const MASK = 0xFFFFFFFFFFFFFFFFn;
+  let h = 0x93681D6255313A99n;
+  const end = offset + length;
+  for (let p = offset; p < end; p += 8) {
+    let k = 0n;
+    for (let i = 0; i < 8 && p + i < end; i++) {
+      k |= BigInt(bytes[p + i]) << BigInt(i * 8);
+    }
+    k = (k * C1) & MASK;
+    k ^= k >> 33n;
+    h ^= k;
+    h = (h * C2) & MASK;
+    h ^= h >> 33n;
+  }
+  h ^= BigInt(length);
+  h ^= h >> 33n;
+  h = (h * C1) & MASK;
+  h ^= h >> 33n;
+  return h;
+}
+
+// ── Main reader ─────────────────────────────────────────────────────────────
+
+export class NxsReader {
+  /**
+   * @param {ArrayBuffer | Uint8Array} buffer — raw .nxb bytes
+   */
+  constructor(buffer) {
+    this.bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+
+    if (this.bytes.length < 32) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", "file too small");
+    }
+
+    // Preamble
+    const magic = this.view.getUint32(0, true);
+    if (magic !== MAGIC_FILE) {
+      throw new NxsError("ERR_BAD_MAGIC", `expected 0x${MAGIC_FILE.toString(16)}, got 0x${magic.toString(16)}`);
+    }
+
+    this.version   = this.view.getUint16(4, true);
+    this.flags     = this.view.getUint16(6, true);
+    this.dictHash  = this.view.getBigUint64(8, true);
+    this.tailPtr   = Number(this.view.getBigUint64(16, true));
+    // bytes 24-31 reserved
+
+    // Footer check
+    const footer = this.view.getUint32(this.bytes.length - 4, true);
+    if (footer !== MAGIC_FOOTER) {
+      throw new NxsError("ERR_BAD_MAGIC", "footer magic mismatch");
+    }
+    if (this.tailPtr === 0) {
+      if (this.bytes.length < 44) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", "streamable footer missing tail pointer");
+      }
+      this.tailPtr = Number(this.view.getBigUint64(this.bytes.length - 12, true));
+    }
+
+    // Schema
+    this.keys = [];
+    this.keySigils = [];
+    if (this.flags & 0x0002) { // Schema Embedded
+      this._readSchema(32);
+      const computedHash = murmur3_64(this.bytes, 32, this._schemaEnd - 32);
+      if (computedHash !== this.dictHash) {
+        throw new NxsError("ERR_DICT_MISMATCH", "schema hash mismatch");
+      }
+    }
+
+    // Tail-index
+    this._readTailIndex();
+  }
+
+  _readSchema(offset) {
+    const keyCount = this.view.getUint16(offset, true);
+    offset += 2;
+    // TypeManifest
+    for (let i = 0; i < keyCount; i++) {
+      this.keySigils.push(this.bytes[offset + i]);
+    }
+    offset += keyCount;
+    // StringPool — null-terminated UTF-8 strings
+    for (let i = 0; i < keyCount; i++) {
+      let end = offset;
+      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      this.keys.push(_decodeMaybeShared(this.bytes, offset, end));
+      offset = end + 1;
+    }
+    // Build name→index map for O(1) lookup
+    this.keyIndex = new Map();
+    for (let i = 0; i < this.keys.length; i++) {
+      this.keyIndex.set(this.keys[i], i);
+    }
+    // Schema ends at 8-byte alignment (caller doesn't need this)
+    this._schemaEnd = (offset + 7) & ~7;
+  }
+
+  _readTailIndex() {
+    let p = this.tailPtr;
+    this.recordCount = this.view.getUint32(p, true);
+    p += 4;
+    // Record array: [KeyID u16][AbsoluteOffset u64] × N
+    this._tailStart = p;
+  }
+
+  /**
+   * O(1) lookup: get the object at top-level index `i`.
+   * Returns an NxsObject view — nothing is decoded until you call .get().
+   */
+  record(i) {
+    if (i < 0 || i >= this.recordCount) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of [0, ${this.recordCount})`);
+    }
+    // Each tail-index entry: u16 keyId + u64 offset = 10 bytes
+    const absOffset = rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
+    return new NxsObject(this, absOffset);
+  }
+
+  /**
+   * Returns a reusable cursor positioned initially at record 0.
+   * Call `cursor.seek(i)` to move to record i without allocating.
+   * Zero allocation per record → much faster full scans.
+   */
+  cursor() {
+    return new NxsCursor(this);
+  }
+
+  /**
+   * Efficient per-record scan with a reused cursor. Calls fn(cursor, i) for
+   * each record. Identical in output to iterating records() but with no
+   * per-record object allocation.
+   */
+  scan(fn) {
+    const cur = new NxsCursor(this);
+    const n = this.recordCount;
+    const bytes = this.bytes;
+    const tailStart = this._tailStart;
+    for (let i = 0; i < n; i++) {
+      cur._reset(rdU64AsNumber(bytes, tailStart + i * 10 + 2));
+      fn(cur, i);
+    }
+  }
+
+  /**
+   * Attach a loaded WASM module to accelerate reducers. The reader copies its
+   * bytes into WASM memory once; subsequent sumF64/minF64/maxF64 calls run
+   * in WASM. If not called, those methods use the pure-JS implementation.
+   */
+  useWasm(wasm) {
+    this._wasm = wasm;
+    wasm.loadPayload(this.bytes);
+    // tail_start / record_count are the same across JS and WASM views because
+    // we copied the whole file starting at `wasm.dataBase`.
+    this._wasmTailStart = this._tailStart;
+    this._wasmDataBase = wasm.dataBase;
+    this._wasmSize = this.bytes.length;
+  }
+
+  /** Iterate all top-level records. */
+  *records() {
+    for (let i = 0; i < this.recordCount; i++) {
+      yield this.record(i);
+    }
+  }
+
+  /**
+   * Resolve a key name to a slot index (integer). Use this once, then pass the
+   * slot to `obj.getStrBySlot(slot)` etc. to skip the Map lookup on hot paths.
+   */
+  slot(key) {
+    const s = this.keyIndex.get(key);
+    if (s === undefined) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    return s;
+  }
+
+  // ── Bulk columnar scan ──────────────────────────────────────────────────
+  //
+  // These methods walk every record in a single JS-native loop that inlines
+  // the LEB128 bitmask and offset-table reads, avoiding the per-record
+  // allocation and indirection of `record(i).getF64(key)`.
+
+  /** Returns the slot index for `key`, or -1 if not present. */
+  _slotOf(key) {
+    const idx = this.keyIndex.get(key);
+    return idx === undefined ? -1 : idx;
+  }
+
+  /**
+   * Inline scan primitive: for each record, locate the byte offset of `slot`'s
+   * value and invoke `decode(dataView, offset)` to extract it.
+   * Returns an array of length recordCount, with nulls where the field is absent.
+   */
+  _scanLoop(slot, decode) {
+    const n = this.recordCount;
+    const view = this.view;
+    const bytes = this.bytes;
+    const tailStart = this._tailStart;
+    const size = bytes.length;
+    const out = new Array(n);
+
+    for (let i = 0; i < n; i++) {
+      // Read u64 absOffset (two u32s avoids BigInt allocation)
+      const entryOff = tailStart + i * 10 + 2;
+      const lo = view.getUint32(entryOff, true);
+      const hi = view.getUint32(entryOff + 4, true);
+      const absOffset = hi * 0x100000000 + lo;
+
+      let p = absOffset + 8; // skip NYXO magic + length
+
+      // Walk LEB128 bitmask, counting present bits before slot
+      let curSlot = 0;
+      let tableIdx = 0;
+      let found = false;
+      let done = false;
+      let byte = 0;
+      while (!done) {
+        if (p >= size) { out[i] = null; break; }
+        byte = bytes[p++];
+        const dataBits = byte & 0x7F;
+        for (let b = 0; b < 7; b++) {
+          if (curSlot === slot) {
+            if ((dataBits >> b) & 1) { found = true; }
+            else { out[i] = null; done = true; break; }
+          } else if (curSlot < slot && ((dataBits >> b) & 1)) {
+            tableIdx++;
+          }
+          curSlot++;
+        }
+        if (done) break;
+        if (found && (byte & 0x80) === 0) break;
+        if (curSlot > slot && found) break;
+        if ((byte & 0x80) === 0) { out[i] = null; done = true; }
+      }
+      if (done) continue;
+      if (!found) { out[i] = null; continue; }
+
+      // If we stopped mid-mask, skip remaining continuation bytes
+      while (byte & 0x80) {
+        if (p >= size) break;
+        byte = bytes[p++];
+      }
+
+      const ofPos = p + tableIdx * 2;
+      const relOff = view.getUint16(ofPos, true);
+      out[i] = decode(view, absOffset + relOff);
+    }
+    return out;
+  }
+
+  /** Scan all f64 values for `key`. Returns Array<number | null>. */
+  scanF64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    return this._scanLoop(slot, (v, off) => v.getFloat64(off, true));
+  }
+
+  /** Scan all i64 values. Returns Array<number | null> (safe when |v| < 2^53). */
+  scanI64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    return this._scanLoop(slot, (v, off) => Number(v.getBigInt64(off, true)));
+  }
+
+  /**
+   * In-native reducer: sum of all f64 values for `key`.
+   * Zero intermediate allocation — returns a single number.
+   */
+  sumF64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._wasm) {
+      return this._wasm.fns.sum_f64(
+        this._wasmDataBase, this._wasmSize,
+        this._wasmTailStart,
+        this.recordCount, slot);
+    }
+    return this._sumF64Js(slot);
+  }
+
+  /** Min over f64 field (returns null if no records). */
+  minF64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._wasm) {
+      const v = this._wasm.fns.min_f64(
+        this._wasmDataBase, this._wasmSize,
+        this._wasmTailStart,
+        this.recordCount, slot);
+      return this._wasm.fns.min_max_has_result() ? v : null;
+    }
+    const arr = this.scanF64(key);
+    let m = Infinity, have = false;
+    for (const v of arr) { if (v !== null && v < m) { m = v; have = true; } }
+    return have ? m : null;
+  }
+
+  /** Max over f64 field. */
+  maxF64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._wasm) {
+      const v = this._wasm.fns.max_f64(
+        this._wasmDataBase, this._wasmSize,
+        this._wasmTailStart,
+        this.recordCount, slot);
+      return this._wasm.fns.min_max_has_result() ? v : null;
+    }
+    const arr = this.scanF64(key);
+    let m = -Infinity, have = false;
+    for (const v of arr) { if (v !== null && v > m) { m = v; have = true; } }
+    return have ? m : null;
+  }
+
+  /** Sum over i64 field. */
+  sumI64(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._wasm) {
+      // WASM returns i64 which Node surfaces as BigInt; convert to Number
+      // (safe for the fixture dataset).
+      return Number(this._wasm.fns.sum_i64(
+        this._wasmDataBase, this._wasmSize,
+        this._wasmTailStart,
+        this.recordCount, slot));
+    }
+    const arr = this.scanI64(key);
+    let s = 0;
+    for (const v of arr) if (v !== null) s += v;
+    return s;
+  }
+
+  /** Pure-JS sumF64 fallback. */
+  _sumF64Js(slot) {
+    const n = this.recordCount;
+    const bytes = this.bytes;
+    const tailStart = this._tailStart;
+    const size = bytes.length;
+    let sum = 0;
+
+    for (let i = 0; i < n; i++) {
+      const absOffset = rdU64AsNumber(bytes, tailStart + i * 10 + 2);
+
+      let p = absOffset + 8;
+      let curSlot = 0;
+      let tableIdx = 0;
+      let found = false;
+      let byte = 0;
+      let brokeEarly = false;
+      while (true) {
+        if (p >= size) break;
+        byte = bytes[p++];
+        const dataBits = byte & 0x7F;
+        for (let b = 0; b < 7; b++) {
+          if (curSlot === slot) {
+            if ((dataBits >> b) & 1) found = true;
+            brokeEarly = true;
+            break;
+          } else if (curSlot < slot && ((dataBits >> b) & 1)) {
+            tableIdx++;
+          }
+          curSlot++;
+        }
+        if (brokeEarly) break;
+        if ((byte & 0x80) === 0) break;
+      }
+      if (!found) continue;
+      while (byte & 0x80) {
+        if (p >= size) break;
+        byte = bytes[p++];
+      }
+      sum += rdF64(bytes, absOffset + rdU16(bytes, p + tableIdx * 2));
+    }
+    return sum;
+  }
+}
+
+// ── Streaming reader ───────────────────────────────────────────────────────
+
+export class NxsStreamReader {
+  constructor({ onSchema, onRecord, onEnd, onError } = {}) {
+    this.onSchema = onSchema;
+    this.onRecord = onRecord;
+    this.onEnd = onEnd;
+    this.onError = onError;
+    this.bytes = new Uint8Array(0);
+    this._buffer = new Uint8Array(0);
+    this._length = 0;
+    this.keys = [];
+    this.keySigils = [];
+    this.keyIndex = new Map();
+    this._schemaEnd = 0;
+    this._nextOffset = 0;
+    this._headerParsed = false;
+    this._recordCount = 0;
+  }
+
+  push(chunk) {
+    try {
+      const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      this._ensureCapacity(this._length + incoming.length);
+      this._buffer.set(incoming, this._length);
+      this._length += incoming.length;
+      this.bytes = this._buffer.subarray(0, this._length);
+      this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+      this._parseAvailable();
+    } catch (err) {
+      this.onError?.(err);
+      throw err;
+    }
+  }
+
+  finish() {
+    this._parseAvailable();
+    const reader = new NxsReader(this.bytes);
+    this.onEnd?.(reader);
+    return reader;
+  }
+
+  _parseAvailable() {
+    if (!this._headerParsed && !this._parseHeader()) return;
+    while (this._nextOffset + 8 <= this.bytes.length) {
+      if (rdU32(this.bytes, this._nextOffset) !== MAGIC_OBJ) return;
+      const length = rdU32(this.bytes, this._nextOffset + 4);
+      if (length < 8) throw new NxsError("ERR_OUT_OF_BOUNDS", "invalid object length");
+      if (this._nextOffset + length > this.bytes.length) return;
+      const obj = new NxsObject(this, this._nextOffset);
+      this.onRecord?.(obj, this._recordCount++);
+      this._nextOffset += length;
+    }
+  }
+
+  _parseHeader() {
+    if (this.bytes.length < 34) return false;
+    if (rdU32(this.bytes, 0) !== MAGIC_FILE) {
+      throw new NxsError("ERR_BAD_MAGIC", "preamble");
+    }
+    this.version = this.view.getUint16(4, true);
+    this.flags = this.view.getUint16(6, true);
+    this.dictHash = this.view.getBigUint64(8, true);
+    this.tailPtr = Number(this.view.getBigUint64(16, true));
+    if ((this.flags & 0x0002) === 0) {
+      throw new NxsError("ERR_DICT_MISMATCH", "stream reader requires embedded schema");
+    }
+
+    const keyCount = this.view.getUint16(32, true);
+    let offset = 34 + keyCount;
+    if (this.bytes.length < offset) return false;
+    const sigils = Array.from(this.bytes.subarray(34, 34 + keyCount));
+    const keys = [];
+    for (let i = 0; i < keyCount; i++) {
+      let end = offset;
+      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      if (end >= this.bytes.length) return false;
+      keys.push(_decodeMaybeShared(this.bytes, offset, end));
+      offset = end + 1;
+    }
+    this.keySigils = sigils;
+    this.keys = keys;
+    this.keyIndex = new Map(keys.map((key, index) => [key, index]));
+    this._schemaEnd = (offset + 7) & ~7;
+    if (this.bytes.length < this._schemaEnd) return false;
+    const computedHash = murmur3_64(this.bytes, 32, this._schemaEnd - 32);
+    if (computedHash !== this.dictHash) {
+      throw new NxsError("ERR_DICT_MISMATCH", "schema hash mismatch");
+    }
+    this._nextOffset = this._schemaEnd;
+    this._headerParsed = true;
+    this.onSchema?.(this.keys, this.keySigils);
+    return true;
+  }
+
+  slot(key) {
+    const s = this.keyIndex.get(key);
+    if (s === undefined) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    return s;
+  }
+
+  _ensureCapacity(required) {
+    if (required <= this._buffer.length) return;
+    let nextCap = this._buffer.length || 4096;
+    while (nextCap < required) nextCap *= 2;
+    const next = new Uint8Array(nextCap);
+    next.set(this.bytes);
+    this._buffer = next;
+  }
+}
+
+// ── Object view ─────────────────────────────────────────────────────────────
+
+/**
+ * A view over a single NXS object. Does not decode fields until requested.
+ * Constructing an NxsObject costs ~nothing (just stores an offset).
+ */
+export class NxsObject {
+  constructor(reader, offset) {
+    this.reader = reader;
+    this.offset = offset;
+    this._stage = 0; // 0 = untouched, 1 = offset-table located, 2 = rank cached
+  }
+
+  /**
+   * Stage 1: walk LEB128 bitmask only far enough to locate the offset table
+   * start. No allocations. This is enough for single-field access.
+   */
+  _locateOffsetTable() {
+    if (this._stage >= 1) return;
+    const bytes = this.reader.bytes;
+    let p = this.offset;
+
+    const magic = rdU32(bytes, p);
+    if (magic !== MAGIC_OBJ) {
+      throw new NxsError("ERR_BAD_MAGIC", `expected NYXO at offset ${p}`);
+    }
+    this.length = rdU32(bytes, p + 4);
+    p += 8;
+
+    let byte;
+    do { byte = bytes[p++]; } while (byte & 0x80);
+
+    this._bitmaskStart = this.offset + 8;
+    this._offsetTableStart = p;
+    this._stage = 1;
+  }
+
+  /**
+   * Stage 2 (lazy): build the full present/rank arrays for O(1) repeated
+   * access. Only called when a second field is accessed on the same object.
+   */
+  _buildRankCache() {
+    if (this._stage >= 2) return;
+    if (this._stage < 1) this._locateOffsetTable();
+
+    const bytes = this.reader.bytes;
+    const keyCount = this.reader.keys.length;
+    const present = new Uint8Array(keyCount);
+    const rank = new Uint16Array(keyCount + 1);
+
+    let p = this._bitmaskStart;
+    let slot = 0;
+    let byte;
+    do {
+      byte = bytes[p++];
+      const dataBits = byte & 0x7F;
+      for (let b = 0; b < 7 && slot < keyCount; b++, slot++) {
+        present[slot] = (dataBits >> b) & 1;
+      }
+    } while ((byte & 0x80) && slot < keyCount);
+
+    let acc = 0;
+    for (let s = 0; s < keyCount; s++) {
+      rank[s] = acc;
+      acc += present[s];
+    }
+    rank[keyCount] = acc;
+
+    this._present = present;
+    this._rank = rank;
+    this._stage = 2;
+  }
+
+  /**
+   * Inline single-slot rank: walk the bitmask from the start, counting present
+   * bits before `slot`, returning [present(0/1), tableIdx].
+   * Used for the first access; cheaper than building the full rank array.
+   */
+  _inlineRank(slot) {
+    const bytes = this.reader.bytes;
+    let p = this._bitmaskStart;
+    let curSlot = 0;
+    let tableIdx = 0;
+    while (curSlot <= slot) {
+      const byte = bytes[p++];
+      const dataBits = byte & 0x7F;
+      for (let b = 0; b < 7; b++, curSlot++) {
+        if (curSlot === slot) {
+          return [(dataBits >> b) & 1, tableIdx];
+        }
+        if ((dataBits >> b) & 1) tableIdx++;
+      }
+      if ((byte & 0x80) === 0) break;
+    }
+    return [0, 0];
+  }
+
+  /**
+   * Adaptive slot lookup: uses inline walk on the first call, rank cache
+   * after a second distinct access. Returns absolute byte offset of the value,
+   * or -1 if absent.
+   */
+  _resolveSlot(slot) {
+    const bytes = this.reader.bytes;
+    if (this._stage === 2) {
+      if (!this._present[slot]) return -1;
+      return this.offset + rdU16(bytes, this._offsetTableStart + this._rank[slot] * 2);
+    }
+    if (this._stage === 0) this._locateOffsetTable();
+
+    if (this._firstAccessedSlot === undefined) {
+      this._firstAccessedSlot = slot;
+      const [present, tableIdx] = this._inlineRank(slot);
+      if (!present) return -1;
+      return this.offset + rdU16(bytes, this._offsetTableStart + tableIdx * 2);
+    }
+
+    if (slot !== this._firstAccessedSlot) {
+      this._buildRankCache();
+      if (!this._present[slot]) return -1;
+      return this.offset + rdU16(bytes, this._offsetTableStart + this._rank[slot] * 2);
+    }
+
+    const [present, tableIdx] = this._inlineRank(slot);
+    if (!present) return -1;
+    return this.offset + rdU16(bytes, this._offsetTableStart + tableIdx * 2);
+  }
+
+  /**
+   * Get the value of a field by key name.
+   * Returns undefined if the field is not present.
+   * O(1) on the first call after parseHeader; subsequent calls re-decode
+   * but do not re-parse the header.
+   */
+  get(key) {
+    const slot = this.reader.keyIndex.get(key);
+    if (slot === undefined) return undefined;
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    return this._decodeValue(off, this.reader.keySigils[slot]);
+  }
+
+  /** Decode all fields into a plain JS object (the eager path). */
+  toObject() {
+    this._buildRankCache();
+    const obj = {};
+    for (const [key, slot] of this.reader.keyIndex) {
+      if (this._present[slot]) obj[key] = this.get(key);
+    }
+    return obj;
+  }
+
+  _decodeValue(offset, _sigilHint) {
+    const { view, bytes } = this.reader;
+
+    // If we have no hint, peek: if first 4 bytes are a known magic, it's
+    // a nested object or list. Otherwise assume an 8-byte atomic value.
+    if (offset + 4 <= bytes.length) {
+      const maybeMagic = view.getUint32(offset, true);
+      if (maybeMagic === MAGIC_OBJ) return new NxsObject(this.reader, offset);
+      if (maybeMagic === MAGIC_LIST) return this._decodeList(offset);
+    }
+
+    // Schema-less fallback: treat string-sigil slots as length-prefixed strings,
+    // everything else as i64. (The current writer encodes all keys with the
+    // SIGIL_STR byte in the TypeManifest; the *value* encoding is determined
+    // by how the writer wrote it — the reader has to know the type.)
+    //
+    // For the benchmark/test we expose distinct accessors below.
+    return this._readI64(offset);
+  }
+
+  _readI64(offset) {
+    return Number(this.reader.view.getBigInt64(offset, true));
+  }
+  _readF64(offset) {
+    return this.reader.view.getFloat64(offset, true);
+  }
+  _readBool(offset) {
+    return this.reader.bytes[offset] !== 0;
+  }
+  _readStr(offset) {
+    const len = this.reader.view.getUint32(offset, true);
+    return decodeUtf8Fast(this.reader.bytes, offset + 4, len);
+  }
+
+  // ── Typed accessors (fast path when caller knows the type) ──────────────
+  // The key-name variants do a Map lookup then delegate to the slot variants.
+  // For hot code, use reader.slot(key) once and then call the ...BySlot forms.
+
+  getI64(key)  { return this.getI64BySlot(this.reader.keyIndex.get(key)); }
+  getF64(key)  { return this.getF64BySlot(this.reader.keyIndex.get(key)); }
+  getBool(key) { return this.getBoolBySlot(this.reader.keyIndex.get(key)); }
+  getStr(key)  { return this.getStrBySlot(this.reader.keyIndex.get(key)); }
+
+  /** Fast path: resolve slot with `reader.slot("username")` once, reuse. */
+  getI64BySlot(slot) {
+    if (slot === undefined) return undefined;
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    return rdI64Safe(this.reader.bytes, off);
+  }
+
+  getF64BySlot(slot) {
+    if (slot === undefined) return undefined;
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    return rdF64(this.reader.bytes, off);
+  }
+
+  getBoolBySlot(slot) {
+    if (slot === undefined) return undefined;
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    return this.reader.bytes[off] !== 0;
+  }
+
+  getStrBySlot(slot) {
+    if (slot === undefined) return undefined;
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    const bytes = this.reader.bytes;
+    return decodeUtf8Fast(bytes, off + 4, rdU32(bytes, off));
+  }
+
+  _decodeList(offset) {
+    const { view } = this.reader;
+    const magic = view.getUint32(offset, true);
+    if (magic !== MAGIC_LIST) throw new NxsError("ERR_BAD_MAGIC", "list magic");
+    // Length at offset+4, ElemSigil at offset+8, ElemCount at offset+9
+    const elemSigil = this.reader.bytes[offset + 8];
+    const elemCount = view.getUint32(offset + 9, true);
+    // Data starts at offset + 16 (after 3-byte padding)
+    const dataStart = offset + 16;
+    const out = new Array(elemCount);
+    for (let i = 0; i < elemCount; i++) {
+      const elemOff = dataStart + i * 8;
+      if (elemSigil === SIGIL_INT) out[i] = Number(view.getBigInt64(elemOff, true));
+      else if (elemSigil === SIGIL_FLOAT) out[i] = view.getFloat64(elemOff, true);
+      else out[i] = null; // unsupported in reader for POC
+    }
+    return out;
+  }
+}
+
+// ── Reusable cursor for zero-allocation scans ───────────────────────────────
+//
+// `NxsCursor` has the same field-access API as `NxsObject` but can be
+// repositioned with `seek(i)` or `_reset(offset)` without any allocation.
+// Use via `reader.scan((cur, i) => ...)` or `reader.cursor()`.
+
+export class NxsCursor extends NxsObject {
+  constructor(reader) {
+    super(reader, 0);
+  }
+
+  /** Move to record `i`. */
+  seek(i) {
+    if (i < 0 || i >= this.reader.recordCount) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of range`);
+    }
+    this._reset(rdU64AsNumber(this.reader.bytes, this.reader._tailStart + i * 10 + 2));
+    return this;
+  }
+
+  /** Internal: reset to a raw object offset. */
+  _reset(absOffset) {
+    this.offset = absOffset;
+    this._stage = 0;
+    this._firstAccessedSlot = undefined;
+    // _present / _rank are reused if already allocated; their values are
+    // overwritten on the next _buildRankCache(). No need to zero them here.
+  }
+}
+
+// ── Query engine ──────────────────────────────────────────────────────────────
+
+/**
+ * Query is a lazy, filterable view over an NxsReader.
+ * Created via `reader.where(pred)` or the `reader.all` getter.
+ *
+ * Usage:
+ *   const q = reader.where(and(eq("active", true), gt("score", 80.0)));
+ *   for (const rec of q) console.log(rec.getStr("username"));
+ *   console.log(q.count());
+ *   console.log(q.first()?.getStr("username"));
+ */
+export class Query {
+  #reader;
+  #pred; // null = all records
+
+  constructor(reader, pred = null) {
+    this.#reader = reader;
+    this.#pred = pred;
+  }
+
+  /** Lazy generator — yields NxsObject instances for matching records. */
+  *[Symbol.iterator]() {
+    const n = this.#reader.recordCount;
+    for (let i = 0; i < n; i++) {
+      const rec = this.#reader.record(i);
+      if (!this.#pred || this.#pred(rec)) yield rec;
+    }
+  }
+
+  /** Returns the count of matching records. */
+  count() {
+    let n = 0;
+    for (const _ of this) n++;
+    return n;
+  }
+
+  /** Returns the first matching record, or null if none match. */
+  first() {
+    for (const r of this) return r;
+    return null;
+  }
+}
+
+// ── Predicate factories ───────────────────────────────────────────────────────
+//
+// Each factory returns a function (NxsObject) => boolean.
+// Value-type detection determines which typed accessor is used:
+//   string  → getStr
+//   boolean → getBool
+//   number  → getF64  (covers both int and float fields; use getI64 for BigInt)
+//   bigint  → getI64 (returned as JS number from rdI64Safe)
+
+function _makeGetter(val) {
+  if (typeof val === "boolean") return (rec, key) => rec.getBool(key);
+  if (typeof val === "bigint")  return (rec, key) => rec.getI64(key); // getI64 returns Number
+  if (typeof val === "number")  return (rec, key) => rec.getF64(key);
+  return (rec, key) => rec.getStr(key);
+}
+
+export const eq  = (key, val) => { const g = _makeGetter(val); return rec => g(rec, key) === val; };
+export const gt  = (key, val) => { const g = _makeGetter(val); return rec => g(rec, key) > val; };
+export const lt  = (key, val) => { const g = _makeGetter(val); return rec => g(rec, key) < val; };
+export const gte = (key, val) => { const g = _makeGetter(val); return rec => g(rec, key) >= val; };
+export const lte = (key, val) => { const g = _makeGetter(val); return rec => g(rec, key) <= val; };
+export const and = (...preds) => rec => preds.every(p => p(rec));
+export const or  = (...preds) => rec => preds.some(p => p(rec));
+export const not = (pred)     => rec => !pred(rec);
+
+// ── NxsReader query entry-points ─────────────────────────────────────────────
+//
+// Patch these onto NxsReader prototype after the class definition so the
+// class body itself remains unchanged.
+
+NxsReader.prototype.where = function where(pred) { return new Query(this, pred); };
+Object.defineProperty(NxsReader.prototype, "all", {
+  get() { return new Query(this); },
+});
