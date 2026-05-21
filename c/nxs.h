@@ -47,6 +47,10 @@ typedef struct {
     uint32_t       record_count;
     size_t         tail_start;
 
+    // O(1) key name → slot (open-addressing; built at nxs_open)
+    uint16_t       key_ht_mask;
+    int16_t        key_ht[NXS_MAX_KEYS];
+
     // scratch for key string copies
     char           _pool[NXS_MAX_KEYS * 64];
 } nxs_reader_t;
@@ -72,11 +76,16 @@ typedef struct {
     size_t              offset;     // absolute offset of NYXO magic
     size_t              bitmask_start;
     size_t              offset_table_start;
-    int                 staged;     // 0=raw, 1=bitmask located
+    uint8_t             stage;      // 0=raw, 1=bitmask located, 2=present+rank cache
+    uint8_t             present[NXS_MAX_KEYS];
+    uint16_t            rank[NXS_MAX_KEYS + 1];
 } nxs_object_t;
 
 // Populate `obj` with a lazy view of record `i`.
 nxs_err_t nxs_record(const nxs_reader_t *r, uint32_t i, nxs_object_t *obj);
+
+// Decode bitmask + build present/rank cache (idempotent; also runs on first field access).
+nxs_err_t nxs_stage_object(nxs_object_t *obj);
 
 // Resolve slot to absolute byte offset of its value, or -1 if absent.
 // Locates the bitmask/offset-table on first call.
