@@ -302,8 +302,12 @@ export class NxsReader {
     this._colBufLen = new Array(kc);
     for (let i = 0; i < kc; i++) {
       const e = this.tailPtr + i * 20;
-      this._colBufOff[i] = Number(this.view.getBigUint64(e + 4, true));
-      this._colBufLen[i] = Number(this.view.getBigUint64(e + 12, true));
+      const fid = this.view.getUint16(e, true);
+      if (fid >= kc) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", "invalid field ID in columnar tail");
+      }
+      this._colBufOff[fid] = Number(this.view.getBigUint64(e + 4, true));
+      this._colBufLen[fid] = Number(this.view.getBigUint64(e + 12, true));
     }
     this._tailStart = this.tailPtr;
   }
@@ -380,7 +384,9 @@ export class NxsReader {
     }
     let sum = 0;
     for (let i = 0; i < n; i++) {
-      if (this._colBit(bitmap, i)) sum += rdF64(values, i * 8);
+      if (!this._colBit(bitmap, i)) continue;
+      const off = i * 8;
+      if (off + 8 <= values.length) sum += rdF64(values, off);
     }
     return sum;
   }

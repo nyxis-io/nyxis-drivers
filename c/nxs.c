@@ -232,9 +232,9 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
             size_t e = r->tail_start + (size_t)i * COL_TAIL_ENTRY_BYTES;
             if (e + COL_TAIL_ENTRY_BYTES > size) return NXS_ERR_OUT_OF_BOUNDS;
             uint16_t fid = rd_u16(data + e);
-            if ((int)fid != i) { /* tolerate out-of-order */ }
-            r->col_buf_off[i] = rd_u64(data + e + 4);
-            r->col_buf_len[i] = rd_u64(data + e + 12);
+            if ((int)fid >= r->key_count) return NXS_ERR_OUT_OF_BOUNDS;
+            r->col_buf_off[fid] = rd_u64(data + e + 4);
+            r->col_buf_len[fid] = rd_u64(data + e + 12);
         }
     } else if (r->flags & FLAG_PAX) {
         if (size < FOOTER_PAX_BYTES) return NXS_ERR_OUT_OF_BOUNDS;
@@ -390,6 +390,8 @@ static nxs_err_t pax_field_values(const nxs_reader_t *r, uint32_t rec, int slot,
     size_t poff = (size_t)r->page_offset[pi];
     if (poff + 24 > r->size || rd_u32(r->data + poff) != MAGIC_PAGE)
         return NXS_ERR_BAD_PAGE_MAGIC;
+    uint16_t fc = rd_u16(r->data + poff + 20);
+    if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
     uint32_t rc = r->page_rec_count[pi];
     size_t body = poff + 24;
     for (int fi = 0; fi < slot; fi++) {
@@ -397,7 +399,7 @@ static nxs_err_t pax_field_values(const nxs_reader_t *r, uint32_t rec, int slot,
         body += bm + (size_t)rc * 8u;
     }
     size_t bm_len = null_bitmap_bytes(rc);
-    if (body + bm_len > r->size) return NXS_ERR_OUT_OF_BOUNDS;
+    if (body + bm_len + (size_t)rc * 8u > r->size) return NXS_ERR_OUT_OF_BOUNDS;
     if (!col_bit(r->data + body, li)) return NXS_ERR_FIELD_ABSENT;
     *vals = r->data + body + bm_len + (size_t)li * 8u;
     *val_len = 8;

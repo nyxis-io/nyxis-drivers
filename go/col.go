@@ -75,8 +75,12 @@ func (r *Reader) parseColumnarFooter() error {
 		if e+colTailEntryBytes > len(r.data) {
 			return fmt.Errorf("ERR_OUT_OF_BOUNDS: columnar tail entry")
 		}
-		r.colBufOff[i] = binary.LittleEndian.Uint64(r.data[e+4 : e+12])
-		r.colBufLen[i] = binary.LittleEndian.Uint64(r.data[e+12 : e+20])
+		fid := binary.LittleEndian.Uint16(r.data[e : e+2])
+		if int(fid) >= kc {
+			return fmt.Errorf("ERR_OUT_OF_BOUNDS: invalid field ID %d", fid)
+		}
+		r.colBufOff[fid] = binary.LittleEndian.Uint64(r.data[e+4 : e+12])
+		r.colBufLen[fid] = binary.LittleEndian.Uint64(r.data[e+12 : e+20])
 	}
 	return nil
 }
@@ -227,6 +231,10 @@ func (r *Reader) pageFieldParts(pi uint32, slot int) ([]byte, []byte, bool) {
 	const magicPage uint32 = 0x4E585350
 	poff := int(r.pageOffset[pi])
 	if poff+24 > len(r.data) || binary.LittleEndian.Uint32(r.data[poff:]) != magicPage {
+		return nil, nil, false
+	}
+	fc := int(binary.LittleEndian.Uint16(r.data[poff+20 : poff+22]))
+	if slot < 0 || slot >= fc {
 		return nil, nil, false
 	}
 	rc := int(r.pageRecCount[pi])
