@@ -22,9 +22,10 @@ tasks.register<JavaExec>("bench") {
     group = "application"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("nxs.BenchKt")
-    args = listOf(
-        project.findProperty("benchFixtures") as String? ?: "../../nyxis/site/bench/fixtures",
-    )
+    args =
+        listOf(
+            project.findProperty("benchFixtures") as String? ?: "../../nyxis/site/bench/fixtures",
+        )
 }
 
 tasks.register<JavaExec>("conformance") {
