@@ -143,7 +143,7 @@ void nxs_close(nxs_reader_t *r) { (void)r; }
 uint32_t nxs_record_count(const nxs_reader_t *r) { return r->record_count; }
 
 int nxs_slot(const nxs_reader_t *r, const char *key) {
-    if (r->key_count <= 0 || r->key_ht_mask == 0) return -1;
+    if (!key || r->key_count <= 0 || r->key_ht_mask == 0) return -1;
     uint32_t h = key_hash(key);
     int pos = (int)(h & r->key_ht_mask);
     while (r->key_ht[pos] != KEY_HT_EMPTY) {
@@ -193,7 +193,7 @@ static nxs_err_t build_rank_cache(nxs_object_t *obj) {
     int kc = r->key_count;
     size_t p = obj->bitmask_start;
     int slot = 0;
-    memset(obj->present, 0, (size_t)kc);
+    memset(obj->present, 0, sizeof obj->present);
     while (slot < kc) {
         if (p >= r->size) return NXS_ERR_OUT_OF_BOUNDS;
         uint8_t b = data[p++];
