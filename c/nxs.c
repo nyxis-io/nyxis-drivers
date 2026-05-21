@@ -381,6 +381,67 @@ int64_t nxs_resolve_slot(nxs_object_t *obj, int slot) {
 
 // ── Typed accessors ───────────────────────────────────────────────────────────
 
+size_t nxs_pax_complete_page_at(const uint8_t *data, size_t size, size_t off,
+                                uint16_t field_count) {
+    if (!data || off + 28 > size || field_count == 0) return 0;
+    if (rd_u32(data + off) != MAGIC_PAGE) return 0;
+    uint32_t rc = rd_u32(data + off + 16);
+    size_t body = 24;
+    for (uint16_t fi = 0; fi < field_count; fi++) {
+        body += null_bitmap_bytes(rc) + (size_t)rc * 8u;
+    }
+    size_t page_len = body + 4;
+    size_t aligned = (page_len + 7u) & ~(size_t)7u;
+    if (off + page_len > size) return 0;
+    if (rd_u32(data + off + page_len - 4) != (uint32_t)page_len) return 0;
+    if (off + aligned > size) return 0;
+    return aligned;
+}
+
+static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
+                                         size_t poff, int slot,
+                                         const uint8_t **bm, size_t *bm_len,
+                                         const uint8_t **vals, size_t *val_len,
+                                         uint32_t *record_count) {
+    if (poff + 24 > size || rd_u32(data + poff) != MAGIC_PAGE)
+        return NXS_ERR_BAD_PAGE_MAGIC;
+    uint32_t rc = rd_u32(data + poff + 16);
+    uint16_t fc = rd_u16(data + poff + 20);
+    if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t body = poff + 24;
+    for (int fi = 0; fi < slot; fi++) {
+        size_t bl = null_bitmap_bytes(rc);
+        body += bl + (size_t)rc * 8u;
+    }
+    size_t bl = null_bitmap_bytes(rc);
+    if (body + bl + (size_t)rc * 8u > size) return NXS_ERR_OUT_OF_BOUNDS;
+    *bm = data + body;
+    *bm_len = bl;
+    *vals = data + body + bl;
+    *val_len = (size_t)rc * 8u;
+    *record_count = rc;
+    return NXS_OK;
+}
+
+static double pax_col_sum_f64_slot(const nxs_reader_t *r, int slot) {
+    double sum = 0.0;
+    for (uint32_t pi = 0; pi < r->page_count; pi++) {
+        const uint8_t *bm, *vals;
+        size_t bm_len, val_len;
+        uint32_t rc;
+        size_t poff = (size_t)r->page_offset[pi];
+        if (pax_page_field_parts_at(r->data, r->size, poff, slot,
+                                    &bm, &bm_len, &vals, &val_len, &rc) != NXS_OK)
+            continue;
+        for (uint32_t i = 0; i < rc; i++) {
+            if (!col_bit(bm, i)) continue;
+            size_t off = (size_t)i * 8u;
+            if (off + 8 <= val_len) sum += rd_f64(vals + off);
+        }
+    }
+    return sum;
+}
+
 static nxs_err_t pax_field_values(const nxs_reader_t *r, uint32_t rec, int slot,
                                   const uint8_t **vals, size_t *val_len,
                                   uint32_t *local_idx) {
@@ -535,6 +596,7 @@ double nxs_col_sum_f64(const nxs_reader_t *r, const char *field) {
     int slot = nxs_slot(r, field);
     if (slot < 0) return 0.0;
     if (r->layout == NXS_LAYOUT_ROW) return nxs_sum_f64(r, field);
+    if (r->layout == NXS_LAYOUT_PAX) return pax_col_sum_f64_slot(r, slot);
     const uint8_t *bm, *vals;
     size_t bm_len, val_len;
     if (col_field_parts(r, slot, &bm, &bm_len, &vals, &val_len) != NXS_OK) return 0.0;
@@ -738,6 +800,219 @@ nxs_err_t nxs_max_f64(const nxs_reader_t *r, const char *key, double *out) {
     if (!have) return NXS_ERR_FIELD_ABSENT;
     *out = m;
     return NXS_OK;
+}
+
+// ── PAX stream reader ─────────────────────────────────────────────────────────
+
+static void pax_stream_free_pages(nxs_pax_stream_reader_t *sr) {
+    free(sr->page_index);
+    free(sr->page_rec_start);
+    free(sr->page_rec_count);
+    free(sr->page_offset);
+    free(sr->page_length);
+    sr->page_index = NULL;
+    sr->page_rec_start = NULL;
+    sr->page_rec_count = NULL;
+    sr->page_offset = NULL;
+    sr->page_length = NULL;
+    sr->page_count = 0;
+    sr->records_available = 0;
+}
+
+static int pax_stream_grow_page(nxs_pax_stream_reader_t *sr, uint32_t page_index,
+                                uint64_t rec_start, uint32_t rec_count,
+                                uint64_t page_off, uint32_t page_len) {
+    uint32_t n = sr->page_count + 1;
+    uint32_t *pi = realloc(sr->page_index, (size_t)n * sizeof(uint32_t));
+    uint64_t *rs = realloc(sr->page_rec_start, (size_t)n * sizeof(uint64_t));
+    uint32_t *rc = realloc(sr->page_rec_count, (size_t)n * sizeof(uint32_t));
+    uint64_t *po = realloc(sr->page_offset, (size_t)n * sizeof(uint64_t));
+    uint32_t *pl = realloc(sr->page_length, (size_t)n * sizeof(uint32_t));
+    if (!pi || !rs || !rc || !po || !pl) {
+        free(pi); free(rs); free(rc); free(po); free(pl);
+        return 0;
+    }
+    sr->page_index = pi;
+    sr->page_rec_start = rs;
+    sr->page_rec_count = rc;
+    sr->page_offset = po;
+    sr->page_length = pl;
+    uint32_t i = sr->page_count;
+    sr->page_index[i] = page_index;
+    sr->page_rec_start[i] = rec_start;
+    sr->page_rec_count[i] = rec_count;
+    sr->page_offset[i] = page_off;
+    sr->page_length[i] = page_len;
+    sr->page_count = n;
+    sr->records_available += rec_count;
+    return 1;
+}
+
+static int pax_stream_detect_sealed(const uint8_t *data, size_t size, uint64_t *tail_index_off) {
+    if (size < FOOTER_PAX_BYTES) return 0;
+    if (rd_u32(data + size - 4) != MAGIC_FOOTER) return 0;
+    uint64_t tp = rd_u64(data + size - FOOTER_PAX_BYTES);
+    if (tp == 0 || tp >= size || size - tp < 16) return 0;
+    *tail_index_off = tp;
+    return 1;
+}
+
+static nxs_err_t pax_stream_load_sealed_tail(nxs_pax_stream_reader_t *sr, uint64_t tail_off) {
+    pax_stream_free_pages(sr);
+    const uint8_t *data = sr->data;
+    size_t size = sr->size;
+    size_t fo = size - FOOTER_PAX_BYTES;
+    uint32_t pc = rd_u32(data + fo + 16);
+    sr->scan_cursor = size;
+    if (pc == 0) {
+        sr->sealed = 1;
+        return NXS_OK;
+    }
+    sr->page_index = calloc(pc, sizeof(uint32_t));
+    sr->page_rec_start = calloc(pc, sizeof(uint64_t));
+    sr->page_rec_count = calloc(pc, sizeof(uint32_t));
+    sr->page_offset = calloc(pc, sizeof(uint64_t));
+    sr->page_length = calloc(pc, sizeof(uint32_t));
+    if (!sr->page_index || !sr->page_rec_start || !sr->page_rec_count ||
+        !sr->page_offset || !sr->page_length) {
+        pax_stream_free_pages(sr);
+        return NXS_ERR_ALLOC;
+    }
+    sr->page_count = pc;
+    sr->records_available = 0;
+    for (uint32_t i = 0; i < pc; i++) {
+        size_t e = (size_t)tail_off + (size_t)i * PAX_TAIL_ENTRY_BYTES;
+        if (e + PAX_TAIL_ENTRY_BYTES > size) return NXS_ERR_OUT_OF_BOUNDS;
+        sr->page_index[i] = rd_u32(data + e);
+        sr->page_rec_start[i] = rd_u64(data + e + 4);
+        sr->page_rec_count[i] = rd_u32(data + e + 12);
+        sr->page_offset[i] = rd_u64(data + e + 16);
+        sr->page_length[i] = rd_u32(data + e + 24);
+        sr->records_available += sr->page_rec_count[i];
+    }
+    sr->sealed = 1;
+    return NXS_OK;
+}
+
+nxs_err_t nxs_pax_stream_open(nxs_pax_stream_reader_t *sr,
+                              const uint8_t *data, size_t size) {
+    if (!sr || !data || size < 32) return NXS_ERR_OUT_OF_BOUNDS;
+    memset(sr, 0, sizeof(*sr));
+    sr->data = data;
+    sr->size = size;
+    if (rd_u32(data) != MAGIC_FILE) return NXS_ERR_BAD_MAGIC;
+    if ((rd_u16(data + 6) & FLAG_PAX) == 0) return NXS_ERR_INVALID_FLAGS;
+    if (rd_u64(data + 16) != 0)
+        return NXS_ERR_INCOMPATIBLE;
+    sr->version = rd_u16(data + 4);
+    sr->flags = rd_u16(data + 6);
+    sr->dict_hash = rd_u64(data + 8);
+    if (!(sr->flags & FLAG_SCHEMA)) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t off = 32;
+    if (off + 2 > size) return NXS_ERR_OUT_OF_BOUNDS;
+    uint16_t kc = rd_u16(data + off);
+    off += 2;
+    if (kc > NXS_MAX_KEYS) kc = NXS_MAX_KEYS;
+    if (off + kc > size) return NXS_ERR_OUT_OF_BOUNDS;
+    memcpy(sr->key_sigils, data + off, kc);
+    off += kc;
+    sr->key_count = (int)kc;
+    char *pool = sr->_pool;
+    size_t pool_used = 0;
+    for (int i = 0; i < sr->key_count; i++) {
+        const uint8_t *start = data + off;
+        while (off < size && data[off] != 0) off++;
+        if (off >= size) return NXS_ERR_OUT_OF_BOUNDS;
+        size_t len = (size_t)(data + off - start);
+        if (pool_used + len + 1 > sizeof(sr->_pool)) return NXS_ERR_OUT_OF_BOUNDS;
+        memcpy(pool + pool_used, start, len);
+        pool[pool_used + len] = '\0';
+        sr->keys[i] = pool + pool_used;
+        pool_used += len + 1;
+        off++;
+    }
+    size_t schema_end = (off + 7) & ~(size_t)7;
+    if (murmur3_64(data + 32, schema_end - 32) != sr->dict_hash)
+        return NXS_ERR_DICT_MISMATCH;
+    sr->data_start = schema_end;
+    sr->scan_cursor = schema_end;
+    uint64_t tail_off = 0;
+    if (pax_stream_detect_sealed(data, size, &tail_off)) {
+        nxs_err_t err = pax_stream_load_sealed_tail(sr, tail_off);
+        if (err != NXS_OK) return err;
+    }
+    return NXS_OK;
+}
+
+void nxs_pax_stream_close(nxs_pax_stream_reader_t *sr) {
+    if (sr) pax_stream_free_pages(sr);
+}
+
+uint32_t nxs_pax_stream_poll(nxs_pax_stream_reader_t *sr) {
+    if (!sr) return 0;
+    uint32_t before = sr->page_count;
+    const uint8_t *data = sr->data;
+    size_t size = sr->size;
+    uint64_t tail_off = 0;
+    if (!sr->sealed && pax_stream_detect_sealed(data, size, &tail_off)) {
+        if (pax_stream_load_sealed_tail(sr, tail_off) == NXS_OK)
+            return sr->page_count - before;
+    }
+    if (sr->sealed) return 0;
+    uint16_t fc = (uint16_t)sr->key_count;
+    while (sr->scan_cursor + 28 <= size) {
+        if (rd_u32(data + sr->scan_cursor) != MAGIC_PAGE) break;
+        size_t plen = nxs_pax_complete_page_at(data, size, sr->scan_cursor, fc);
+        if (plen == 0) break;
+        uint32_t pidx = rd_u32(data + sr->scan_cursor + 4);
+        uint64_t rstart = rd_u64(data + sr->scan_cursor + 8);
+        uint32_t rc = rd_u32(data + sr->scan_cursor + 16);
+        size_t body = 24;
+        for (uint16_t fi = 0; fi < fc; fi++)
+            body += null_bitmap_bytes(rc) + (size_t)rc * 8u;
+        uint32_t page_len = (uint32_t)(body + 4);
+        if (!pax_stream_grow_page(sr, pidx, rstart, rc, sr->scan_cursor, page_len))
+            break;
+        sr->scan_cursor += plen;
+    }
+    return sr->page_count - before;
+}
+
+int nxs_pax_stream_is_sealed(const nxs_pax_stream_reader_t *sr) {
+    return sr && sr->sealed;
+}
+
+uint32_t nxs_pax_stream_page_count(const nxs_pax_stream_reader_t *sr) {
+    return sr ? sr->page_count : 0;
+}
+
+uint64_t nxs_pax_stream_records_available(const nxs_pax_stream_reader_t *sr) {
+    return sr ? sr->records_available : 0;
+}
+
+double nxs_pax_stream_col_sum_f64(const nxs_pax_stream_reader_t *sr, const char *field) {
+    if (!sr) return 0.0;
+    int slot = -1;
+    for (int i = 0; i < sr->key_count; i++) {
+        if (strcmp(sr->keys[i], field) == 0) { slot = i; break; }
+    }
+    if (slot < 0) return 0.0;
+    double sum = 0.0;
+    for (uint32_t pi = 0; pi < sr->page_count; pi++) {
+        const uint8_t *bm, *vals;
+        size_t bm_len, val_len;
+        uint32_t rc;
+        size_t poff = (size_t)sr->page_offset[pi];
+        if (pax_page_field_parts_at(sr->data, sr->size, poff, slot,
+                                    &bm, &bm_len, &vals, &val_len, &rc) != NXS_OK)
+            continue;
+        for (uint32_t i = 0; i < rc; i++) {
+            if (!col_bit(bm, i)) continue;
+            size_t off = (size_t)i * 8u;
+            if (off + 8 <= val_len) sum += rd_f64(vals + off);
+        }
+    }
+    return sum;
 }
 
 // ── Query engine ──────────────────────────────────────────────────────────────

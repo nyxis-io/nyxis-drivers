@@ -3,7 +3,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { NxsReader, NxsStreamReader, eq, gt, lt, and, not } from "./nxs.js";
+import { NxsReader, NxsStreamReader, NxsPaxStreamReader, paxCompletePageAt, eq, gt, lt, and, not } from "./nxs.js";
 import { NxsSchema, NxsWriter } from "./nxs_writer.js";
 
 const fixtureDir = process.argv[2] || "./fixtures";
@@ -432,6 +432,46 @@ test("columnar layout — colSumF64 and colBuffer (conformance vector)", () => {
   const { values, count } = r.colBuffer("score");
   assertEq(count, 100, "buffer count");
   assertEq(values.length, 800, "value bytes");
+});
+
+test("PAX sealed — colSumF64 across pages (conformance vector)", () => {
+  const paxPath = join(fixtureDir, "../../nyxis/conformance/pax_flat8_dense_p256_1000.nxb");
+  const alt = join(fixtureDir, "../nyxis/conformance/pax_flat8_dense_p256_1000.nxb");
+  const path = existsSync(paxPath) ? paxPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const r = new NxsReader(readFileSync(path));
+  assertEq(r.layout, "pax", "layout");
+  assertEq(r.recordCount, 1000, "record count");
+  const sum = r.colSumF64("score");
+  let want = 0;
+  for (let i = 0; i < 1000; i++) want += i * 0.5;
+  assertClose(sum, want, 1e-6, "pax col sum score");
+});
+
+test("PAX stream — first complete page before seal", () => {
+  const paxPath = join(fixtureDir, "../../nyxis/conformance/pax_flat8_dense_p256_1000.nxb");
+  const alt = join(fixtureDir, "../nyxis/conformance/pax_flat8_dense_p256_1000.nxb");
+  const path = existsSync(paxPath) ? paxPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const full = readFileSync(path);
+  let dataStart = 32;
+  const kc = new DataView(full.buffer, full.byteOffset, full.byteLength).getUint16(32, true);
+  dataStart = 34 + kc;
+  for (let i = 0; i < kc; i++) {
+    while (dataStart < full.length && full[dataStart] !== 0) dataStart++;
+    dataStart++;
+  }
+  dataStart = (dataStart + 7) & ~7;
+  const plen = paxCompletePageAt(full, dataStart, kc);
+  if (!plen) throw new Error("first page not complete in conformance vector");
+  const partial = full.slice(0, dataStart + plen);
+  new DataView(partial.buffer, partial.byteOffset, partial.byteLength).setBigUint64(16, 0n, true);
+  const sr = new NxsPaxStreamReader();
+  sr.push(partial);
+  assertEq(sr.recordsAvailable, 256, "records in first page");
+  let want = 0;
+  for (let i = 0; i < 256; i++) want += i * 0.5;
+  assertClose(sr.colSumF64("score"), want, 1e-6, "stream page1 sum");
 });
 
 test("columnar — null bitmap uses integer byte index (colGetF64)", async () => {

@@ -358,6 +358,62 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* PAX sealed col sum + streaming first page */
+    {
+        char pax_path[512];
+        snprintf(pax_path, sizeof(pax_path), "%s/../../nyxis/conformance/pax_flat8_dense_p256_1000.nxb", dir);
+        size_t pax_size = 0;
+        uint8_t *pax_data = read_file(pax_path, &pax_size);
+        if (!pax_data) {
+            snprintf(pax_path, sizeof(pax_path), "%s/../nyxis/conformance/pax_flat8_dense_p256_1000.nxb", dir);
+            pax_data = read_file(pax_path, &pax_size);
+        }
+        if (pax_data) {
+            nxs_reader_t pr;
+            if (nxs_open(&pr, pax_data, pax_size) == NXS_OK) {
+                double sum = nxs_col_sum_f64(&pr, "score");
+                double want = 0.0;
+                for (int i = 0; i < 1000; i++) want += (double)i * 0.5;
+                CHECK("PAX ColSumF64 matches dense conformance", fabs(sum - want) < 1e-3);
+                nxs_close(&pr);
+            } else {
+                CHECK("PAX conformance opens", 0);
+            }
+            size_t off = 32;
+            if (off + 2 <= pax_size) {
+                uint16_t kc;
+                memcpy(&kc, pax_data + off, 2);
+                off += 2 + kc;
+                for (uint16_t ki = 0; ki < kc; ki++) {
+                    while (off < pax_size && pax_data[off]) off++;
+                    off++;
+                }
+                off = (off + 7) & ~(size_t)7;
+                size_t plen = nxs_pax_complete_page_at(pax_data, pax_size, off, kc);
+                if (plen > 0) {
+                    uint8_t *partial = malloc(off + plen);
+                    if (partial) {
+                        memcpy(partial, pax_data, off + plen);
+                        memset(partial + 16, 0, 8);
+                    nxs_pax_stream_reader_t psr;
+                    if (partial && nxs_pax_stream_open(&psr, partial, off + plen) == NXS_OK) {
+                        nxs_pax_stream_poll(&psr);
+                        CHECK("PAX stream first page has 256 records",
+                              nxs_pax_stream_records_available(&psr) == 256);
+                        double s1 = nxs_pax_stream_col_sum_f64(&psr, "score");
+                        double w1 = 0.0;
+                        for (int i = 0; i < 256; i++) w1 += (double)i * 0.5;
+                        CHECK("PAX stream page1 sum", fabs(s1 - w1) < 1e-3);
+                        nxs_pax_stream_close(&psr);
+                    }
+                    free(partial);
+                    }
+                }
+            }
+            free(pax_data);
+        }
+    }
+
     printf("\n%d passed, %d failed\n\n", passed, failed);
     return failed > 0 ? 1 : 0;
 }
