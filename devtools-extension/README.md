@@ -54,4 +54,4 @@ const text = decodeToNxs(await fetch("/path/file.nxb").then(r => r.arrayBuffer()
 
 ## Permissions
 
-Only `devtools` — no host permissions, no access to page DOM. Decoding runs locally in the DevTools context.
+No manifest permissions. DevTools access is declared via `devtools_page` only (there is no `devtools` permission in MV3). No host permissions and no page DOM access; decoding runs locally in the DevTools context.

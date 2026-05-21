@@ -3,6 +3,5 @@
   "name": "Nyxis Inspector",
   "version": "1.0.0",
   "description": "Decode .nxb network responses to human-readable .nxs in DevTools",
-  "devtools_page": "devtools.html",
-  "permissions": ["devtools"]
+  "devtools_page": "devtools.html"
 }
