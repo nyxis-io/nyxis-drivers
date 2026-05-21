@@ -41,6 +41,10 @@ html, body {
   color: #ce9178;
 }
 
+.meta.error {
+  color: #f48771;
+}
+
 .actions {
   display: flex;
   gap: 6px;

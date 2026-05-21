@@ -1,4 +1,4 @@
-const api = globalThis.chrome ?? globalThis.browser;
+const api = globalThis.chrome;
 
 const metaEl = document.getElementById("meta");
 const viewerEl = document.getElementById("viewer");
@@ -6,10 +6,35 @@ const copyBtn = document.getElementById("copy");
 const wrapBtn = document.getElementById("wrap");
 
 let lastText = "";
+let port = null;
 
-const port = api.runtime.connect({ name: "nyxis-inspector-panel" });
+function connectPanel() {
+  try {
+    port = api.runtime.connect({ name: "nyxis-inspector-panel" });
+  } catch (err) {
+    setStatus(`Could not connect: ${err?.message ?? err}`, true);
+    return;
+  }
 
-port.onMessage.addListener((msg) => {
+  port.onDisconnect.addListener(() => {
+    port = null;
+    setStatus("Disconnected — close DevTools and reopen, or reload the extension.", true);
+  });
+
+  port.onMessage.addListener(onMessage);
+}
+
+function setStatus(text, isError = false) {
+  metaEl.textContent = text;
+  metaEl.classList.toggle("error", isError);
+}
+
+function onMessage(msg) {
+  if (msg.type === "PANEL_STATUS") {
+    setStatus(msg.message ?? "", !msg.connected);
+    return;
+  }
+
   if (msg.type === "UPDATE_VIEWER") {
     lastText = msg.data ?? "";
     viewerEl.textContent = lastText;
@@ -23,6 +48,7 @@ port.onMessage.addListener((msg) => {
     if (m.recordCount != null) parts.push(`${m.recordCount} record(s)`);
     const tail = parts.length ? ` — ${parts.join(" · ")}` : "";
     const shortUrl = shortenUrl(m.url);
+    metaEl.classList.remove("error");
     metaEl.innerHTML = shortUrl
       ? `<span title="${escapeAttr(m.url)}">${escapeHtml(shortUrl)}</span>${escapeHtml(tail)}`
       : "Decoded .nxb response";
@@ -34,9 +60,12 @@ port.onMessage.addListener((msg) => {
     viewerEl.textContent = `Decode error: ${msg.message}`;
     viewerEl.classList.add("error");
     copyBtn.disabled = true;
+    metaEl.classList.add("error");
     metaEl.textContent = msg.meta?.url ? shortenUrl(msg.meta.url) : "Error";
   }
-});
+}
+
+connectPanel();
 
 copyBtn.addEventListener("click", async () => {
   if (!lastText) return;

@@ -1,28 +1,36 @@
 /**
- * Nyxis Inspector — DevTools background for the custom panel.
- * Sniffs Network responses for NYXB (.nxb) payloads and sends decoded .nxs text to the panel.
+ * Nyxis Inspector — DevTools page: network sniff + decode, relay to panel via service worker.
  */
 import { decodeToNxs, isNxbBuffer } from "./lib/nxs_decode.js";
 
-const api = globalThis.chrome ?? globalThis.browser;
+const api = globalThis.chrome;
 const NETWORK = api.devtools.network;
 
-/** @type {Set<chrome.runtime.Port>} */
-const panelPorts = new Set();
+/** @type {chrome.runtime.Port | null} */
+let relayPort = null;
 
-api.runtime.onConnect.addListener((port) => {
-  if (port.name !== "nyxis-inspector-panel") return;
-  panelPorts.add(port);
-  port.onDisconnect.addListener(() => panelPorts.delete(port));
-});
+function connectRelay() {
+  try {
+    relayPort = api.runtime.connect({ name: "nyxis-devtools" });
+    relayPort.onDisconnect.addListener(() => {
+      relayPort = null;
+    });
+  } catch (err) {
+    console.error("[Nyxis Inspector] relay connect failed:", err);
+    relayPort = null;
+  }
+}
+
+connectRelay();
 
 function broadcast(msg) {
-  for (const port of panelPorts) {
-    try {
-      port.postMessage(msg);
-    } catch {
-      panelPorts.delete(port);
-    }
+  if (!relayPort) connectRelay();
+  if (!relayPort) return;
+  try {
+    relayPort.postMessage(msg);
+  } catch (err) {
+    console.error("[Nyxis Inspector] broadcast failed:", err);
+    relayPort = null;
   }
 }
 
@@ -48,8 +56,9 @@ function responseToUint8Array(content, encoding) {
 function shouldInspectRequest(request) {
   const url = request.request?.url ?? "";
   if (/\.nxb(\?|#|$)/i.test(url)) return true;
-  const mime = request.response?.content?.mimeType ?? "";
+  const mime = (request.response?.content?.mimeType ?? "").toLowerCase();
   if (mime.includes("octet-stream") && /\.nxb/i.test(url)) return true;
+  if (/\/bench\/fixtures\//i.test(url) && request.request?.method === "GET") return true;
   return false;
 }
 
@@ -88,11 +97,10 @@ function inspectRequest(request) {
   });
 }
 
-api.devtools.panels.create(
-  "Nyxis",
-  "",
-  "panel.html",
-  () => {},
-);
-
 NETWORK.onRequestFinished.addListener(inspectRequest);
+
+broadcast({
+  type: "PANEL_STATUS",
+  connected: true,
+  message: "Network listener active — load a .nxb URL (DevTools must be open before the request).",
+});

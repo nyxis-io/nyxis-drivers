@@ -14,7 +14,16 @@ Chrome / Firefox extension that registers a **Nyxis** sidebar in Developer Tools
 
 3. **Firefox:** `about:debugging` → This Firefox → **Load Temporary Add-on** → `manifest.json`.
 
-4. Open DevTools on any page → **Nyxis** tab. Fetch a `.nxb` URL (e.g. from [nyxis.io](https://www.nyxis.io) demo fixtures); the panel updates automatically.
+4. Open DevTools on any page → **Nyxis** tab in the **top** toolbar (beside Console / Network — not a Network sidebar). Fetch a `.nxb` URL (e.g. `https://www.nyxis.io/bench/fixtures/records_1000.nxb`); the panel updates automatically.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|--------|-----|
+| No **Nyxis** tab | Reload extension at `chrome://extensions`; close all DevTools windows and reopen. |
+| Tab exists, empty / “bridge not ready” | Select **Nyxis** again after DevTools fully opens, or reload the extension. |
+| Tab works, never decodes | DevTools must be **open before** the request. Use **Network** → reload page → pick a `.nxb` row. |
+| Explorer loads `.nxs` only | That path compiles in-page; wire traffic is text. Load a `.nxb` fixture URL instead. |
 
 ## How it works
 

@@ -8,7 +8,7 @@
 <body>
   <header class="toolbar">
     <div class="brand">Nyxis Inspector</div>
-    <div class="meta" id="meta">Load a page and fetch a <code>.nxb</code> file — decoded <code>.nxs</code> appears here.</div>
+    <div class="meta" id="meta">Connecting…</div>
     <div class="actions">
       <button type="button" id="copy" disabled>Copy</button>
       <button type="button" id="wrap" title="Toggle line wrap">Wrap</button>
@@ -16,8 +16,9 @@
   </header>
   <pre id="viewer" class="viewer" aria-label="Decoded NXS source"></pre>
   <footer class="hint">
-    Sniffs Network responses ending in <code>.nxb</code> or NYXB magic (<code>0x4E595842</code>).
-    Bi-modal: wire <code>.nxb</code> on the network, audit as <code>.nxs</code> here.
+    <strong>Tab:</strong> top DevTools bar → <strong>Nyxis</strong> (next to Console, Network, …).
+    <strong>Data:</strong> open <strong>Network</strong>, reload with DevTools already open, then request a <code>.nxb</code> URL
+    (e.g. <code>…/bench/fixtures/records_1000.nxb</code>). In-page <code>.nxs</code> loads are not on the wire as binary.
   </footer>
   <script type="module" src="panel.js"></script>
 </body>

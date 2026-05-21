@@ -36,5 +36,6 @@ c/test
 c/bench
 
 *.png
+!devtools-extension/icons/*.png
 .para-worktrees/
 context
