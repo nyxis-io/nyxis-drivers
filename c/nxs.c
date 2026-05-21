@@ -391,10 +391,9 @@ size_t nxs_pax_complete_page_at(const uint8_t *data, size_t size, size_t off,
     if (!data || off + 28 > size || field_count == 0) return 0;
     if (rd_u32(data + off) != MAGIC_PAGE) return 0;
     uint32_t rc = rd_u32(data + off + 16);
-    size_t body = 24;
-    for (uint16_t fi = 0; fi < field_count; fi++) {
-        body += null_bitmap_bytes(rc) + (size_t)rc * 8u;
-    }
+    size_t bl = null_bitmap_bytes(rc);
+    size_t field_stride = bl + (size_t)rc * 8u;
+    size_t body = 24 + (size_t)field_count * field_stride;
     size_t page_len = body + 4;
     size_t aligned = (page_len + 7u) & ~(size_t)7u;
     if (off + page_len > size) return 0;
@@ -820,44 +819,44 @@ static void pax_stream_free_pages(nxs_pax_stream_reader_t *sr) {
     sr->page_offset = NULL;
     sr->page_length = NULL;
     sr->page_count = 0;
+    sr->page_capacity = 0;
     sr->records_available = 0;
+}
+
+static int pax_stream_ensure_capacity(nxs_pax_stream_reader_t *sr, uint32_t need) {
+    if (need <= sr->page_capacity) return 1;
+    uint32_t cap = sr->page_capacity ? sr->page_capacity : 8u;
+    while (cap < need) {
+        if (cap > UINT32_MAX / 2u) {
+            cap = need;
+            break;
+        }
+        cap *= 2u;
+    }
+    uint32_t *pi = realloc(sr->page_index, (size_t)cap * sizeof(uint32_t));
+    if (!pi) return 0;
+    sr->page_index = pi;
+    uint64_t *rs = realloc(sr->page_rec_start, (size_t)cap * sizeof(uint64_t));
+    if (!rs) return 0;
+    sr->page_rec_start = rs;
+    uint32_t *rc = realloc(sr->page_rec_count, (size_t)cap * sizeof(uint32_t));
+    if (!rc) return 0;
+    sr->page_rec_count = rc;
+    uint64_t *po = realloc(sr->page_offset, (size_t)cap * sizeof(uint64_t));
+    if (!po) return 0;
+    sr->page_offset = po;
+    uint32_t *pl = realloc(sr->page_length, (size_t)cap * sizeof(uint32_t));
+    if (!pl) return 0;
+    sr->page_length = pl;
+    sr->page_capacity = cap;
+    return 1;
 }
 
 static int pax_stream_grow_page(nxs_pax_stream_reader_t *sr, uint32_t page_index,
                                 uint64_t rec_start, uint32_t rec_count,
                                 uint64_t page_off, uint32_t page_len) {
     uint32_t n = sr->page_count + 1;
-    size_t bytes = (size_t)n;
-    uint32_t *pi = malloc(bytes * sizeof(uint32_t));
-    uint64_t *rs = malloc(bytes * sizeof(uint64_t));
-    uint32_t *rc = malloc(bytes * sizeof(uint32_t));
-    uint64_t *po = malloc(bytes * sizeof(uint64_t));
-    uint32_t *pl = malloc(bytes * sizeof(uint32_t));
-    if (!pi || !rs || !rc || !po || !pl) {
-        free(pi);
-        free(rs);
-        free(rc);
-        free(po);
-        free(pl);
-        return 0;
-    }
-    if (sr->page_count > 0) {
-        memcpy(pi, sr->page_index, (size_t)sr->page_count * sizeof(uint32_t));
-        memcpy(rs, sr->page_rec_start, (size_t)sr->page_count * sizeof(uint64_t));
-        memcpy(rc, sr->page_rec_count, (size_t)sr->page_count * sizeof(uint32_t));
-        memcpy(po, sr->page_offset, (size_t)sr->page_count * sizeof(uint64_t));
-        memcpy(pl, sr->page_length, (size_t)sr->page_count * sizeof(uint32_t));
-    }
-    free(sr->page_index);
-    free(sr->page_rec_start);
-    free(sr->page_rec_count);
-    free(sr->page_offset);
-    free(sr->page_length);
-    sr->page_index = pi;
-    sr->page_rec_start = rs;
-    sr->page_rec_count = rc;
-    sr->page_offset = po;
-    sr->page_length = pl;
+    if (!pax_stream_ensure_capacity(sr, n)) return 0;
     uint32_t i = sr->page_count;
     sr->page_index[i] = page_index;
     sr->page_rec_start[i] = rec_start;
@@ -928,12 +927,12 @@ nxs_err_t nxs_pax_stream_open(nxs_pax_stream_reader_t *sr,
     sr->version = rd_u16(data + 4);
     sr->flags = rd_u16(data + 6);
     sr->dict_hash = rd_u64(data + 8);
-    if (!(sr->flags & FLAG_SCHEMA)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (!(sr->flags & FLAG_SCHEMA)) return NXS_ERR_INVALID_FLAGS;
     size_t off = 32;
     if (off + 2 > size) return NXS_ERR_OUT_OF_BOUNDS;
     uint16_t kc = rd_u16(data + off);
     off += 2;
-    if (kc > NXS_MAX_KEYS) return NXS_ERR_OUT_OF_BOUNDS;
+    if (kc > NXS_MAX_KEYS) return NXS_ERR_INCOMPATIBLE;
     if (off + kc > size) return NXS_ERR_OUT_OF_BOUNDS;
     memcpy(sr->key_sigils, data + off, kc);
     off += kc;

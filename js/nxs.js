@@ -932,13 +932,10 @@ export function paxCompletePageAt(bytes, off, fieldCount) {
   if (off + 28 > bytes.length || fieldCount === 0) return 0;
   if (rdU32(bytes, off) !== MAGIC_PAGE) return 0;
   const rc = rdU32(bytes, off + 16);
-  let body = 24;
-  for (let fi = 0; fi < fieldCount; fi++) {
-    const bmLen = ((rc + 7) >> 3);
-    const alignedBm = (bmLen + 7) & ~7;
-    body += alignedBm + rc * 8;
-  }
-  const pageLen = body + 4;
+  const rawBm = (rc + 7) >> 3;
+  const alignedBm = (rawBm + 7) & ~7;
+  const fieldStride = alignedBm + rc * 8;
+  const pageLen = 24 + fieldCount * fieldStride + 4;
   const aligned = (pageLen + 7) & ~7;
   if (off + pageLen > bytes.length) return 0;
   if (rdU32(bytes, off + pageLen - 4) !== pageLen) return 0;
@@ -1053,11 +1050,8 @@ export class NxsPaxStreamReader {
       const pidx = rdU32(this.bytes, this._scanCursor + 4);
       const rstart = Number(this.view.getBigUint64(this._scanCursor + 8, true));
       const rc = rdU32(this.bytes, this._scanCursor + 16);
-      let body = 24;
-      for (let fi = 0; fi < fc; fi++) {
-        body += this._nullBitmapBytes(rc) + rc * 8;
-      }
-      const pageLen = body + 4;
+      const fieldStride = this._nullBitmapBytes(rc) + rc * 8;
+      const pageLen = 24 + fc * fieldStride + 4;
       this._pageIndex.push(pidx);
       this._pageRecStart.push(rstart);
       this._pageRecCount.push(rc);

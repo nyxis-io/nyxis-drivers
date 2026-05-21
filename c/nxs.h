@@ -246,6 +246,7 @@ typedef struct {
     int            sealed;
 
     uint32_t       page_count;
+    uint32_t       page_capacity;
     uint64_t       records_available;
     uint32_t      *page_index;
     uint64_t      *page_rec_start;

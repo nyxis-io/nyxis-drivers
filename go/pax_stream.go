@@ -41,10 +41,8 @@ func PaxCompletePageAt(data []byte, off int, fieldCount uint16) int {
 		return 0
 	}
 	rc := binary.LittleEndian.Uint32(data[off+16 : off+20])
-	body := 24
-	for fi := uint16(0); fi < fieldCount; fi++ {
-		body += nullBitmapBytes(rc) + int(rc)*8
-	}
+	fieldStride := nullBitmapBytes(rc) + int(rc)*8
+	body := 24 + int(fieldCount)*fieldStride
 	pageLen := body + 4
 	aligned := (pageLen + 7) &^ 7
 	if off+pageLen > len(data) {
@@ -202,11 +200,8 @@ func (sr *PaxStreamReader) Poll() uint32 {
 		pidx := binary.LittleEndian.Uint32(sr.data[sr.scanCursor+4:])
 		rstart := binary.LittleEndian.Uint64(sr.data[sr.scanCursor+8:])
 		rc := binary.LittleEndian.Uint32(sr.data[sr.scanCursor+16:])
-		body := 24
-		for fi := uint16(0); fi < fc; fi++ {
-			body += nullBitmapBytes(rc) + int(rc)*8
-		}
-		pageLen := uint32(body + 4)
+		fieldStride := nullBitmapBytes(rc) + int(rc)*8
+		pageLen := uint32(24 + int(fc)*fieldStride + 4)
 		sr.pageIndex = append(sr.pageIndex, pidx)
 		sr.pageRecStart = append(sr.pageRecStart, rstart)
 		sr.pageRecCount = append(sr.pageRecCount, rc)
