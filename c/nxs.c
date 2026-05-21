@@ -43,7 +43,7 @@ static uint32_t key_hash(const char *s) {
 static void key_index_build(nxs_reader_t *r) {
     int cap = 64;
     while (cap < r->key_count * 2) cap *= 2;
-    if (cap > NXS_MAX_KEYS) cap = NXS_MAX_KEYS;
+    if (cap > NXS_MAX_KEYS * 2) cap = NXS_MAX_KEYS * 2;
     r->key_ht_mask = (uint16_t)(cap - 1);
     for (int i = 0; i < cap; i++) r->key_ht[i] = KEY_HT_EMPTY;
     for (int i = 0; i < r->key_count; i++) {
@@ -220,6 +220,7 @@ nxs_err_t nxs_stage_object(nxs_object_t *obj) {
 
 int64_t nxs_resolve_slot(nxs_object_t *obj, int slot) {
     if (slot < 0) return -1;
+    if (slot >= obj->reader->key_count) return -1;
     if (build_rank_cache(obj) != NXS_OK) return -1;
     if (!obj->present[slot]) return -1;
     const uint8_t *data = obj->reader->data;

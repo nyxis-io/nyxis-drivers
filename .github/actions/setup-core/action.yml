@@ -43,5 +43,8 @@ runs:
         key: rust-fixtures-${{ hashFiles('nyxis/rust/Cargo.lock') }}
         restore-keys: rust-fixtures-
 
-    - run: make -C nyxis fixtures FIXTURE_COUNT=${{ inputs.fixture_count }}
+    - run: mkdir -p nyxis/bench/fixtures
+      shell: bash
+
+    - run: make -C nyxis fixtures FIXTURE_COUNT=${{ inputs.fixture_count }} FIXTURE_DIR=bench/fixtures
       shell: bash

@@ -49,7 +49,7 @@ typedef struct {
 
     // O(1) key name → slot (open-addressing; built at nxs_open)
     uint16_t       key_ht_mask;
-    int16_t        key_ht[NXS_MAX_KEYS];
+    int16_t        key_ht[NXS_MAX_KEYS * 2];
 
     // scratch for key string copies
     char           _pool[NXS_MAX_KEYS * 64];
