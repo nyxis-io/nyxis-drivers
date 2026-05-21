@@ -1,3 +1,8 @@
+import {
+  isContextInvalidated,
+  CONTEXT_INVALIDATED_USER_MSG,
+} from "./context.js";
+
 const api = globalThis.chrome;
 
 const metaEl = document.getElementById("meta");
@@ -12,8 +17,33 @@ let lastText = "";
 let port = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
+let extensionDead = false;
+
+function showExtensionReloaded() {
+  extensionDead = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  viewerEl.classList.remove("decoding");
+  setStatus(CONTEXT_INVALIDATED_USER_MSG, true);
+}
+
+function runtimeReachable() {
+  try {
+    void api.runtime.id;
+    return true;
+  } catch (err) {
+    return !isContextInvalidated(err);
+  }
+}
 
 function connectPanel() {
+  if (extensionDead) return;
+  if (!runtimeReachable()) {
+    showExtensionReloaded();
+    return;
+  }
   if (port) {
     try {
       port.disconnect();
@@ -27,12 +57,17 @@ function connectPanel() {
     port = api.runtime.connect({ name: "nyxis-inspector-panel" });
     reconnectAttempt = 0;
   } catch (err) {
+    if (isContextInvalidated(err)) {
+      showExtensionReloaded();
+      return;
+    }
     scheduleReconnect(`Could not connect: ${err?.message ?? err}`);
     return;
   }
 
   port.onDisconnect.addListener(() => {
     port = null;
+    if (extensionDead) return;
     scheduleReconnect();
   });
 
@@ -40,7 +75,7 @@ function connectPanel() {
 }
 
 function scheduleReconnect(statusText) {
-  if (reconnectTimer) return;
+  if (extensionDead || reconnectTimer) return;
 
   if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
     setStatus(
@@ -119,14 +154,7 @@ function onMessage(msg) {
     const parts = [];
     if (m.method && m.status != null) parts.push(`${m.method} ${m.status}`);
     if (m.size != null) parts.push(`${formatBytes(m.size)}`);
-    if (m.recordCount != null) {
-      const shown = m.previewShown ?? m.recordCount;
-      parts.push(
-        shown < m.recordCount
-          ? `${shown} of ${m.recordCount} record(s) preview`
-          : `${m.recordCount} record(s)`,
-      );
-    }
+    if (m.recordCount != null) parts.push(`${m.recordCount} record(s)`);
     const tail = parts.length ? ` — ${parts.join(" · ")}` : "";
     const shortUrl = shortenUrl(m.url);
     metaEl.classList.remove("error");

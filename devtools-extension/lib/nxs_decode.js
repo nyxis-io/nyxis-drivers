@@ -173,7 +173,7 @@ function formatRecord(reader, index) {
 /**
  * Decode an NXB buffer to `.nxs`-style source text.
  * @param {ArrayBuffer|Uint8Array} input
- * @param {{ maxRecords?: number }} [options] — cap rows (DevTools preview); default all records
+ * @param {{ maxRecords?: number }} [options] — optional row cap; default all records
  * @returns {string}
  */
 export function decodeToNxs(input, options = {}) {

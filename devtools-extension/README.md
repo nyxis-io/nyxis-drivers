@@ -26,7 +26,8 @@ Chrome / Firefox extension that registers a **Nyxis** sidebar in Developer Tools
 | Explorer loads `.nxs` only | That path compiles in-page; wire traffic is text. Load a `.nxb` fixture URL instead. |
 | Stale decode after refresh | Fixed: panel clears on `devtools.network.onNavigated` when the inspected page reloads. |
 | “Disconnected” / slow decode | MV3 service worker sleeps when idle; v1.0.3 adds heartbeat, auto-reconnect, and a “Fetching & decoding…” status while `getContent` + decode run. |
-| Stuck on “Fetching & decoding” | Often an empty cached body: disable **Network → Disable cache** and hard-reload. Inspector shows first **100** records (file may have more). |
+| Stuck on “Fetching & decoding” | Often an empty cached body: disable **Network → Disable cache** and hard-reload. Very large files may take time to decode and send to the panel. |
+| `Extension context invalidated` | You reloaded the extension while DevTools was open. **Close DevTools completely**, then reopen (no reconnect loop will fix it). |
 
 ## How it works
 

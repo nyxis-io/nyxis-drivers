@@ -2,14 +2,16 @@
  * Nyxis Inspector — DevTools page: network sniff + decode, relay to panel via service worker.
  */
 import { decodeToNxs, isNxbBuffer } from "./lib/nxs_decode.js";
+import {
+  isContextInvalidated,
+  CONTEXT_INVALIDATED_USER_MSG,
+} from "./context.js";
 
 const api = globalThis.chrome;
 const NETWORK = api.devtools.network;
 
 const HEARTBEAT_MS = 20_000;
 const RELAY_RETRY_MS = 400;
-/** DevTools preview: full decode of 10k+ records can freeze messaging UI. */
-const INSPECTOR_MAX_RECORDS = 100;
 const GET_CONTENT_TIMEOUT_MS = 45_000;
 
 /** @type {chrome.runtime.Port | null} */
@@ -18,6 +20,8 @@ let heartbeatTimer = null;
 let relayRetryTimer = null;
 /** Bumped on navigation so in-flight getContent/decode results are ignored. */
 let navigationGeneration = 0;
+/** Set when the extension reloads while this DevTools window is still open. */
+let extensionDead = false;
 
 function stopHeartbeat() {
   if (heartbeatTimer) {
@@ -26,24 +30,41 @@ function stopHeartbeat() {
   }
 }
 
+function markExtensionDead(err) {
+  if (extensionDead) return;
+  extensionDead = true;
+  stopHeartbeat();
+  if (relayRetryTimer) {
+    clearTimeout(relayRetryTimer);
+    relayRetryTimer = null;
+  }
+  relayPort = null;
+  console.warn("[Nyxis Inspector]", CONTEXT_INVALIDATED_USER_MSG, err);
+}
+
 function startHeartbeat() {
   stopHeartbeat();
   heartbeatTimer = setInterval(() => {
+    if (extensionDead) return;
     if (!relayPort) {
       connectRelay();
       return;
     }
     try {
       relayPort.postMessage({ type: "PING" });
-    } catch {
+    } catch (err) {
       relayPort = null;
+      if (isContextInvalidated(err)) {
+        markExtensionDead(err);
+        return;
+      }
       connectRelay();
     }
   }, HEARTBEAT_MS);
 }
 
 function scheduleRelayReconnect() {
-  if (relayRetryTimer) return;
+  if (extensionDead || relayRetryTimer) return;
   relayRetryTimer = setTimeout(() => {
     relayRetryTimer = null;
     connectRelay();
@@ -51,6 +72,7 @@ function scheduleRelayReconnect() {
 }
 
 function connectRelay() {
+  if (extensionDead) return;
   if (relayPort) {
     try {
       relayPort.disconnect();
@@ -74,6 +96,10 @@ function connectRelay() {
       message: "Network listener active — load a .nxb URL (DevTools must be open before the request).",
     });
   } catch (err) {
+    if (isContextInvalidated(err)) {
+      markExtensionDead(err);
+      return;
+    }
     console.error("[Nyxis Inspector] relay connect failed:", err);
     relayPort = null;
     scheduleRelayReconnect();
@@ -83,11 +109,16 @@ function connectRelay() {
 connectRelay();
 
 function broadcast(msg) {
+  if (extensionDead) return;
   if (!relayPort) connectRelay();
   if (!relayPort) return;
   try {
     relayPort.postMessage(msg);
   } catch (err) {
+    if (isContextInvalidated(err)) {
+      markExtensionDead(err);
+      return;
+    }
     console.error("[Nyxis Inspector] broadcast failed:", err);
     relayPort = null;
     scheduleRelayReconnect();
@@ -198,12 +229,10 @@ function inspectRequest(request) {
       setTimeout(() => {
         if (captureGeneration !== navigationGeneration) return;
         try {
-          const text = decodeToNxs(bytes, { maxRecords: INSPECTOR_MAX_RECORDS });
+          const text = decodeToNxs(bytes);
           const size = bytes.byteLength;
           const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
           const recordCount = recordMatch ? Number(recordMatch[1]) : null;
-          const previewMatch = text.match(/preview limit (\d+)/);
-          const previewShown = previewMatch ? Number(previewMatch[1]) : recordCount;
 
           broadcast({
             type: "UPDATE_VIEWER",
@@ -212,7 +241,6 @@ function inspectRequest(request) {
               url,
               size,
               recordCount,
-              previewShown,
               method: request.request.method,
               status: request.response.status,
             },
