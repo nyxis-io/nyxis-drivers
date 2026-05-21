@@ -17,6 +17,11 @@ const MAGIC_OBJ    = 0x4E59584F; // NYXO
 const MAGIC_LIST   = 0x4E59584C; // NYXL
 const MAGIC_FOOTER = 0x2153584E; // NXS!
 
+const FLAG_COLUMNAR = 0x0001;
+const FLAG_PAX      = 0x0004;
+const FLAG_SCHEMA_EMBEDDED = 0x0002;
+const FOOTER_COL_BYTES = 20;
+
 const SIGIL_INT     = 0x3D; // =
 const SIGIL_FLOAT   = 0x7E; // ~
 const SIGIL_BOOL    = 0x3F; // ?
@@ -201,6 +206,7 @@ export class NxsReader {
 
     this.version   = this.view.getUint16(4, true);
     this.flags     = this.view.getUint16(6, true);
+    this._layout   = "row";
     this.dictHash  = this.view.getBigUint64(8, true);
     this.tailPtr   = Number(this.view.getBigUint64(16, true));
     // bytes 24-31 reserved
@@ -220,7 +226,7 @@ export class NxsReader {
     // Schema
     this.keys = [];
     this.keySigils = [];
-    if (this.flags & 0x0002) { // Schema Embedded
+    if (this.flags & FLAG_SCHEMA_EMBEDDED) {
       this._readSchema(32);
       const computedHash = murmur3_64(this.bytes, 32, this._schemaEnd - 32);
       if (computedHash !== this.dictHash) {
@@ -228,8 +234,30 @@ export class NxsReader {
       }
     }
 
-    // Tail-index
-    this._readTailIndex();
+    this._colBufOff = [];
+    this._colBufLen = [];
+
+    if ((this.flags & FLAG_COLUMNAR) && (this.flags & FLAG_PAX)) {
+      throw new NxsError("ERR_INVALID_FLAGS", "columnar and PAX both set");
+    }
+    if (this.flags & FLAG_COLUMNAR) {
+      if (this.tailPtr === 0) {
+        throw new NxsError("ERR_INCOMPATIBLE_FLAGS", "columnar requires sealed tail pointer");
+      }
+      this._layout = "columnar";
+      this._readColumnarFooter();
+    } else if (this.flags & FLAG_PAX) {
+      this._layout = "pax";
+      this._readPaxFooter();
+    } else {
+      this._layout = "row";
+      this._readTailIndex();
+    }
+  }
+
+  /** `row` | `columnar` | `pax` */
+  get layout() {
+    return this._layout;
   }
 
   _readSchema(offset) {
@@ -262,6 +290,126 @@ export class NxsReader {
     p += 4;
     // Record array: [KeyID u16][AbsoluteOffset u64] × N
     this._tailStart = p;
+  }
+
+  _readColumnarFooter() {
+    const fo = this.bytes.length - FOOTER_COL_BYTES;
+    if (fo < 32) throw new NxsError("ERR_OUT_OF_BOUNDS", "columnar footer");
+    this.tailPtr = Number(this.view.getBigUint64(fo, true));
+    this.recordCount = Number(this.view.getBigUint64(fo + 8, true));
+    const kc = this.keys.length;
+    this._colBufOff = new Array(kc);
+    this._colBufLen = new Array(kc);
+    for (let i = 0; i < kc; i++) {
+      const e = this.tailPtr + i * 20;
+      this._colBufOff[i] = Number(this.view.getBigUint64(e + 4, true));
+      this._colBufLen[i] = Number(this.view.getBigUint64(e + 12, true));
+    }
+    this._tailStart = this.tailPtr;
+  }
+
+  _readPaxFooter() {
+    const fo = this.bytes.length - 28;
+    this.tailPtr = Number(this.view.getBigUint64(fo, true));
+    this.recordCount = Number(this.view.getBigUint64(fo + 8, true));
+    this._tailStart = this.tailPtr;
+  }
+
+  _nullBitmapBytes(n) {
+    const raw = Math.ceil(n / 8);
+    return (raw + 7) & ~7;
+  }
+
+  _colFieldParts(slot) {
+    const off = this._colBufOff[slot];
+    const len = this._colBufLen[slot];
+    if (off + len > this.bytes.length) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", "column sector");
+    }
+    const bmLen = this._nullBitmapBytes(this.recordCount);
+    if (len < bmLen) throw new NxsError("ERR_OUT_OF_BOUNDS", "column sector short");
+    const sector = this.bytes.subarray(off, off + len);
+    return {
+      bitmap: sector.subarray(0, bmLen),
+      values: sector.subarray(bmLen),
+    };
+  }
+
+  _colBit(bitmap, rec) {
+    return ((bitmap[rec >> 3] >> (rec & 7)) & 1) === 1;
+  }
+
+  /**
+   * Raw value bytes for a columnar/PAX field (dense numeric tail only).
+   * @returns {{ values: Uint8Array, bitmap: Uint8Array, count: number }}
+   */
+  colBuffer(key) {
+    if (this.layout !== "columnar" && this.layout !== "pax") {
+      throw new NxsError("ERR_LAYOUT", "colBuffer requires columnar or PAX layout");
+    }
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    const { bitmap, values } = this._colFieldParts(slot);
+    return { values, bitmap, count: this.recordCount };
+  }
+
+  /** f64 at `recordIndex` in a columnar column (null → null). */
+  colGetF64(key, recordIndex) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    const { bitmap, values } = this._colFieldParts(slot);
+    if (!this._colBit(bitmap, recordIndex)) return null;
+    const off = recordIndex * 8;
+    if (off + 8 > values.length) return null;
+    return rdF64(values, off);
+  }
+
+  /**
+   * Sum a columnar f64 column (dense fast path when bitmap is all-ones).
+   */
+  colSumF64(key) {
+    if (this.layout !== "columnar" && this.layout !== "pax") {
+      return this.sumF64(key);
+    }
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    const { bitmap, values } = this._colFieldParts(slot);
+    const n = this.recordCount;
+    if (this._nullBitmapDense(bitmap, n)) {
+      return this._sumF64DenseColumn(values, n);
+    }
+    let sum = 0;
+    for (let i = 0; i < n; i++) {
+      if (this._colBit(bitmap, i)) sum += rdF64(values, i * 8);
+    }
+    return sum;
+  }
+
+  _nullBitmapDense(bitmap, n) {
+    if (n === 0) return true;
+    const full = (n / 8) | 0;
+    for (let i = 0; i < full; i++) {
+      if (bitmap[i] !== 0xff) return false;
+    }
+    const rem = n % 8;
+    if (rem === 0) return true;
+    const mask = (1 << rem) - 1;
+    return (bitmap[full] & mask) === mask;
+  }
+
+  _sumF64DenseColumn(values, n) {
+    let i = 0;
+    let a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    const end16 = n - (n % 16);
+    for (; i < end16; i += 16) {
+      a0 += rdF64(values, i * 8);
+      a1 += rdF64(values, (i + 4) * 8);
+      a2 += rdF64(values, (i + 8) * 8);
+      a3 += rdF64(values, (i + 12) * 8);
+    }
+    let sum = a0 + a1 + a2 + a3;
+    for (; i < n; i++) sum += rdF64(values, i * 8);
+    return sum;
   }
 
   /**
@@ -560,6 +708,9 @@ export class NxsReader {
    * Zero intermediate allocation — returns a single number.
    */
   sumF64(key) {
+    if (this.layout === "columnar" || this.layout === "pax") {
+      return this.colSumF64(key);
+    }
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
     if (this._wasm) {

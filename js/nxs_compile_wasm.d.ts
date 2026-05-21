@@ -3,11 +3,17 @@
 
 export function compile_nxs(source: string): Uint8Array;
 
+/**
+ * Compile record blocks as columnar layout (no `@layout` pragma required in source).
+ */
+export function compile_nxs_columnar(source: string): Uint8Array;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly compile_nxs: (a: number, b: number) => [number, number, number];
+    readonly compile_nxs_columnar: (a: number, b: number) => [number, number, number];
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

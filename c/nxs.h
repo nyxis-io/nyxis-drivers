@@ -25,7 +25,18 @@ typedef enum {
     NXS_ERR_FIELD_ABSENT   = 4,
     NXS_ERR_ALLOC          = 5,
     NXS_ERR_DICT_MISMATCH  = 6,
+    NXS_ERR_INVALID_FLAGS  = 0x10,
+    NXS_ERR_INCOMPATIBLE   = 0x11,
+    NXS_ERR_UNSUPPORTED    = 0x12,
+    NXS_ERR_BAD_PAGE_MAGIC = 0x13,
+    NXS_ERR_UNSUPPORTED_TYPE = 0x15,
 } nxs_err_t;
+
+typedef enum {
+    NXS_LAYOUT_ROW = 0,
+    NXS_LAYOUT_COLUMNAR = 1,
+    NXS_LAYOUT_PAX = 2,
+} nxs_layout_t;
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 #define NXS_MAX_KEYS 256
@@ -43,9 +54,23 @@ typedef struct {
     char          *keys[NXS_MAX_KEYS];
     uint8_t        key_sigils[NXS_MAX_KEYS];
 
-    // tail-index
+    // tail-index / layout
     uint32_t       record_count;
     size_t         tail_start;
+    nxs_layout_t   layout;
+
+    // columnar: per-field buffer location (indexed by slot)
+    uint64_t       col_buf_off[NXS_MAX_KEYS];
+    uint64_t       col_buf_len[NXS_MAX_KEYS];
+
+    // PAX: page table (heap-allocated in nxs_open, freed in nxs_close)
+    uint32_t       page_count;
+    uint32_t       page_size_hint;
+    uint32_t      *page_index;
+    uint64_t      *page_rec_start;
+    uint32_t      *page_rec_count;
+    uint64_t      *page_offset;
+    uint32_t      *page_length;
 
     // O(1) key name → slot (open-addressing; built at nxs_open)
     uint16_t       key_ht_mask;
@@ -73,12 +98,13 @@ int nxs_slot(const nxs_reader_t *r, const char *key);
 // ── Object ────────────────────────────────────────────────────────────────────
 typedef struct {
     const nxs_reader_t *reader;
-    size_t              offset;     // absolute offset of NYXO magic
+    size_t              offset;     // row: NYXO offset; columnar/PAX: record index
     size_t              bitmask_start;
     size_t              offset_table_start;
     uint8_t             stage;      // 0=raw, 1=bitmask located, 2=present+rank cache
     uint8_t             present[NXS_MAX_KEYS];
     uint16_t            rank[NXS_MAX_KEYS + 1];
+    uint32_t            record_index; // columnar/PAX record index
 } nxs_object_t;
 
 // Populate `obj` with a lazy view of record `i`.
@@ -173,6 +199,27 @@ int nxs_query_next(NxsQuery *q, nxs_object_t *out);
 
 /* Count matching records (consumes the iterator). */
 uint32_t nxs_query_count(NxsQuery *q);
+
+/* ── Columnar / PAX OLAP API (OLAP.md) ─────────────────────────────────────── */
+
+double  nxs_col_sum_f64(const nxs_reader_t *r, const char *field);
+double  nxs_col_min_f64(const nxs_reader_t *r, const char *field);
+double  nxs_col_max_f64(const nxs_reader_t *r, const char *field);
+int64_t nxs_col_sum_i64(const nxs_reader_t *r, const char *field);
+
+const void*   nxs_col_buffer(const nxs_reader_t *r, const char *field, size_t *out_len);
+const uint8_t* nxs_col_null_bitmap(const nxs_reader_t *r, const char *field, size_t *out_len);
+
+typedef struct nxs_page nxs_page_t;
+struct nxs_page {
+    const nxs_reader_t *reader;
+    int                  page_idx;
+};
+
+nxs_page_t* nxs_page_first(const nxs_reader_t *r);
+nxs_page_t* nxs_page_next(nxs_page_t *page);
+const void* nxs_page_col_buffer(nxs_page_t *page, const char *field, size_t *out_len);
+void        nxs_page_free(nxs_page_t *page);
 
 #ifdef __cplusplus
 }
