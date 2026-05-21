@@ -125,6 +125,58 @@ func colBit(bm []byte, rec uint32) bool {
 	return (bm[rec/8]>>(rec%8))&1 == 1
 }
 
+func (r *Reader) paxFindPage(rec uint32) (page int, local int, ok bool) {
+	if r.pageCount == 0 {
+		return 0, 0, false
+	}
+	r64 := uint64(rec)
+	lo, hi := 0, int(r.pageCount)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		start := r.pageRecStart[mid]
+		count := uint64(r.pageRecCount[mid])
+		if r64 < start {
+			hi = mid - 1
+		} else if r64 >= start+count {
+			lo = mid + 1
+		} else {
+			return mid, int(r64 - start), true
+		}
+	}
+	return 0, 0, false
+}
+
+// colNumericBytes returns the 8-byte fixed cell for a record/slot in columnar or PAX layout.
+func (r *Reader) colNumericBytes(rec uint32, slot int) ([]byte, bool) {
+	if r.layout == LayoutColumnar {
+		bm, vals, err := r.colFieldParts(slot)
+		if err != nil || rec >= r.recordCount || !colBit(bm, rec) {
+			return nil, false
+		}
+		off := int(rec) * 8
+		if off+8 > len(vals) {
+			return nil, false
+		}
+		return vals[off : off+8], true
+	}
+	if r.layout == LayoutPAX {
+		pi, li, found := r.paxFindPage(rec)
+		if !found {
+			return nil, false
+		}
+		pageBm, pageVals, pageOk := r.pageFieldParts(uint32(pi), slot)
+		if !pageOk || !colBit(pageBm, uint32(li)) {
+			return nil, false
+		}
+		off := li * 8
+		if off+8 > len(pageVals) {
+			return nil, false
+		}
+		return pageVals[off : off+8], true
+	}
+	return nil, false
+}
+
 func (r *Reader) colFieldParts(slot int) (bm []byte, vals []byte, err error) {
 	if slot < 0 || slot >= len(r.colBufOff) {
 		return nil, nil, fmt.Errorf("ERR_KEY_NOT_FOUND")

@@ -21,6 +21,8 @@ const FLAG_COLUMNAR = 0x0001;
 const FLAG_PAX      = 0x0004;
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
 const FOOTER_COL_BYTES = 20;
+const FOOTER_PAX_BYTES = 28;
+const MAGIC_PAGE     = 0x4E585350; // NYXP
 
 const SIGIL_INT     = 0x3D; // =
 const SIGIL_FLOAT   = 0x7E; // ~
@@ -216,7 +218,9 @@ export class NxsReader {
     if (footer !== MAGIC_FOOTER) {
       throw new NxsError("ERR_BAD_MAGIC", "footer magic mismatch");
     }
-    if (this.tailPtr === 0) {
+    const preambleTail = this.tailPtr;
+    const layoutFlags = this.flags & (FLAG_COLUMNAR | FLAG_PAX);
+    if (this.tailPtr === 0 && layoutFlags === 0) {
       if (this.bytes.length < 44) {
         throw new NxsError("ERR_OUT_OF_BOUNDS", "streamable footer missing tail pointer");
       }
@@ -241,7 +245,7 @@ export class NxsReader {
       throw new NxsError("ERR_INVALID_FLAGS", "columnar and PAX both set");
     }
     if (this.flags & FLAG_COLUMNAR) {
-      if (this.tailPtr === 0) {
+      if (preambleTail === 0) {
         throw new NxsError("ERR_INCOMPATIBLE_FLAGS", "columnar requires sealed tail pointer");
       }
       this._layout = "columnar";
@@ -313,10 +317,83 @@ export class NxsReader {
   }
 
   _readPaxFooter() {
-    const fo = this.bytes.length - 28;
+    const fo = this.bytes.length - FOOTER_PAX_BYTES;
+    if (fo < 32) throw new NxsError("ERR_OUT_OF_BOUNDS", "PAX footer");
     this.tailPtr = Number(this.view.getBigUint64(fo, true));
     this.recordCount = Number(this.view.getBigUint64(fo + 8, true));
+    this.pageCount = this.view.getUint32(fo + 16, true);
+    this.pageSizeHint = this.view.getUint32(fo + 20, true);
     this._tailStart = this.tailPtr;
+    this._pageIndex = [];
+    this._pageRecStart = [];
+    this._pageRecCount = [];
+    this._pageOffset = [];
+    this._pageLength = [];
+    for (let i = 0; i < this.pageCount; i++) {
+      const e = this._tailStart + i * 28;
+      this._pageIndex.push(this.view.getUint32(e, true));
+      this._pageRecStart.push(Number(this.view.getBigUint64(e + 4, true)));
+      this._pageRecCount.push(this.view.getUint32(e + 12, true));
+      this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
+      this._pageLength.push(this.view.getUint32(e + 24, true));
+    }
+  }
+
+  _paxFindPage(rec) {
+    if (!this.pageCount) return null;
+    let lo = 0;
+    let hi = this.pageCount - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const start = this._pageRecStart[mid];
+      const count = this._pageRecCount[mid];
+      if (rec < start) hi = mid - 1;
+      else if (rec >= start + count) lo = mid + 1;
+      else return { page: mid, local: rec - start };
+    }
+    return null;
+  }
+
+  _pageFieldParts(pageIndex, slot) {
+    const poff = this._pageOffset[pageIndex];
+    if (poff + 24 > this.bytes.length) return null;
+    if (this.view.getUint32(poff, true) !== MAGIC_PAGE) return null;
+    const fieldCount = this.view.getUint16(poff + 20, true);
+    if (slot < 0 || slot >= fieldCount) return null;
+    const rc = this._pageRecCount[pageIndex];
+    let body = poff + 24;
+    for (let fi = 0; fi < slot; fi++) {
+      const bmLen = this._nullBitmapBytes(rc);
+      body += bmLen + rc * 8;
+    }
+    const bmLen = this._nullBitmapBytes(rc);
+    if (body + bmLen + rc * 8 > this.bytes.length) return null;
+    const sector = this.bytes.subarray(body, body + bmLen + rc * 8);
+    return {
+      bitmap: sector.subarray(0, bmLen),
+      values: sector.subarray(bmLen),
+      pageRecCount: rc,
+    };
+  }
+
+  _colNumericBytes(rec, slot) {
+    if (this._layout === "columnar") {
+      const { bitmap, values } = this._colFieldParts(slot);
+      if (!this._colBit(bitmap, rec)) return null;
+      const off = rec * 8;
+      if (off + 8 > values.length) return null;
+      return values.subarray(off, off + 8);
+    }
+    if (this._layout === "pax") {
+      const loc = this._paxFindPage(rec);
+      if (!loc) return null;
+      const parts = this._pageFieldParts(loc.page, slot);
+      if (!parts || !this._colBit(parts.bitmap, loc.local)) return null;
+      const off = loc.local * 8;
+      if (off + 8 > parts.values.length) return null;
+      return parts.values.subarray(off, off + 8);
+    }
+    return null;
   }
 
   _nullBitmapBytes(n) {
@@ -361,11 +438,9 @@ export class NxsReader {
   colGetF64(key, recordIndex) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    const { bitmap, values } = this._colFieldParts(slot);
-    if (!this._colBit(bitmap, recordIndex)) return null;
-    const off = recordIndex * 8;
-    if (off + 8 > values.length) return null;
-    return rdF64(values, off);
+    const cell = this._colNumericBytes(recordIndex, slot);
+    if (!cell) return null;
+    return rdF64(cell, 0);
   }
 
   /**
@@ -425,6 +500,9 @@ export class NxsReader {
   record(i) {
     if (i < 0 || i >= this.recordCount) {
       throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of [0, ${this.recordCount})`);
+    }
+    if (this._layout === "columnar" || this._layout === "pax") {
+      return new NxsObject(this, i, i);
     }
     // Each tail-index entry: u16 keyId + u64 offset = 10 bytes
     const absOffset = rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
@@ -994,9 +1072,10 @@ export class NxsFieldIndex {
  * Constructing an NxsObject costs ~nothing (just stores an offset).
  */
 export class NxsObject {
-  constructor(reader, offset) {
+  constructor(reader, offset, recordIndex = null) {
     this.reader = reader;
     this.offset = offset;
+    this.recordIndex = recordIndex;
     this._stage = 0; // 0 = untouched, 1 = offset-table located, 2 = rank cached
   }
 
@@ -1185,23 +1264,44 @@ export class NxsObject {
   /** Fast path: resolve slot with `reader.slot("username")` once, reuse. */
   getI64BySlot(slot) {
     if (slot === undefined) return undefined;
+    const r = this.reader;
+    if (r._layout === "columnar" || r._layout === "pax") {
+      const ri = this.recordIndex ?? this.offset;
+      const cell = r._colNumericBytes(ri, slot);
+      if (!cell) return undefined;
+      return rdI64Safe(cell, 0);
+    }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
-    return rdI64Safe(this.reader.bytes, off);
+    return rdI64Safe(r.bytes, off);
   }
 
   getF64BySlot(slot) {
     if (slot === undefined) return undefined;
+    const r = this.reader;
+    if (r._layout === "columnar" || r._layout === "pax") {
+      const ri = this.recordIndex ?? this.offset;
+      const cell = r._colNumericBytes(ri, slot);
+      if (!cell) return undefined;
+      return rdF64(cell, 0);
+    }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
-    return rdF64(this.reader.bytes, off);
+    return rdF64(r.bytes, off);
   }
 
   getBoolBySlot(slot) {
     if (slot === undefined) return undefined;
+    const r = this.reader;
+    if (r._layout === "columnar" || r._layout === "pax") {
+      const ri = this.recordIndex ?? this.offset;
+      const cell = r._colNumericBytes(ri, slot);
+      if (!cell) return undefined;
+      return cell[0] !== 0;
+    }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
-    return this.reader.bytes[off] !== 0;
+    return r.bytes[off] !== 0;
   }
 
   getStrBySlot(slot) {

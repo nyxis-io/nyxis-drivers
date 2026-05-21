@@ -370,6 +370,13 @@ func (o *Object) GetStr(key string) (string, bool) {
 }
 
 func (o *Object) GetI64BySlot(slot int) (int64, bool) {
+	if o.reader.layout != LayoutRow {
+		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
+		if !ok {
+			return 0, false
+		}
+		return int64(binary.LittleEndian.Uint64(cell)), true
+	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
 		return 0, false
@@ -379,19 +386,11 @@ func (o *Object) GetI64BySlot(slot int) (int64, bool) {
 
 func (o *Object) GetF64BySlot(slot int) (float64, bool) {
 	if o.reader.layout != LayoutRow {
-		bm, vals, err := o.reader.colFieldParts(slot)
-		if err != nil {
+		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
+		if !ok {
 			return 0, false
 		}
-		ri := o.recordIndex
-		if !colBit(bm, ri) {
-			return 0, false
-		}
-		off := int(ri) * 8
-		if off+8 > len(vals) {
-			return 0, false
-		}
-		return math.Float64frombits(binary.LittleEndian.Uint64(vals[off : off+8])), true
+		return math.Float64frombits(binary.LittleEndian.Uint64(cell)), true
 	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
@@ -401,6 +400,13 @@ func (o *Object) GetF64BySlot(slot int) (float64, bool) {
 }
 
 func (o *Object) GetBoolBySlot(slot int) (bool, bool) {
+	if o.reader.layout != LayoutRow {
+		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
+		if !ok {
+			return false, false
+		}
+		return cell[0] != 0, true
+	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
 		return false, false
