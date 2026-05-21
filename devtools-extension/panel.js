@@ -100,6 +100,12 @@ function onMessage(msg) {
 
   if (msg.type === "DECODE_SKIPPED") {
     viewerEl.classList.remove("decoding");
+    viewerEl.textContent = "";
+    copyBtn.disabled = true;
+    setStatus(
+      msg.meta?.message ?? "Could not read NYXB body from this response.",
+      true,
+    );
     return;
   }
 
@@ -113,7 +119,14 @@ function onMessage(msg) {
     const parts = [];
     if (m.method && m.status != null) parts.push(`${m.method} ${m.status}`);
     if (m.size != null) parts.push(`${formatBytes(m.size)}`);
-    if (m.recordCount != null) parts.push(`${m.recordCount} record(s)`);
+    if (m.recordCount != null) {
+      const shown = m.previewShown ?? m.recordCount;
+      parts.push(
+        shown < m.recordCount
+          ? `${shown} of ${m.recordCount} record(s) preview`
+          : `${m.recordCount} record(s)`,
+      );
+    }
     const tail = parts.length ? ` — ${parts.join(" · ")}` : "";
     const shortUrl = shortenUrl(m.url);
     metaEl.classList.remove("error");

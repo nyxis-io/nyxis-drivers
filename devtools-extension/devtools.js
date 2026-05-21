@@ -8,6 +8,9 @@ const NETWORK = api.devtools.network;
 
 const HEARTBEAT_MS = 20_000;
 const RELAY_RETRY_MS = 400;
+/** DevTools preview: full decode of 10k+ records can freeze messaging UI. */
+const INSPECTOR_MAX_RECORDS = 100;
+const GET_CONTENT_TIMEOUT_MS = 45_000;
 
 /** @type {chrome.runtime.Port | null} */
 let relayPort = null;
@@ -88,7 +91,20 @@ function broadcast(msg) {
     console.error("[Nyxis Inspector] broadcast failed:", err);
     relayPort = null;
     scheduleRelayReconnect();
+    if (msg.type === "UPDATE_VIEWER" || msg.type === "DECODE_PENDING") {
+      broadcast({
+        type: "DECODE_ERROR",
+        message: err?.message ?? "Could not send decode to panel (message too large?)",
+        meta: msg.meta ?? {},
+      });
+    }
   }
+}
+
+function magicHex(bytes) {
+  if (!bytes || bytes.byteLength < 4) return "n/a";
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, true);
+  return `0x${v.toString(16).toUpperCase().padStart(8, "0")}`;
 }
 
 function clearViewer(reason) {
@@ -137,24 +153,57 @@ function inspectRequest(request) {
     meta: { url },
   });
 
+  let settled = false;
+  const timeoutId = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    broadcast({
+      type: "DECODE_ERROR",
+      message:
+        "Timed out reading response body. In Network, disable cache and hard-reload (Ctrl+Shift+R), or try a smaller .nxb.",
+      meta: { url },
+    });
+  }, GET_CONTENT_TIMEOUT_MS);
+
   request.getContent((content, encoding) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timeoutId);
     if (captureGeneration !== navigationGeneration) return;
 
     try {
       const bytes = responseToUint8Array(content, encoding);
+      if (!bytes.byteLength) {
+        broadcast({
+          type: "DECODE_SKIPPED",
+          meta: {
+            url,
+            message:
+              "Response body empty — Chrome often omits cached bodies. Disable cache in Network and hard-reload.",
+          },
+        });
+        return;
+      }
       if (!isNxbBuffer(bytes)) {
-        broadcast({ type: "DECODE_SKIPPED", meta: { url } });
+        broadcast({
+          type: "DECODE_SKIPPED",
+          meta: {
+            url,
+            message: `Not NYXB (${bytes.byteLength} bytes, magic ${magicHex(bytes)}).`,
+          },
+        });
         return;
       }
 
-      // Yield so DECODE_PENDING can paint before a large synchronous decode.
       setTimeout(() => {
         if (captureGeneration !== navigationGeneration) return;
         try {
-          const text = decodeToNxs(bytes);
+          const text = decodeToNxs(bytes, { maxRecords: INSPECTOR_MAX_RECORDS });
           const size = bytes.byteLength;
           const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
           const recordCount = recordMatch ? Number(recordMatch[1]) : null;
+          const previewMatch = text.match(/preview limit (\d+)/);
+          const previewShown = previewMatch ? Number(previewMatch[1]) : recordCount;
 
           broadcast({
             type: "UPDATE_VIEWER",
@@ -163,6 +212,7 @@ function inspectRequest(request) {
               url,
               size,
               recordCount,
+              previewShown,
               method: request.request.method,
               status: request.response.status,
             },

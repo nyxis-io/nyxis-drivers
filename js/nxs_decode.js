@@ -173,9 +173,10 @@ function formatRecord(reader, index) {
 /**
  * Decode an NXB buffer to `.nxs`-style source text.
  * @param {ArrayBuffer|Uint8Array} input
+ * @param {{ maxRecords?: number }} [options] — cap rows (DevTools preview); default all records
  * @returns {string}
  */
-export function decodeToNxs(input) {
+export function decodeToNxs(input, options = {}) {
   const bytes = input instanceof Uint8Array
     ? input
     : new Uint8Array(input);
@@ -183,16 +184,25 @@ export function decodeToNxs(input) {
     throw new NxsError("ERR_BAD_MAGIC", "not an NXB file (expected NYXB preamble)");
   }
 
+  const maxRecords = options.maxRecords ?? Infinity;
   const reader = new NxsReader(bytes);
+  const showCount = Math.min(reader.recordCount, maxRecords);
   const lines = [
     `# Nyxis decode — NYXB v${reader.version >> 8}.${reader.version & 0xff}, ${reader.recordCount} record(s)`,
     `# schema keys (${reader.keys.length}): ${reader.keys.join(", ")}`,
     "",
   ];
 
-  for (let i = 0; i < reader.recordCount; i++) {
+  for (let i = 0; i < showCount; i++) {
     lines.push(formatRecord(reader, i));
-    if (i + 1 < reader.recordCount) lines.push("");
+    if (i + 1 < showCount) lines.push("");
+  }
+
+  if (reader.recordCount > showCount) {
+    lines.push("");
+    lines.push(
+      `# … ${reader.recordCount - showCount} more record(s) not shown (preview limit ${showCount}).`,
+    );
   }
 
   return lines.join("\n");
