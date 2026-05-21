@@ -413,12 +413,11 @@ static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
     uint32_t rc = rd_u32(data + poff + 16);
     uint16_t fc = rd_u16(data + poff + 20);
     if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
-    size_t body = poff + 24;
-    for (int fi = 0; fi < slot; fi++) {
-        size_t bl = null_bitmap_bytes(rc);
-        body += bl + (size_t)rc * 8u;
-    }
+    if (fc > (uint16_t)NXS_MAX_KEYS) return NXS_ERR_OUT_OF_BOUNDS;
     size_t bl = null_bitmap_bytes(rc);
+    size_t field_stride = bl + (size_t)rc * 8u;
+    if (field_stride == 0 || poff + 24 > size) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t body = poff + 24 + (size_t)slot * field_stride;
     if (body + bl + (size_t)rc * 8u > size) return NXS_ERR_OUT_OF_BOUNDS;
     *bm = data + body;
     *bm_len = bl;
@@ -828,15 +827,32 @@ static int pax_stream_grow_page(nxs_pax_stream_reader_t *sr, uint32_t page_index
                                 uint64_t rec_start, uint32_t rec_count,
                                 uint64_t page_off, uint32_t page_len) {
     uint32_t n = sr->page_count + 1;
-    uint32_t *pi = realloc(sr->page_index, (size_t)n * sizeof(uint32_t));
-    uint64_t *rs = realloc(sr->page_rec_start, (size_t)n * sizeof(uint64_t));
-    uint32_t *rc = realloc(sr->page_rec_count, (size_t)n * sizeof(uint32_t));
-    uint64_t *po = realloc(sr->page_offset, (size_t)n * sizeof(uint64_t));
-    uint32_t *pl = realloc(sr->page_length, (size_t)n * sizeof(uint32_t));
+    size_t bytes = (size_t)n;
+    uint32_t *pi = malloc(bytes * sizeof(uint32_t));
+    uint64_t *rs = malloc(bytes * sizeof(uint64_t));
+    uint32_t *rc = malloc(bytes * sizeof(uint32_t));
+    uint64_t *po = malloc(bytes * sizeof(uint64_t));
+    uint32_t *pl = malloc(bytes * sizeof(uint32_t));
     if (!pi || !rs || !rc || !po || !pl) {
-        free(pi); free(rs); free(rc); free(po); free(pl);
+        free(pi);
+        free(rs);
+        free(rc);
+        free(po);
+        free(pl);
         return 0;
     }
+    if (sr->page_count > 0) {
+        memcpy(pi, sr->page_index, (size_t)sr->page_count * sizeof(uint32_t));
+        memcpy(rs, sr->page_rec_start, (size_t)sr->page_count * sizeof(uint64_t));
+        memcpy(rc, sr->page_rec_count, (size_t)sr->page_count * sizeof(uint32_t));
+        memcpy(po, sr->page_offset, (size_t)sr->page_count * sizeof(uint64_t));
+        memcpy(pl, sr->page_length, (size_t)sr->page_count * sizeof(uint32_t));
+    }
+    free(sr->page_index);
+    free(sr->page_rec_start);
+    free(sr->page_rec_count);
+    free(sr->page_offset);
+    free(sr->page_length);
     sr->page_index = pi;
     sr->page_rec_start = rs;
     sr->page_rec_count = rc;
@@ -857,7 +873,7 @@ static int pax_stream_detect_sealed(const uint8_t *data, size_t size, uint64_t *
     if (size < FOOTER_PAX_BYTES) return 0;
     if (rd_u32(data + size - 4) != MAGIC_FOOTER) return 0;
     uint64_t tp = rd_u64(data + size - FOOTER_PAX_BYTES);
-    if (tp == 0 || tp >= size || size - tp < 16) return 0;
+    if (tp == 0 || tp >= size || size - tp < FOOTER_PAX_BYTES) return 0;
     *tail_index_off = tp;
     return 1;
 }
@@ -917,7 +933,7 @@ nxs_err_t nxs_pax_stream_open(nxs_pax_stream_reader_t *sr,
     if (off + 2 > size) return NXS_ERR_OUT_OF_BOUNDS;
     uint16_t kc = rd_u16(data + off);
     off += 2;
-    if (kc > NXS_MAX_KEYS) kc = NXS_MAX_KEYS;
+    if (kc > NXS_MAX_KEYS) return NXS_ERR_OUT_OF_BOUNDS;
     if (off + kc > size) return NXS_ERR_OUT_OF_BOUNDS;
     memcpy(sr->key_sigils, data + off, kc);
     off += kc;
@@ -972,9 +988,10 @@ uint32_t nxs_pax_stream_poll(nxs_pax_stream_reader_t *sr) {
         uint32_t pidx = rd_u32(data + sr->scan_cursor + 4);
         uint64_t rstart = rd_u64(data + sr->scan_cursor + 8);
         uint32_t rc = rd_u32(data + sr->scan_cursor + 16);
-        size_t body = 24;
-        for (uint16_t fi = 0; fi < fc; fi++)
-            body += null_bitmap_bytes(rc) + (size_t)rc * 8u;
+        size_t bl = null_bitmap_bytes(rc);
+        size_t field_stride = bl + (size_t)rc * 8u;
+        size_t body = 24 + (size_t)fc * field_stride;
+        if (body + 4 > size || body + 4 > 0xFFFFFFFFu) break;
         uint32_t page_len = (uint32_t)(body + 4);
         if (!pax_stream_grow_page(sr, pidx, rstart, rc, sr->scan_cursor, page_len))
             break;

@@ -383,12 +383,9 @@ export class NxsReader {
     const fieldCount = this.view.getUint16(poff + 20, true);
     if (slot < 0 || slot >= fieldCount) return null;
     const rc = this._pageRecCount[pageIndex];
-    let body = poff + 24;
-    for (let fi = 0; fi < slot; fi++) {
-      const bmLen = this._nullBitmapBytes(rc);
-      body += bmLen + rc * 8;
-    }
     const bmLen = this._nullBitmapBytes(rc);
+    const fieldStride = bmLen + rc * 8;
+    const body = poff + 24 + slot * fieldStride;
     if (body + bmLen + rc * 8 > this.bytes.length) return null;
     const sector = this.bytes.subarray(body, body + bmLen + rc * 8);
     return {
@@ -1023,12 +1020,9 @@ export class NxsPaxStreamReader {
     const fieldCount = this.view.getUint16(poff + 20, true);
     if (slot < 0 || slot >= fieldCount) return null;
     const rc = this._pageRecCount[pageIndex];
-    let body = poff + 24;
-    for (let fi = 0; fi < slot; fi++) {
-      const bmLen = this._nullBitmapBytes(rc);
-      body += bmLen + rc * 8;
-    }
     const bmLen = this._nullBitmapBytes(rc);
+    const fieldStride = bmLen + rc * 8;
+    const body = poff + 24 + slot * fieldStride;
     if (body + bmLen + rc * 8 > this.bytes.length) return null;
     const sector = this.bytes.subarray(body, body + bmLen + rc * 8);
     return {

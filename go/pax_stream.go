@@ -260,12 +260,9 @@ func (sr *PaxStreamReader) streamPageFieldParts(pi uint32, slot int) ([]byte, []
 		return nil, nil, false
 	}
 	rc := int(sr.pageRecCount[pi])
-	body := poff + 24
-	for fi := 0; fi < slot; fi++ {
-		bmLen := nullBitmapBytes(sr.pageRecCount[pi])
-		body += bmLen + rc*8
-	}
 	bmLen := nullBitmapBytes(sr.pageRecCount[pi])
+	fieldStride := bmLen + rc*8
+	body := poff + 24 + slot*fieldStride
 	if body+bmLen+rc*8 > len(sr.data) {
 		return nil, nil, false
 	}
