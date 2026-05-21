@@ -129,7 +129,11 @@ function onMessage(msg) {
     viewerEl.classList.add("decoding");
     viewerEl.textContent = "";
     copyBtn.disabled = true;
-    setStatus(url ? `Fetching & decoding ${shortenUrl(url)}…` : "Fetching & decoding…");
+    if (msg.meta?.message) {
+      setStatus(msg.meta.message);
+    } else {
+      setStatus(url ? `Fetching & decoding ${shortenUrl(url)}…` : "Fetching & decoding…");
+    }
     return;
   }
 

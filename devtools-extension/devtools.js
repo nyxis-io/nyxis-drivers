@@ -173,6 +173,126 @@ function shouldInspectRequest(request) {
   return false;
 }
 
+/** Re-fetch when DevTools getContent returns empty (cached responses). */
+async function fetchNxbUrl(url) {
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "omit",
+    redirect: "follow",
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+function decodeAndBroadcast(bytes, url, request, captureGeneration) {
+  if (captureGeneration !== navigationGeneration) return;
+
+  if (!isNxbBuffer(bytes)) {
+    broadcast({
+      type: "DECODE_SKIPPED",
+      meta: {
+        url,
+        message: `Not NYXB (${bytes.byteLength} bytes, magic ${magicHex(bytes)}).`,
+      },
+    });
+    return;
+  }
+
+  setTimeout(() => {
+    if (captureGeneration !== navigationGeneration) return;
+    try {
+      const text = decodeToNxs(bytes);
+      const size = bytes.byteLength;
+      const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
+      const recordCount = recordMatch ? Number(recordMatch[1]) : null;
+
+      broadcast({
+        type: "UPDATE_VIEWER",
+        data: text,
+        meta: {
+          url,
+          size,
+          recordCount,
+          method: request.request.method,
+          status: request.response.status,
+        },
+      });
+    } catch (err) {
+      broadcast({
+        type: "DECODE_ERROR",
+        message: err?.message ?? String(err),
+        meta: { url },
+      });
+    }
+  }, 0);
+}
+
+function loadNxbBody(request, url, captureGeneration) {
+  let finished = false;
+  const timeoutId = setTimeout(() => {
+    if (finished) return;
+    finished = true;
+    broadcast({
+      type: "DECODE_ERROR",
+      message: "Timed out loading .nxb body (Network cache or file too large).",
+      meta: { url },
+    });
+  }, GET_CONTENT_TIMEOUT_MS);
+
+  const finish = (fn) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeoutId);
+    if (captureGeneration !== navigationGeneration) return;
+    fn();
+  };
+
+  const onBytes = (bytes) => {
+    finish(() => decodeAndBroadcast(bytes, url, request, captureGeneration));
+  };
+
+  const onLoadError = (err, triedFetch) => {
+    finish(() => {
+      broadcast({
+        type: "DECODE_SKIPPED",
+        meta: {
+          url,
+          message: triedFetch
+            ? `Could not load .nxb: ${err?.message ?? err}`
+            : `Response body unavailable: ${err?.message ?? err}`,
+        },
+      });
+    });
+  };
+
+  request.getContent((content, encoding) => {
+    if (finished) return;
+    try {
+      const bytes = responseToUint8Array(content, encoding);
+      if (bytes.byteLength > 0) {
+        onBytes(bytes);
+        return;
+      }
+
+      broadcast({
+        type: "DECODE_PENDING",
+        meta: {
+          url,
+          message: "Network cache had no body — re-fetching…",
+        },
+      });
+
+      fetchNxbUrl(url)
+        .then(onBytes)
+        .catch((err) => onLoadError(err, true));
+    } catch (err) {
+      onLoadError(err, false);
+    }
+  });
+}
+
 function inspectRequest(request) {
   if (!shouldInspectRequest(request)) return;
 
@@ -184,83 +304,7 @@ function inspectRequest(request) {
     meta: { url },
   });
 
-  let settled = false;
-  const timeoutId = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    broadcast({
-      type: "DECODE_ERROR",
-      message:
-        "Timed out reading response body. In Network, disable cache and hard-reload (Ctrl+Shift+R), or try a smaller .nxb.",
-      meta: { url },
-    });
-  }, GET_CONTENT_TIMEOUT_MS);
-
-  request.getContent((content, encoding) => {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timeoutId);
-    if (captureGeneration !== navigationGeneration) return;
-
-    try {
-      const bytes = responseToUint8Array(content, encoding);
-      if (!bytes.byteLength) {
-        broadcast({
-          type: "DECODE_SKIPPED",
-          meta: {
-            url,
-            message:
-              "Response body empty — Chrome often omits cached bodies. Disable cache in Network and hard-reload.",
-          },
-        });
-        return;
-      }
-      if (!isNxbBuffer(bytes)) {
-        broadcast({
-          type: "DECODE_SKIPPED",
-          meta: {
-            url,
-            message: `Not NYXB (${bytes.byteLength} bytes, magic ${magicHex(bytes)}).`,
-          },
-        });
-        return;
-      }
-
-      setTimeout(() => {
-        if (captureGeneration !== navigationGeneration) return;
-        try {
-          const text = decodeToNxs(bytes);
-          const size = bytes.byteLength;
-          const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
-          const recordCount = recordMatch ? Number(recordMatch[1]) : null;
-
-          broadcast({
-            type: "UPDATE_VIEWER",
-            data: text,
-            meta: {
-              url,
-              size,
-              recordCount,
-              method: request.request.method,
-              status: request.response.status,
-            },
-          });
-        } catch (err) {
-          broadcast({
-            type: "DECODE_ERROR",
-            message: err?.message ?? String(err),
-            meta: { url },
-          });
-        }
-      }, 0);
-    } catch (err) {
-      broadcast({
-        type: "DECODE_ERROR",
-        message: err?.message ?? String(err),
-        meta: { url },
-      });
-    }
-  });
+  loadNxbBody(request, url, captureGeneration);
 }
 
 NETWORK.onRequestFinished.addListener(inspectRequest);

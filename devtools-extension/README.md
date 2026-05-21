@@ -26,7 +26,7 @@ Chrome / Firefox extension that registers a **Nyxis** sidebar in Developer Tools
 | Explorer loads `.nxs` only | That path compiles in-page; wire traffic is text. Load a `.nxb` fixture URL instead. |
 | Stale decode after refresh | Fixed: panel clears on `devtools.network.onNavigated` when the inspected page reloads. |
 | “Disconnected” / slow decode | MV3 service worker sleeps when idle; v1.0.3 adds heartbeat, auto-reconnect, and a “Fetching & decoding…” status while `getContent` + decode run. |
-| Stuck on “Fetching & decoding” | Often an empty cached body: disable **Network → Disable cache** and hard-reload. Very large files may take time to decode and send to the panel. |
+| Stuck on “Fetching & decoding” | Large files take time to decode and send to the panel. If Network cache omits the body, Inspector **re-fetches** the `.nxb` URL automatically (requires `host_permissions`). |
 | `Extension context invalidated` | You reloaded the extension while DevTools was open. **Close DevTools completely**, then reopen (no reconnect loop will fix it). |
 
 ## How it works
@@ -67,4 +67,4 @@ const text = decodeToNxs(await fetch("/path/file.nxb").then(r => r.arrayBuffer()
 
 ## Permissions
 
-No manifest permissions. DevTools access is declared via `devtools_page` only (there is no `devtools` permission in MV3). No host permissions and no page DOM access; decoding runs locally in the DevTools context.
+`devtools_page` only (no `devtools` permission in MV3). **`host_permissions`: `<all_urls>`** so Inspector can re-fetch `.nxb` URLs when DevTools Network returns an empty cached body. No page DOM access; decoding runs in the DevTools context.
