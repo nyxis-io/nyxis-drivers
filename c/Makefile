@@ -2,7 +2,7 @@ CC      = cc
 CFLAGS  = -std=c99 -O2 -Wall -Wextra
 LDFLAGS = -lm
 
-.PHONY: all clean test bench
+.PHONY: all clean test bench profile-selective
 
 all: test bench
 
@@ -12,5 +12,8 @@ test: test.c nxs.c nxs.h nxs_writer.c nxs_writer.h
 bench: bench.c nxs.c nxs.h
 	$(CC) $(CFLAGS) -o bench bench.c nxs.c $(LDFLAGS)
 
+profile-selective: profile_selective.c nxs.c nxs.h
+	$(CC) $(CFLAGS) -O3 -o profile-selective profile_selective.c nxs.c $(LDFLAGS)
+
 clean:
-	rm -f test bench
+	rm -f test bench profile-selective

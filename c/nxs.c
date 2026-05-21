@@ -27,6 +27,35 @@ static inline double rd_f64(const uint8_t *p) {
 #define MAGIC_FOOTER 0x2153584Eu
 #define FLAG_SCHEMA  0x0002u
 
+#define KEY_HT_EMPTY (-1)
+
+// ── Key index (FNV-1a + open addressing) ─────────────────────────────────────
+
+static uint32_t key_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c = (unsigned char)*s; c; c = (unsigned char)*++s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void key_index_build(nxs_reader_t *r) {
+    int cap = 64;
+    while (cap < r->key_count * 2) cap *= 2;
+    if (cap > NXS_MAX_KEYS * 2) cap = NXS_MAX_KEYS * 2;
+    r->key_ht_mask = (uint16_t)(cap - 1);
+    for (int i = 0; i < cap; i++) r->key_ht[i] = KEY_HT_EMPTY;
+    for (int i = 0; i < r->key_count; i++) {
+        uint32_t h = key_hash(r->keys[i]);
+        int pos = (int)(h & r->key_ht_mask);
+        while (r->key_ht[pos] != KEY_HT_EMPTY) {
+            pos = (pos + 1) & (int)r->key_ht_mask;
+        }
+        r->key_ht[pos] = (int16_t)i;
+    }
+}
+
 // ── MurmurHash3-64 (schema integrity check) ───────────────────────────────────
 
 static uint64_t murmur3_64(const uint8_t *data, size_t len) {
@@ -105,6 +134,7 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
     if (tp + 4 > size) return NXS_ERR_OUT_OF_BOUNDS;
     r->record_count = rd_u32(data + tp);
     r->tail_start   = tp + 4;
+    if (r->key_count > 0) key_index_build(r);
     return NXS_OK;
 }
 
@@ -113,8 +143,13 @@ void nxs_close(nxs_reader_t *r) { (void)r; }
 uint32_t nxs_record_count(const nxs_reader_t *r) { return r->record_count; }
 
 int nxs_slot(const nxs_reader_t *r, const char *key) {
-    for (int i = 0; i < r->key_count; i++) {
-        if (strcmp(r->keys[i], key) == 0) return i;
+    if (!key || r->key_count <= 0 || r->key_ht_mask == 0) return -1;
+    uint32_t h = key_hash(key);
+    int pos = (int)(h & r->key_ht_mask);
+    while (r->key_ht[pos] != KEY_HT_EMPTY) {
+        int slot = (int)r->key_ht[pos];
+        if (strcmp(r->keys[slot], key) == 0) return slot;
+        pos = (pos + 1) & (int)r->key_ht_mask;
     }
     return -1;
 }
@@ -128,12 +163,12 @@ nxs_err_t nxs_record(const nxs_reader_t *r, uint32_t i, nxs_object_t *obj) {
     uint64_t abs_off = rd_u64(r->data + entry);
     obj->reader = r;
     obj->offset = (size_t)abs_off;
-    obj->staged = 0;
+    obj->stage = 0;
     return NXS_OK;
 }
 
 static nxs_err_t locate_bitmask(nxs_object_t *obj) {
-    if (obj->staged) return NXS_OK;
+    if (obj->stage >= 1) return NXS_OK;
     const uint8_t *data = obj->reader->data;
     size_t p = obj->offset;
     if (p + 8 > obj->reader->size) return NXS_ERR_OUT_OF_BOUNDS;
@@ -142,40 +177,57 @@ static nxs_err_t locate_bitmask(nxs_object_t *obj) {
     obj->bitmask_start = p;
     while (p < obj->reader->size && (data[p] & 0x80)) p++;
     if (p >= obj->reader->size) return NXS_ERR_OUT_OF_BOUNDS;
-    p++; // include last byte
+    p++;
     obj->offset_table_start = p;
-    obj->staged = 1;
+    obj->stage = 1;
     return NXS_OK;
+}
+
+static nxs_err_t build_rank_cache(nxs_object_t *obj) {
+    if (obj->stage >= 2) return NXS_OK;
+    nxs_err_t err = locate_bitmask(obj);
+    if (err != NXS_OK) return err;
+
+    const nxs_reader_t *r = obj->reader;
+    const uint8_t *data = r->data;
+    int kc = r->key_count;
+    size_t p = obj->bitmask_start;
+    int slot = 0;
+    memset(obj->present, 0, sizeof obj->present);
+    while (slot < kc) {
+        if (p >= r->size) return NXS_ERR_OUT_OF_BOUNDS;
+        uint8_t b = data[p++];
+        uint8_t bits = b & 0x7F;
+        for (int i = 0; i < 7 && slot < kc; i++) {
+            obj->present[slot] = (bits >> i) & 1;
+            slot++;
+        }
+        if (!(b & 0x80)) break;
+    }
+    uint16_t acc = 0;
+    for (int i = 0; i < kc; i++) {
+        obj->rank[i] = acc;
+        acc += (uint16_t)obj->present[i];
+    }
+    obj->rank[kc] = acc;
+    obj->stage = 2;
+    return NXS_OK;
+}
+
+nxs_err_t nxs_stage_object(nxs_object_t *obj) {
+    return build_rank_cache(obj);
 }
 
 int64_t nxs_resolve_slot(nxs_object_t *obj, int slot) {
     if (slot < 0) return -1;
-    if (locate_bitmask(obj) != NXS_OK) return -1;
+    if (slot >= obj->reader->key_count) return -1;
+    if (build_rank_cache(obj) != NXS_OK) return -1;
+    if (!obj->present[slot]) return -1;
     const uint8_t *data = obj->reader->data;
-    size_t p = obj->bitmask_start;
-    int cur = 0, table_idx = 0;
-    while (1) {
-        if (p >= obj->reader->size) return -1;
-        uint8_t b = data[p++];
-        uint8_t bits = b & 0x7F;
-        for (int i = 0; i < 7; i++) {
-            if (cur == slot) {
-                if (!((bits >> i) & 1)) return -1;
-                // skip remaining continuation bytes
-                while (b & 0x80) {
-                    if (p >= obj->reader->size) break;
-                    b = data[p++];
-                }
-                size_t ot = obj->offset_table_start + (size_t)table_idx * 2;
-                if (ot + 2 > obj->reader->size) return -1;
-                uint16_t rel = rd_u16(data + ot);
-                return (int64_t)(obj->offset + rel);
-            }
-            if (cur < slot && ((bits >> i) & 1)) table_idx++;
-            cur++;
-        }
-        if (!(b & 0x80)) return -1;
-    }
+    size_t ot = obj->offset_table_start + (size_t)obj->rank[slot] * 2;
+    if (ot + 2 > obj->reader->size) return -1;
+    uint16_t rel = rd_u16(data + ot);
+    return (int64_t)(obj->offset + rel);
 }
 
 // ── Typed accessors ───────────────────────────────────────────────────────────
@@ -443,7 +495,7 @@ int nxs_query_next(NxsQuery *q, nxs_object_t *out) {
 
         out->reader = r;
         out->offset = abs_off;
-        out->staged = 0;
+        out->stage = 0;
         return 1;
     }
     return 0;
