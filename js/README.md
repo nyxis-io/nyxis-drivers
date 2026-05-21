@@ -82,6 +82,24 @@ reader.useWasm(wasm);
 const sum = reader.sumF64("score");   // ~1.3× faster at 1M records
 ```
 
+### Random access (cursor, field index, WASM batch)
+
+```js
+const slot = reader.slot("username");
+const cur = reader.cursor();
+cur.seek(42);
+cur.getStrBySlot(slot);           // zero-alloc vs record(42)
+
+cur.seekWarm(42);                 // multi-field: rank cache built once
+cur.getStrBySlot(slot);
+cur.getF64BySlot(reader.slot("score"));
+
+const idx = reader.buildFieldIndex("username"); // one O(n) pass
+idx.getStrAt(42);                 // no bitmask walk per access
+
+reader.batchResolveOffsets(slot, [0, 42, 99]); // one WASM call for many k
+```
+
 Build the WASM module from source (in the core repo):
 
 ```bash

@@ -85,6 +85,37 @@ test("record(42) matches JSON[42].username", () => {
   assertEq(r.record(42).getStr("username"), json[42].username);
 });
 
+test("buildFieldIndex getStrAt matches record().getStr", () => {
+  const r = new NxsReader(buf);
+  const idx = r.buildFieldIndex("username");
+  if (!idx) throw new Error("buildFieldIndex returned null");
+  assertEq(idx.getStrAt(42), json[42].username);
+  assertEq(idx.getStrAt(999), json[999].username);
+});
+
+test("cursor.seekWarm multi-field matches record()", () => {
+  const r = new NxsReader(buf);
+  const slotU = r.slot("username");
+  const slotS = r.slot("score");
+  const cur = r.cursor();
+  cur.seekWarm(500);
+  assertEq(cur.getStrBySlot(slotU), json[500].username);
+  assertClose(cur.getF64BySlot(slotS), json[500].score);
+});
+
+test("batchResolveOffsets matches buildFieldIndex offsets", () => {
+  const r = new NxsReader(buf);
+  const slot = r.slot("username");
+  const indices = [0, 42, 999];
+  const batch = r.batchResolveOffsets(slot, indices);
+  const idx = r.buildFieldIndex("username");
+  for (let j = 0; j < indices.length; j++) {
+    if (batch[j] !== idx.offsets[indices[j]]) {
+      throw new Error(`offset mismatch at record ${indices[j]}`);
+    }
+  }
+});
+
 test("record(500) matches JSON[500].score", () => {
   const r = new NxsReader(buf);
   assertClose(r.record(500).getF64("score"), json[500].score);

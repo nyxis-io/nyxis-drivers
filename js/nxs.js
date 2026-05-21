@@ -334,6 +334,139 @@ export class NxsReader {
     return s;
   }
 
+  /**
+   * Inspect record 0 to find where `slot`'s value lives in every uniform record.
+   * @returns {{ bitmaskLen: number, tableIdx: number, present: boolean }}
+   */
+  _computeFastLayout(slot) {
+    if (this.recordCount === 0) {
+      return { bitmaskLen: 0, tableIdx: 0, present: false };
+    }
+    const bytes = this.bytes;
+    const abs = rdU64AsNumber(bytes, this._tailStart + 2);
+    let p = abs + 8;
+    const bitmaskStart = p;
+    let curSlot = 0;
+    let tableIdx = 0;
+    let present = false;
+    for (;;) {
+      const b = bytes[p++];
+      const bits = b & 0x7F;
+      for (let i = 0; i < 7; i++) {
+        if (curSlot === slot) present = ((bits >> i) & 1) === 1;
+        else if (curSlot < slot && ((bits >> i) & 1)) tableIdx++;
+        curSlot++;
+      }
+      if ((b & 0x80) === 0) break;
+    }
+    return { bitmaskLen: p - bitmaskStart, tableIdx, present };
+  }
+
+  /**
+   * True when every record shares the same bitmask bytes as record 0.
+   * O(n); only worth calling before many fast/indexed scans.
+   */
+  isUniform() {
+    const n = this.recordCount;
+    if (n === 0) return true;
+    const bytes = this.bytes;
+    const abs0 = rdU64AsNumber(bytes, this._tailStart + 2);
+    let p = abs0 + 8;
+    const start = p;
+    for (;;) {
+      const b = bytes[p++];
+      if ((b & 0x80) === 0) break;
+    }
+    const mask = bytes.subarray(start, p);
+    for (let i = 1; i < n; i++) {
+      const abs = rdU64AsNumber(bytes, this._tailStart + i * 10 + 2);
+      const other = bytes.subarray(abs + 8, abs + 8 + mask.length);
+      if (other.length !== mask.length) return false;
+      for (let j = 0; j < mask.length; j++) {
+        if (other[j] !== mask[j]) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * One O(n) pass: absolute byte offset of `key`'s value per record.
+   * Random access becomes `index.getStrAt(k)` with no bitmask walk.
+   * @returns {NxsFieldIndex | null}
+   */
+  buildFieldIndex(key) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._wasm?.fns.build_field_index) {
+      return this._buildFieldIndexWasm(slot);
+    }
+    return this._buildFieldIndexJs(slot);
+  }
+
+  _buildFieldIndexJs(slot) {
+    const layout = this._computeFastLayout(slot);
+    if (!layout.present) return null;
+    const n = this.recordCount;
+    const offsets = new Uint32Array(n);
+    const bytes = this.bytes;
+    const tailStart = this._tailStart;
+    const offsetTablePos = 8 + layout.bitmaskLen + layout.tableIdx * 2;
+    for (let i = 0; i < n; i++) {
+      const abs = rdU64AsNumber(bytes, tailStart + i * 10 + 2);
+      offsets[i] = abs + rdU16(bytes, abs + offsetTablePos);
+    }
+    return new NxsFieldIndex(this, slot, offsets);
+  }
+
+  _buildFieldIndexWasm(slot) {
+    const n = this.recordCount;
+    const wasm = this._wasm;
+    const outPtr = wasm._allocScratch(n * 4);
+    const written = wasm.fns.build_field_index(
+      this._wasmDataBase, this._wasmSize,
+      this._wasmTailStart,
+      n, slot, outPtr);
+    if (!written) return this._buildFieldIndexJs(slot);
+    const offsets = new Uint32Array(wasm.memory.buffer, outPtr, n).slice();
+    return new NxsFieldIndex(this, slot, offsets);
+  }
+
+  /**
+   * Resolve value offsets for many record indices in one WASM call (strings
+   * still decode in JS). Falls back to per-index JS resolve when WASM absent.
+   * @param {number} slot — from reader.slot(key)
+   * @param {Uint32Array | number[]} recordIndices
+   * @returns {Uint32Array} absolute value offsets; `0xFFFFFFFF` = absent
+   */
+  batchResolveOffsets(slot, recordIndices) {
+    const count = recordIndices.length;
+    if (this._wasm?.fns.batch_resolve_offsets) {
+      return this._batchResolveOffsetsWasm(slot, recordIndices);
+    }
+    const out = new Uint32Array(count);
+    const cur = this.cursor();
+    for (let j = 0; j < count; j++) {
+      cur.seek(recordIndices[j]);
+      const off = cur._resolveSlot(slot);
+      out[j] = off < 0 ? 0xFFFFFFFF : off >>> 0;
+    }
+    return out;
+  }
+
+  _batchResolveOffsetsWasm(slot, recordIndices) {
+    const wasm = this._wasm;
+    const count = recordIndices.length;
+    const idxPtr = wasm._allocScratch(count * 4);
+    const outPtr = wasm._allocScratch(count * 4);
+    const idxView = new Uint32Array(wasm.memory.buffer, idxPtr, count);
+    for (let j = 0; j < count; j++) idxView[j] = recordIndices[j] >>> 0;
+    wasm.fns.batch_resolve_offsets(
+      this._wasmDataBase, this._wasmSize,
+      this._wasmTailStart,
+      this.recordCount, slot, idxPtr, count, outPtr);
+    return new Uint32Array(wasm.memory.buffer, outPtr, count).slice();
+  }
+
   // ── Bulk columnar scan ──────────────────────────────────────────────────
   //
   // These methods walk every record in a single JS-native loop that inlines
@@ -646,6 +779,57 @@ export class NxsStreamReader {
   }
 }
 
+// ── Pre-built field index (random access without per-read bitmask walk) ─────
+
+const ABSENT_OFFSET = 0xFFFFFFFF;
+
+/**
+ * Flat per-record value offsets for one schema field. Built via
+ * `reader.buildFieldIndex(key)` (one O(n) scan).
+ */
+export class NxsFieldIndex {
+  /**
+   * @param {NxsReader} reader
+   * @param {number} slot
+   * @param {Uint32Array} offsets — absolute file offsets of each value
+   */
+  constructor(reader, slot, offsets) {
+    this.reader = reader;
+    this.slot = slot;
+    this.offsets = offsets;
+  }
+
+  _off(i) {
+    const o = this.offsets[i];
+    return o === ABSENT_OFFSET ? -1 : o;
+  }
+
+  getStrAt(i) {
+    const off = this._off(i);
+    if (off < 0) return undefined;
+    const bytes = this.reader.bytes;
+    return decodeUtf8Fast(bytes, off + 4, rdU32(bytes, off));
+  }
+
+  getF64At(i) {
+    const off = this._off(i);
+    if (off < 0) return undefined;
+    return rdF64(this.reader.bytes, off);
+  }
+
+  getI64At(i) {
+    const off = this._off(i);
+    if (off < 0) return undefined;
+    return rdI64Safe(this.reader.bytes, off);
+  }
+
+  getBoolAt(i) {
+    const off = this._off(i);
+    if (off < 0) return undefined;
+    return this.reader.bytes[off] !== 0;
+  }
+}
+
 // ── Object view ─────────────────────────────────────────────────────────────
 
 /**
@@ -908,6 +1092,16 @@ export class NxsCursor extends NxsObject {
       throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of range`);
     }
     this._reset(rdU64AsNumber(this.reader.bytes, this.reader._tailStart + i * 10 + 2));
+    return this;
+  }
+
+  /**
+   * Seek and pre-build the rank cache for multi-field access on this record.
+   */
+  seekWarm(i) {
+    this.seek(i);
+    this._locateOffsetTable();
+    this._buildRankCache();
     return this;
   }
 

@@ -24,6 +24,19 @@ export class NxsWasm {
     this.fns = instance.exports;
     this.bytes = new Uint8Array(memory.buffer);
     this.loadedBytes = 0;
+    this._scratchOff = 0;
+  }
+
+  /** Bump-allocate `n` bytes just past the loaded .nxb payload. */
+  _allocScratch(n) {
+    if (!this._scratchOff) {
+      this._scratchOff = (this.dataBase + this.loadedBytes + 15) & ~15;
+    }
+    const base = this._scratchOff;
+    const end = base + n;
+    this._ensureCapacity(end - this.dataBase);
+    this._scratchOff = (end + 7) & ~7;
+    return base;
   }
 
   allocBuffer(n) {
@@ -45,11 +58,13 @@ export class NxsWasm {
   loadPayload(nxbBytes) {
     if (this._sharesMemory(nxbBytes)) {
       this.loadedBytes = nxbBytes.byteLength;
+      this._scratchOff = 0;
       return;
     }
     this._ensureCapacity(nxbBytes.byteLength);
     this.bytes.set(nxbBytes, this.dataBase);
     this.loadedBytes = nxbBytes.byteLength;
+    this._scratchOff = 0;
   }
 
   _sharesMemory(nxbBytes) {

@@ -26,8 +26,11 @@ const wasmReader = new NxsReader(nxb);
 wasmReader.useWasm(wasm);
 
 const expectedSum = json.reduce((a, r) => a + r.score, 0);
-const expectedMin = Math.min(...json.map(r => r.score));
-const expectedMax = Math.max(...json.map(r => r.score));
+let expectedMin = Infinity, expectedMax = -Infinity;
+for (const r of json) {
+  if (r.score < expectedMin) expectedMin = r.score;
+  if (r.score > expectedMax) expectedMax = r.score;
+}
 const expectedAgeSum = json.reduce((a, r) => a + r.age, 0);
 
 test("WASM loads", () => {
@@ -63,6 +66,29 @@ test("sumI64 WASM matches", () => {
 test("WASM fallback still works when not attached", () => {
   const r = new NxsReader(nxb);
   if (!close(r.sumF64("score"), expectedSum)) throw new Error("fallback mismatch");
+});
+
+test("buildFieldIndex WASM matches JS", () => {
+  if (!wasm.fns.build_field_index) throw new Error("no build_field_index export");
+  const jsIdx = jsReader.buildFieldIndex("username");
+  const wasmIdx = wasmReader.buildFieldIndex("username");
+  if (jsIdx.getStrAt(42) !== wasmIdx.getStrAt(42)) {
+    throw new Error(`42: js=${jsIdx.getStrAt(42)} wasm=${wasmIdx.getStrAt(42)}`);
+  }
+  if (jsIdx.offsets[500] !== wasmIdx.offsets[500]) {
+    throw new Error(`offset[500] js=${jsIdx.offsets[500]} wasm=${wasmIdx.offsets[500]}`);
+  }
+});
+
+test("batchResolveOffsets WASM matches JS", () => {
+  if (!wasm.fns.batch_resolve_offsets) throw new Error("no batch_resolve_offsets export");
+  const slot = jsReader.slot("username");
+  const indices = [1, 42, 999];
+  const jsOff = jsReader.batchResolveOffsets(slot, indices);
+  const wasmOff = wasmReader.batchResolveOffsets(slot, indices);
+  for (let j = 0; j < indices.length; j++) {
+    if (jsOff[j] !== wasmOff[j]) throw new Error(`j=${j}: js=${jsOff[j]} wasm=${wasmOff[j]}`);
+  }
 });
 
 // async test — execute outside the `test()` harness which assumes sync fns
