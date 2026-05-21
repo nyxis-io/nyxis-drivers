@@ -6,18 +6,74 @@ import { decodeToNxs, isNxbBuffer } from "./lib/nxs_decode.js";
 const api = globalThis.chrome;
 const NETWORK = api.devtools.network;
 
+const HEARTBEAT_MS = 20_000;
+const RELAY_RETRY_MS = 400;
+
 /** @type {chrome.runtime.Port | null} */
 let relayPort = null;
+let heartbeatTimer = null;
+let relayRetryTimer = null;
+/** Bumped on navigation so in-flight getContent/decode results are ignored. */
+let navigationGeneration = 0;
+
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (!relayPort) {
+      connectRelay();
+      return;
+    }
+    try {
+      relayPort.postMessage({ type: "PING" });
+    } catch {
+      relayPort = null;
+      connectRelay();
+    }
+  }, HEARTBEAT_MS);
+}
+
+function scheduleRelayReconnect() {
+  if (relayRetryTimer) return;
+  relayRetryTimer = setTimeout(() => {
+    relayRetryTimer = null;
+    connectRelay();
+  }, RELAY_RETRY_MS);
+}
 
 function connectRelay() {
+  if (relayPort) {
+    try {
+      relayPort.disconnect();
+    } catch {
+      /* already dead */
+    }
+    relayPort = null;
+  }
+  stopHeartbeat();
   try {
     relayPort = api.runtime.connect({ name: "nyxis-devtools" });
     relayPort.onDisconnect.addListener(() => {
       relayPort = null;
+      stopHeartbeat();
+      scheduleRelayReconnect();
+    });
+    startHeartbeat();
+    broadcast({
+      type: "PANEL_STATUS",
+      connected: true,
+      message: "Network listener active — load a .nxb URL (DevTools must be open before the request).",
     });
   } catch (err) {
     console.error("[Nyxis Inspector] relay connect failed:", err);
     relayPort = null;
+    scheduleRelayReconnect();
   }
 }
 
@@ -31,6 +87,7 @@ function broadcast(msg) {
   } catch (err) {
     console.error("[Nyxis Inspector] broadcast failed:", err);
     relayPort = null;
+    scheduleRelayReconnect();
   }
 }
 
@@ -72,33 +129,57 @@ function shouldInspectRequest(request) {
 function inspectRequest(request) {
   if (!shouldInspectRequest(request)) return;
 
+  const url = request.request?.url ?? "";
+  const captureGeneration = navigationGeneration;
+
+  broadcast({
+    type: "DECODE_PENDING",
+    meta: { url },
+  });
+
   request.getContent((content, encoding) => {
+    if (captureGeneration !== navigationGeneration) return;
+
     try {
       const bytes = responseToUint8Array(content, encoding);
-      if (!isNxbBuffer(bytes)) return;
+      if (!isNxbBuffer(bytes)) {
+        broadcast({ type: "DECODE_SKIPPED", meta: { url } });
+        return;
+      }
 
-      const text = decodeToNxs(bytes);
-      const url = request.request.url;
-      const size = bytes.byteLength;
-      const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
-      const recordCount = recordMatch ? Number(recordMatch[1]) : null;
+      // Yield so DECODE_PENDING can paint before a large synchronous decode.
+      setTimeout(() => {
+        if (captureGeneration !== navigationGeneration) return;
+        try {
+          const text = decodeToNxs(bytes);
+          const size = bytes.byteLength;
+          const recordMatch = text.match(/^# Nyxis decode.*(\d+) record/s);
+          const recordCount = recordMatch ? Number(recordMatch[1]) : null;
 
-      broadcast({
-        type: "UPDATE_VIEWER",
-        data: text,
-        meta: {
-          url,
-          size,
-          recordCount,
-          method: request.request.method,
-          status: request.response.status,
-        },
-      });
+          broadcast({
+            type: "UPDATE_VIEWER",
+            data: text,
+            meta: {
+              url,
+              size,
+              recordCount,
+              method: request.request.method,
+              status: request.response.status,
+            },
+          });
+        } catch (err) {
+          broadcast({
+            type: "DECODE_ERROR",
+            message: err?.message ?? String(err),
+            meta: { url },
+          });
+        }
+      }, 0);
     } catch (err) {
       broadcast({
         type: "DECODE_ERROR",
         message: err?.message ?? String(err),
-        meta: { url: request.request?.url },
+        meta: { url },
       });
     }
   });
@@ -106,13 +187,7 @@ function inspectRequest(request) {
 
 NETWORK.onRequestFinished.addListener(inspectRequest);
 
-// Inspected page reload/navigation — DevTools stays open; drop stale decode.
 NETWORK.onNavigated.addListener(() => {
+  navigationGeneration += 1;
   clearViewer("navigated");
-});
-
-broadcast({
-  type: "PANEL_STATUS",
-  connected: true,
-  message: "Network listener active — load a .nxb URL (DevTools must be open before the request).",
 });

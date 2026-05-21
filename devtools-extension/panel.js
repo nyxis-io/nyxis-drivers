@@ -5,23 +5,63 @@ const viewerEl = document.getElementById("viewer");
 const copyBtn = document.getElementById("copy");
 const wrapBtn = document.getElementById("wrap");
 
+const MAX_RECONNECT_ATTEMPTS = 12;
+const RECONNECT_BASE_MS = 400;
+
 let lastText = "";
 let port = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
 
 function connectPanel() {
+  if (port) {
+    try {
+      port.disconnect();
+    } catch {
+      /* already closed */
+    }
+    port = null;
+  }
+
   try {
     port = api.runtime.connect({ name: "nyxis-inspector-panel" });
+    reconnectAttempt = 0;
   } catch (err) {
-    setStatus(`Could not connect: ${err?.message ?? err}`, true);
+    scheduleReconnect(`Could not connect: ${err?.message ?? err}`);
     return;
   }
 
   port.onDisconnect.addListener(() => {
     port = null;
-    setStatus("Disconnected — close DevTools and reopen, or reload the extension.", true);
+    scheduleReconnect();
   });
 
   port.onMessage.addListener(onMessage);
+}
+
+function scheduleReconnect(statusText) {
+  if (reconnectTimer) return;
+
+  if (reconnectAttempt >= MAX_RECONNECT_ATTEMPTS) {
+    setStatus(
+      "Disconnected — reload the extension at chrome://extensions, then reopen DevTools.",
+      true,
+    );
+    return;
+  }
+
+  if (statusText) {
+    setStatus(statusText, true);
+  } else {
+    setStatus("Reconnecting…", false);
+  }
+
+  const delay = Math.min(RECONNECT_BASE_MS * (2 ** reconnectAttempt), 8000);
+  reconnectAttempt += 1;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectPanel();
+  }, delay);
 }
 
 function setStatus(text, isError = false) {
@@ -32,13 +72,14 @@ function setStatus(text, isError = false) {
 function clearPanel(message) {
   lastText = "";
   viewerEl.textContent = "";
-  viewerEl.classList.remove("error");
+  viewerEl.classList.remove("error", "decoding");
   copyBtn.disabled = true;
   setStatus(message ?? "Waiting for an .nxb response in the Network tab…");
 }
 
 function onMessage(msg) {
   if (msg.type === "PANEL_STATUS") {
+    viewerEl.classList.remove("decoding");
     setStatus(msg.message ?? "", !msg.connected);
     return;
   }
@@ -48,10 +89,24 @@ function onMessage(msg) {
     return;
   }
 
+  if (msg.type === "DECODE_PENDING") {
+    const url = msg.meta?.url;
+    viewerEl.classList.add("decoding");
+    viewerEl.textContent = "";
+    copyBtn.disabled = true;
+    setStatus(url ? `Fetching & decoding ${shortenUrl(url)}…` : "Fetching & decoding…");
+    return;
+  }
+
+  if (msg.type === "DECODE_SKIPPED") {
+    viewerEl.classList.remove("decoding");
+    return;
+  }
+
   if (msg.type === "UPDATE_VIEWER") {
     lastText = msg.data ?? "";
     viewerEl.textContent = lastText;
-    viewerEl.classList.remove("error");
+    viewerEl.classList.remove("error", "decoding");
     copyBtn.disabled = !lastText;
 
     const m = msg.meta ?? {};
@@ -72,6 +127,7 @@ function onMessage(msg) {
     lastText = "";
     viewerEl.textContent = `Decode error: ${msg.message}`;
     viewerEl.classList.add("error");
+    viewerEl.classList.remove("decoding");
     copyBtn.disabled = true;
     metaEl.classList.add("error");
     metaEl.textContent = msg.meta?.url ? shortenUrl(msg.meta.url) : "Error";

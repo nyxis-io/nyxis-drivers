@@ -1,6 +1,6 @@
 /**
  * Relays messages between the DevTools page (network decode) and the Nyxis panel.
- * MV3 panels cannot reliably message the devtools page directly; the service worker is the hub.
+ * MV3 service workers sleep when idle; the devtools page sends periodic pings to keep this alive.
  */
 const api = globalThis.chrome ?? globalThis.browser;
 
@@ -8,6 +8,8 @@ const api = globalThis.chrome ?? globalThis.browser;
 let devtoolsPort = null;
 /** @type {Set<chrome.runtime.Port>} */
 const panelPorts = new Set();
+
+let devtoolsDisconnectTimer = null;
 
 function fanoutToPanels(msg) {
   for (const port of panelPorts) {
@@ -19,23 +21,47 @@ function fanoutToPanels(msg) {
   }
 }
 
+function notifyPanelStatus() {
+  fanoutToPanels({
+    type: "PANEL_STATUS",
+    connected: Boolean(devtoolsPort),
+    message: devtoolsPort
+      ? "Connected — open Network and load a .nxb response."
+      : "Waiting for DevTools bridge…",
+  });
+}
+
+function scheduleDevtoolsGoneNotice() {
+  if (devtoolsDisconnectTimer) clearTimeout(devtoolsDisconnectTimer);
+  devtoolsDisconnectTimer = setTimeout(() => {
+    devtoolsDisconnectTimer = null;
+    if (!devtoolsPort) notifyPanelStatus();
+  }, 2500);
+}
+
 api.runtime.onConnect.addListener((port) => {
   if (port.name === "nyxis-devtools") {
+    if (devtoolsDisconnectTimer) {
+      clearTimeout(devtoolsDisconnectTimer);
+      devtoolsDisconnectTimer = null;
+    }
     devtoolsPort = port;
     port.onDisconnect.addListener(() => {
       devtoolsPort = null;
-      fanoutToPanels({
-        type: "PANEL_STATUS",
-        connected: false,
-        message: "DevTools bridge closed. Close and reopen DevTools.",
-      });
+      scheduleDevtoolsGoneNotice();
     });
-    port.onMessage.addListener((msg) => fanoutToPanels(msg));
-    fanoutToPanels({
-      type: "PANEL_STATUS",
-      connected: true,
-      message: "Connected — open Network and load a .nxb response.",
+    port.onMessage.addListener((msg) => {
+      if (msg?.type === "PING") {
+        try {
+          port.postMessage({ type: "PONG" });
+        } catch {
+          /* port closing */
+        }
+        return;
+      }
+      fanoutToPanels(msg);
     });
+    notifyPanelStatus();
     return;
   }
 
@@ -47,7 +73,7 @@ api.runtime.onConnect.addListener((port) => {
       connected: Boolean(devtoolsPort),
       message: devtoolsPort
         ? "Connected — open Network and load a .nxb response."
-        : "DevTools bridge not ready. Close and reopen DevTools, then select this tab again.",
+        : "Waiting for DevTools bridge…",
     });
     return;
   }

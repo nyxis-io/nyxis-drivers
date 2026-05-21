@@ -80,6 +80,11 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
   color: #6a6a6a;
 }
 
+.viewer.decoding:empty::before {
+  content: "Fetching response body and decoding…";
+  color: #9cdcfe;
+}
+
 .hint {
   flex-shrink: 0;
   padding: 6px 10px;
