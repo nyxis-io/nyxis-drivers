@@ -19,16 +19,16 @@ type PaxStreamReader struct {
 	KeySigils []byte
 	keyIndex  map[string]int
 
-	dataStart         int
-	scanCursor        int
-	sealed            bool
-	pageCount         uint32
-	recordsAvailable  uint64
-	pageIndex         []uint32
-	pageRecStart      []uint64
-	pageRecCount      []uint32
-	pageOffset        []uint64
-	pageLength        []uint32
+	dataStart        int
+	scanCursor       int
+	sealed           bool
+	pageCount        uint32
+	recordsAvailable uint64
+	pageIndex        []uint32
+	pageRecStart     []uint64
+	pageRecCount     []uint32
+	pageOffset       []uint64
+	pageLength       []uint32
 }
 
 // PaxCompletePageAt returns the 8-byte-aligned length of a complete NXSP page at off,

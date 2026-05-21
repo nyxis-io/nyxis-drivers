@@ -112,6 +112,13 @@ func (r *Reader) parsePAXFooter() error {
 			r.pageOffset[i] = binary.LittleEndian.Uint64(r.data[e+16 : e+24])
 			r.pageLength[i] = binary.LittleEndian.Uint32(r.data[e+24 : e+28])
 		}
+		const magicPage uint32 = 0x4E585350
+		for i := uint32(0); i < r.pageCount; i++ {
+			poff := int(r.pageOffset[i])
+			if poff+4 > len(r.data) || binary.LittleEndian.Uint32(r.data[poff:]) != magicPage {
+				return fmt.Errorf("ERR_INVALID_PAGE_MAGIC: PAX page magic mismatch")
+			}
+		}
 	}
 	return nil
 }

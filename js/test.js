@@ -428,7 +428,9 @@ test("columnar layout — colSumF64 and colBuffer (conformance vector)", () => {
   assertEq(r.layout, "columnar", "layout");
   assertEq(r.recordCount, 100, "record count");
   const sum = r.colSumF64("score");
-  assertClose(sum, 747, 1e-6, "col sum score");
+  let want = 0;
+  for (let i = 0; i < 100; i++) want += i * 0.5;
+  assertClose(sum, want, 1e-6, "col sum score");
   const { values, count } = r.colBuffer("score");
   assertEq(count, 100, "buffer count");
   assertEq(values.length, 800, "value bytes");

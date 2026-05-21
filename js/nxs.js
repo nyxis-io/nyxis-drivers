@@ -337,6 +337,12 @@ export class NxsReader {
       this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
       this._pageLength.push(this.view.getUint32(e + 24, true));
     }
+    for (let i = 0; i < this.pageCount; i++) {
+      const poff = this._pageOffset[i];
+      if (poff + 4 > this.bytes.length || this.view.getUint32(poff, true) !== MAGIC_PAGE) {
+        throw new NxsError("ERR_INVALID_PAGE_MAGIC", "PAX page magic mismatch");
+      }
+    }
   }
 
   _paxSumF64(slot) {

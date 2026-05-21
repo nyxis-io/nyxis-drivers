@@ -265,6 +265,11 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
                 r->page_offset[i] = rd_u64(data + e + 16);
                 r->page_length[i] = rd_u32(data + e + 24);
             }
+            for (uint32_t i = 0; i < r->page_count; i++) {
+                size_t poff = (size_t)r->page_offset[i];
+                if (poff + 4 > size || rd_u32(data + poff) != MAGIC_PAGE)
+                    return NXS_ERR_BAD_PAGE_MAGIC;
+            }
         }
     } else {
         if (r->tail_ptr == 0) {
