@@ -20,3 +20,12 @@ identifier_name:
 cyclomatic_complexity:
   warning: 14
   error: 22
+
+# OLAP ColLayout.swift uses (bm, offsets, values) tuples; NXSReader grew with layout routing.
+file_length:
+  warning: 500
+  error: 500
+
+large_tuple:
+  warning: 4
+  error: 4
