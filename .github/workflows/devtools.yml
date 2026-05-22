@@ -1,0 +1,34 @@
+name: DevTools Extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'devtools-extension/**'
+      - 'js/nxs.js'
+      - 'js/nxs_decode.js'
+      - '.github/workflows/devtools.yml'
+  pull_request:
+    paths:
+      - 'devtools-extension/**'
+      - 'js/nxs.js'
+      - 'js/nxs_decode.js'
+      - '.github/workflows/devtools.yml'
+
+jobs:
+  sync-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run sync-lib.sh
+        run: bash devtools-extension/sync-lib.sh
+
+      - name: Verify lib/nxs.js matches js/nxs.js
+        run: diff js/nxs.js devtools-extension/lib/nxs.js
+
+      - name: Verify lib/nxs_decode.js matches js/nxs_decode.js
+        run: diff js/nxs_decode.js devtools-extension/lib/nxs_decode.js
+
+      - name: Validate manifest.json is valid JSON
+        run: node -e "JSON.parse(require('fs').readFileSync('devtools-extension/manifest.json','utf8'))"
