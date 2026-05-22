@@ -1,6 +1,6 @@
 {
   "name": "nyxis",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "JavaScript reader for the Nyxis (NXS) binary format",
   "main": "nxs.js",

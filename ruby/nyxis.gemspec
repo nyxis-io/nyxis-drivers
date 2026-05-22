@@ -1,6 +1,6 @@
 Gem::Specification.new do |spec|
   spec.name          = "nyxis"
-  spec.version       = "1.0.0"
+  spec.version       = "1.2.0"
   spec.authors       = ["Micael Malta"]
   spec.email         = ["micael@example.com"]
 
