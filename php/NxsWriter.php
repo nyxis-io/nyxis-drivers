@@ -98,16 +98,25 @@ class _Frame
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
+const SIGIL_STR    = 0x22; // '"' — string / var-length
+const SIGIL_I64    = 0x69; // 'i'
+const SIGIL_F64    = 0x64; // 'd'
+const SIGIL_BOOL   = 0x62; // 'b'
+const SIGIL_NULL   = 0x6E; // 'n'
+const SIGIL_BINARY = 0x42; // 'B'
+
 class Writer
 {
     private Schema $schema;
     private string $buf            = '';
     private array  $frames         = [];
     private array  $recordOffsets  = [];
+    private array  $slotSigils     = [];
 
     public function __construct(Schema $schema)
     {
-        $this->schema = $schema;
+        $this->schema     = $schema;
+        $this->slotSigils = array_fill(0, $schema->length(), SIGIL_STR);
     }
 
     public function beginObject(): void
@@ -213,18 +222,21 @@ class Writer
 
     public function writeI64(int $slot, int $v): void
     {
+        $this->slotSigils[$slot] = SIGIL_I64;
         $this->_markSlot($slot);
         $this->buf .= pack('q', $v);
     }
 
     public function writeF64(int $slot, float $v): void
     {
+        $this->slotSigils[$slot] = SIGIL_F64;
         $this->_markSlot($slot);
         $this->buf .= pack('e', $v);
     }
 
     public function writeBool(int $slot, bool $v): void
     {
+        $this->slotSigils[$slot] = SIGIL_BOOL;
         $this->_markSlot($slot);
         $this->buf .= $v ? "\x01" : "\x00";
         $this->buf .= str_repeat("\x00", 7);
@@ -232,17 +244,20 @@ class Writer
 
     public function writeTime(int $slot, int $unixNs): void
     {
+        $this->slotSigils[$slot] = SIGIL_I64;
         $this->writeI64($slot, $unixNs);
     }
 
     public function writeNull(int $slot): void
     {
+        $this->slotSigils[$slot] = SIGIL_NULL;
         $this->_markSlot($slot);
         $this->buf .= str_repeat("\x00", 8);
     }
 
     public function writeStr(int $slot, string $v): void
     {
+        $this->slotSigils[$slot] = SIGIL_STR;
         $this->_markSlot($slot);
         $b    = $v; // PHP strings are binary-safe
         $blen = strlen($b);
@@ -256,6 +271,7 @@ class Writer
 
     public function writeBytes(int $slot, string $data): void
     {
+        $this->slotSigils[$slot] = SIGIL_BINARY;
         $this->_markSlot($slot);
         $dlen = strlen($data);
         $this->buf .= pack('V', $dlen);
@@ -268,7 +284,7 @@ class Writer
 
     public function writeListI64(int $slot, array $values): void
     {
-        $this->_markSlot($slot);
+        $this->_markSlot($slot); // list is var-length — keep SIGIL_STR default
         $n     = count($values);
         $total = 16 + $n * 8;
         $this->buf .= pack('VVCVx3', WRITER_MAGIC_LIST, $total, 0x3D, $n);
@@ -347,7 +363,7 @@ class Writer
         $buf[$p] = chr($n & 0xFF);       $p++;
         $buf[$p] = chr(($n >> 8) & 0xFF); $p++;
         for ($i = 0; $i < $n; $i++) {
-            $buf[$p++] = "\x22"; // '"' sigil
+            $buf[$p++] = chr($this->slotSigils[$i]);
         }
         foreach ($encoded as $e) {
             $elen = strlen($e);

@@ -64,10 +64,18 @@ private class Frame(val start: Int, bitmaskBytes: Int) {
     var needsSort: Boolean = false
 }
 
+private const val SIGIL_STR = 0x22 // '"' — string / var-length
+private const val SIGIL_I64 = 0x69 // 'i'
+private const val SIGIL_F64 = 0x64 // 'd'
+private const val SIGIL_BOOL = 0x62 // 'b'
+private const val SIGIL_NULL = 0x6E // 'n'
+private const val SIGIL_BINARY = 0x42 // 'B'
+
 class NxsWriter(private val schema: NxsSchema) {
     private val buf = ByteArrayOutputStream(4096)
     private val frames = ArrayDeque<Frame>()
     private val recordOffsets = mutableListOf<Int>()
+    private val slotSigils = IntArray(schema.count) { SIGIL_STR }
 
     fun beginObject() {
         if (frames.isEmpty()) recordOffsets += buf.size()
@@ -164,6 +172,7 @@ class NxsWriter(private val schema: NxsSchema) {
         slot: Int,
         value: Long,
     ) {
+        slotSigils[slot] = SIGIL_I64
         markSlot(slot)
         for (i in 0..7) buf.write(((value ushr (i * 8)) and 0xFF).toInt())
     }
@@ -172,13 +181,17 @@ class NxsWriter(private val schema: NxsSchema) {
         slot: Int,
         value: Double,
     ) {
-        writeI64(slot, java.lang.Double.doubleToRawLongBits(value))
+        slotSigils[slot] = SIGIL_F64
+        markSlot(slot)
+        val bits = java.lang.Double.doubleToRawLongBits(value)
+        for (i in 0..7) buf.write(((bits ushr (i * 8)) and 0xFF).toInt())
     }
 
     fun writeBool(
         slot: Int,
         value: Boolean,
     ) {
+        slotSigils[slot] = SIGIL_BOOL
         markSlot(slot)
         buf.write(if (value) 1 else 0)
         repeat(7) { buf.write(0) }
@@ -187,9 +200,13 @@ class NxsWriter(private val schema: NxsSchema) {
     fun writeTime(
         slot: Int,
         unixNs: Long,
-    ) = writeI64(slot, unixNs)
+    ) {
+        slotSigils[slot] = SIGIL_I64
+        writeI64(slot, unixNs)
+    }
 
     fun writeNull(slot: Int) {
+        slotSigils[slot] = SIGIL_NULL
         markSlot(slot)
         repeat(8) { buf.write(0) }
     }
@@ -198,6 +215,7 @@ class NxsWriter(private val schema: NxsSchema) {
         slot: Int,
         value: String,
     ) {
+        slotSigils[slot] = SIGIL_STR
         markSlot(slot)
         val b = value.toByteArray(Charsets.UTF_8)
         writeU32(b.size)
@@ -210,6 +228,7 @@ class NxsWriter(private val schema: NxsSchema) {
         slot: Int,
         value: ByteArray,
     ) {
+        slotSigils[slot] = SIGIL_BINARY
         markSlot(slot)
         writeU32(value.size)
         buf.write(value)
@@ -327,7 +346,7 @@ class NxsWriter(private val schema: NxsSchema) {
         var p = 0
         b[p++] = (n and 0xFF).toByte()
         b[p++] = ((n shr 8) and 0xFF).toByte()
-        repeat(n) { b[p++] = 0x22 } // '"' sigil
+        repeat(n) { i -> b[p++] = slotSigils[i].toByte() }
         for (e in utf8) {
             e.copyInto(b, p)
             p += e.size

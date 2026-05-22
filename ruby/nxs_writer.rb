@@ -74,12 +74,21 @@ module Nxs
 
   # ── Writer ────────────────────────────────────────────────────────────────────
 
+  SIGIL_STR    = 0x22  # '"' — string / var-length
+  SIGIL_I64    = 0x69  # 'i'
+  SIGIL_F64    = 0x64  # 'd'
+  SIGIL_BOOL   = 0x62  # 'b'
+  SIGIL_NULL   = 0x6E  # 'n'
+  SIGIL_BINARY = 0x42  # 'B'
+
   class Writer
     def initialize(schema)
       @schema         = schema
       @buf            = String.new(encoding: "BINARY")
       @frames         = []
       @record_offsets = []
+      # Sigil per slot: default str/var-length; updated on each typed write
+      @slot_sigils    = Array.new(schema.length, SIGIL_STR)
     end
 
     def begin_object
@@ -153,31 +162,37 @@ module Nxs
     # ── Typed write methods ──────────────────────────────────────────────────────
 
     def write_i64(slot, v)
+      @slot_sigils[slot] = SIGIL_I64
       _mark_slot(slot)
       @buf << [v].pack("q<")
     end
 
     def write_f64(slot, v)
+      @slot_sigils[slot] = SIGIL_F64
       _mark_slot(slot)
       @buf << [v].pack("E")
     end
 
     def write_bool(slot, v)
+      @slot_sigils[slot] = SIGIL_BOOL
       _mark_slot(slot)
       @buf << (v ? "\x01" : "\x00").b
       @buf << "\x00".b * 7
     end
 
     def write_time(slot, unix_ns)
+      @slot_sigils[slot] = SIGIL_I64
       write_i64(slot, unix_ns)
     end
 
     def write_null(slot)
+      @slot_sigils[slot] = SIGIL_NULL
       _mark_slot(slot)
       @buf << "\x00".b * 8
     end
 
     def write_str(slot, v)
+      @slot_sigils[slot] = SIGIL_STR
       _mark_slot(slot)
       b = v.encode("UTF-8").b
       @buf << [b.bytesize].pack("V")
@@ -187,6 +202,7 @@ module Nxs
     end
 
     def write_bytes(slot, data)
+      @slot_sigils[slot] = SIGIL_BINARY
       _mark_slot(slot)
       @buf << [data.bytesize].pack("V")
       @buf << data.b
@@ -195,7 +211,7 @@ module Nxs
     end
 
     def write_list_i64(slot, values)
-      _mark_slot(slot)
+      _mark_slot(slot) # list is var-length — keep SIGIL_STR default
       total = 16 + values.length * 8
       @buf << [MAGIC_LIST, total, 0x3D, values.length].pack("VVCVx3")
       @buf << values.pack("q<*")
@@ -261,7 +277,7 @@ module Nxs
       buf = String.new("\x00".b * padded, encoding: "BINARY")
       p = 0
       buf[p, 2] = [keys.length].pack("v"); p += 2
-      keys.length.times { buf.setbyte(p, 0x22); p += 1 }  # '"' sigil
+      keys.length.times { |i| buf.setbyte(p, @slot_sigils[i]); p += 1 }
       encoded.each do |e|
         buf[p, e.bytesize] = e; p += e.bytesize
         buf.setbyte(p, 0x00);   p += 1

@@ -88,14 +88,30 @@ namespace Nxs
 
     // ── Writer ────────────────────────────────────────────────────────────────
 
+    internal static class Sigils
+    {
+        internal const byte Str = 0x22; // '"' — string / var-length
+        internal const byte I64 = 0x69; // 'i'
+        internal const byte F64 = 0x64; // 'd'
+        internal const byte Bool = 0x62; // 'b'
+        internal const byte Null = 0x6E; // 'n'
+        internal const byte Binary = 0x42; // 'B'
+    }
+
     public sealed class NxsWriter
     {
         private readonly NxsSchema _schema;
         private readonly MemoryStream _buf = new(4096);
         private readonly Stack<Frame> _frames = new();
         private readonly List<int> _recordOffsets = new();
+        private readonly byte[] _slotSigils;
 
-        public NxsWriter(NxsSchema schema) => _schema = schema;
+        public NxsWriter(NxsSchema schema)
+        {
+            _schema = schema;
+            _slotSigils = new byte[schema.Count];
+            Array.Fill(_slotSigils, Sigils.Str);
+        }
 
         public void BeginObject()
         {
@@ -177,6 +193,7 @@ namespace Nxs
 
         public void WriteI64(int slot, long value)
         {
+            _slotSigils[slot] = Sigils.I64;
             MarkSlot(slot);
             Span<byte> b = stackalloc byte[8];
             BinaryPrimitives.WriteInt64LittleEndian(b, value);
@@ -185,6 +202,7 @@ namespace Nxs
 
         public void WriteF64(int slot, double value)
         {
+            _slotSigils[slot] = Sigils.F64;
             MarkSlot(slot);
             Span<byte> b = stackalloc byte[8];
             BinaryPrimitives.WriteDoubleLittleEndian(b, value);
@@ -193,21 +211,28 @@ namespace Nxs
 
         public void WriteBool(int slot, bool value)
         {
+            _slotSigils[slot] = Sigils.Bool;
             MarkSlot(slot);
             _buf.WriteByte(value ? (byte)1 : (byte)0);
             _buf.Write(new byte[7]);
         }
 
-        public void WriteTime(int slot, long unixNs) => WriteI64(slot, unixNs);
+        public void WriteTime(int slot, long unixNs)
+        {
+            _slotSigils[slot] = Sigils.I64;
+            WriteI64(slot, unixNs);
+        }
 
         public void WriteNull(int slot)
         {
+            _slotSigils[slot] = Sigils.Null;
             MarkSlot(slot);
             _buf.Write(new byte[8]);
         }
 
         public void WriteStr(int slot, string value)
         {
+            _slotSigils[slot] = Sigils.Str;
             MarkSlot(slot);
             byte[] b = Encoding.UTF8.GetBytes(value);
             WriteU32((uint)b.Length);
@@ -218,6 +243,7 @@ namespace Nxs
 
         public void WriteBytes(int slot, ReadOnlySpan<byte> value)
         {
+            _slotSigils[slot] = Sigils.Binary;
             MarkSlot(slot);
             WriteU32((uint)value.Length);
             _buf.Write(value);
@@ -227,7 +253,7 @@ namespace Nxs
 
         public void WriteListI64(int slot, long[] values)
         {
-            MarkSlot(slot);
+            MarkSlot(slot); // list is var-length — keep Sigils.Str default
             int total = 16 + values.Length * 8;
             WriteU32(0x4E59584C); WriteU32((uint)total);
             _buf.WriteByte(0x3D); // '=' sigil
@@ -307,7 +333,7 @@ namespace Nxs
             var b = new byte[padded];
             int p = 0;
             BinaryPrimitives.WriteUInt16LittleEndian(b.AsSpan(p), (ushort)n); p += 2;
-            for (int i = 0; i < n; i++) b[p++] = 0x22;
+            for (int i = 0; i < n; i++) b[p++] = _slotSigils[i];
             foreach (var e in encoded) { e.CopyTo(b, p); p += e.Length; b[p++] = 0; }
             return b;
         }

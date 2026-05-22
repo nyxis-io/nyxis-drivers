@@ -79,6 +79,14 @@ export class NxsSchema {
 
 // ── Writer ───────────────────────────────────────────────────────────────────
 
+// Sigil constants
+const SIGIL_STR    = 0x22; // '"' — string / var-length
+const SIGIL_I64    = 0x69; // 'i'
+const SIGIL_F64    = 0x64; // 'd'
+const SIGIL_BOOL   = 0x62; // 'b'
+const SIGIL_NULL   = 0x6E; // 'n'
+const SIGIL_BINARY = 0x42; // 'B'
+
 export class NxsWriter {
   /**
    * @param {NxsSchema} schema
@@ -90,6 +98,8 @@ export class NxsWriter {
     this._len = 0;
     this._frames = [];       // stack of open object frames
     this._recordOffsets = []; // record start positions in data sector
+    // Sigil per slot: default str/var-length; updated on each typed write
+    this._slotSigils = new Uint8Array(schema.length).fill(SIGIL_STR);
   }
 
   // ── Buffer growth ────────────────────────────────────────────────────────
@@ -206,7 +216,7 @@ export class NxsWriter {
   finish() {
     if (this._frames.length !== 0) throw new Error("unclosed objects");
 
-    const schemaBytes = buildSchema(this.schema.keys);
+    const schemaBytes = buildSchema(this.schema.keys, this._slotSigils);
     const dictHash    = murmur3_64(schemaBytes, 0, schemaBytes.length);
 
     // data_start_abs = 32 (preamble) + schemaBytes.length
@@ -262,6 +272,7 @@ export class NxsWriter {
   // ── Typed write methods ──────────────────────────────────────────────────
 
   writeI64(slot, v) {
+    this._slotSigils[slot] = SIGIL_I64;
     this._markSlot(slot);
     let lo, hi;
     if (typeof v === "bigint") {
@@ -277,11 +288,13 @@ export class NxsWriter {
   }
 
   writeF64(slot, v) {
+    this._slotSigils[slot] = SIGIL_F64;
     this._markSlot(slot);
     this._writeBytes(encodeF64LE(v));
   }
 
   writeBool(slot, v) {
+    this._slotSigils[slot] = SIGIL_BOOL;
     this._markSlot(slot);
     this._grow(8);
     this._buf[this._len] = v ? 0x01 : 0x00;
@@ -294,6 +307,7 @@ export class NxsWriter {
   }
 
   writeNull(slot) {
+    this._slotSigils[slot] = SIGIL_NULL;
     this._markSlot(slot);
     this._grow(8);
     this._buf.fill(0, this._len, this._len + 8);
@@ -301,6 +315,7 @@ export class NxsWriter {
   }
 
   writeStr(slot, v) {
+    this._slotSigils[slot] = SIGIL_STR;
     this._markSlot(slot);
     const bytes = encodeUtf8(v);
     const len = bytes.length;
@@ -313,6 +328,7 @@ export class NxsWriter {
   }
 
   writeBytes(slot, data) {
+    this._slotSigils[slot] = SIGIL_BINARY;
     this._markSlot(slot);
     const len = data.length;
     const used = (4 + len) % 8;
@@ -324,7 +340,7 @@ export class NxsWriter {
   }
 
   writeListI64(slot, values) {
-    this._markSlot(slot);
+    this._markSlot(slot); // list is var-length — keep SIGIL_STR default
     const total = 16 + values.length * 8;
     this._writeU32(MAGIC_LIST);
     this._writeU32(total);
@@ -402,6 +418,7 @@ export class NxsWriter {
     this._len = 0;
     this._frames = [];
     this._recordOffsets = [];
+    this._slotSigils.fill(SIGIL_STR);
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────
@@ -475,7 +492,7 @@ function encodeUtf8(s) {
   return _utf8Encoder.encode(s);
 }
 
-function buildSchema(keys) {
+function buildSchema(keys, sigils) {
   const keyCount = keys.length;
   // Encode all keys as UTF-8 bytes
   const encoded = keys.map(k => _utf8Encoder.encode(k));
@@ -493,8 +510,8 @@ function buildSchema(keys) {
   buf[p++] = keyCount & 0xFF;
   buf[p++] = (keyCount >>> 8) & 0xFF;
 
-  // TypeManifest: all 0x22 ('"') per spec
-  for (let i = 0; i < keyCount; i++) buf[p++] = 0x22;
+  // TypeManifest: emit per-slot sigil
+  for (let i = 0; i < keyCount; i++) buf[p++] = sigils[i];
 
   // StringPool
   for (const e of encoded) {
