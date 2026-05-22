@@ -94,9 +94,7 @@ module Nxs
         raise NxsError.new('ERR_OUT_OF_BOUNDS', "record #{i} out of [0, #{@record_count})")
       end
 
-      if @layout != :row
-        return Object.new(self, i, i)
-      end
+      return Object.new(self, i, i) if @layout != :row
 
       abs_offset = @data.unpack1("@#{@tail_start + i * 10 + 2}Q<")
       Object.new(self, abs_offset)
@@ -378,12 +376,14 @@ module Nxs
       (raw + 7) & ~7
     end
 
+    # rubocop:disable Naming/PredicateMethod -- mirrors C col_bit naming
     def col_bit(bm, rec)
       ((bm.getbyte(rec / 8) >> (rec % 8)) & 1) == 1
     end
+    # rubocop:enable Naming/PredicateMethod
 
     def var_sigil?(sig)
-      sig == 0x22 || sig == 0x3C
+      [0x22, 0x3C].include?(sig)
     end
 
     def var_off_bytes_len(rc)
@@ -805,9 +805,7 @@ module Nxs
       slot = @reader.key_index[key]
       return nil unless slot
 
-      if uses_columnar_field_access?
-        return @reader.col_get_str(key, record_index)
-      end
+      return @reader.col_get_str(key, record_index) if uses_columnar_field_access?
 
       off = field_offset(key)
       return nil unless off

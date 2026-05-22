@@ -380,12 +380,10 @@ class Reader
     private array  $colBufOff = [];
     private array  $colBufLen = [];
     private int    $pageCount    = 0;
-    private int    $pageSizeHint = 0;
-    private array  $pageIndex    = [];
     private array  $pageRecStart = [];
     private array  $pageRecCount = [];
     private array  $pageOffset   = [];
-    private array  $pageLength    = [];
+    private array  $pageLength   = [];
 
     public function __construct(string $bytes)
     {
@@ -502,16 +500,14 @@ class Reader
         $fo = $len - FOOTER_PAX_BYTES;
         $tailPtr = rdU64($this->bytes, $fo);
         $this->recordCount  = (int)rdU64($this->bytes, $fo + 8);
-        $this->pageCount    = rdU32($this->bytes, $fo + 16);
-        $this->pageSizeHint = rdU32($this->bytes, $fo + 20);
-        $this->tailStart    = (int)$tailPtr;
+        $this->pageCount = rdU32($this->bytes, $fo + 16);
+        $this->tailStart = (int)$tailPtr;
         if ($this->pageCount > 0) {
             for ($i = 0; $i < $this->pageCount; $i++) {
                 $e = $this->tailStart + $i * PAX_TAIL_ENTRY_BYTES;
                 if ($e + PAX_TAIL_ENTRY_BYTES > $len) {
                     throw new NxsException('ERR_OUT_OF_BOUNDS: PAX tail entry');
                 }
-                $this->pageIndex[]    = rdU32($this->bytes, $e);
                 $this->pageRecStart[] = rdU64($this->bytes, $e + 4);
                 $this->pageRecCount[] = rdU32($this->bytes, $e + 12);
                 $this->pageOffset[]   = rdU64($this->bytes, $e + 16);
@@ -519,7 +515,8 @@ class Reader
             }
             for ($i = 0; $i < $this->pageCount; $i++) {
                 $poff = (int)$this->pageOffset[$i];
-                if ($poff > $len || $poff + 4 > $len) {
+                $plen = (int)$this->pageLength[$i];
+                if ($poff > $len || $poff + 4 > $len || ($plen > 0 && $poff + $plen > $len)) {
                     throw new NxsException('ERR_OUT_OF_BOUNDS: PAX page offset');
                 }
                 if (rdU32($this->bytes, $poff) !== MAGIC_PAGE) {

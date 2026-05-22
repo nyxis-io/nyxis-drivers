@@ -19,6 +19,8 @@ Metrics/BlockLength:
 
 Metrics/ClassLength:
   Max: 220
+  Exclude:
+    - "nxs.rb" # OLAP columnar/PAX read paths (parity with go/col.go)
 
 Metrics/MethodLength:
   Max: 200

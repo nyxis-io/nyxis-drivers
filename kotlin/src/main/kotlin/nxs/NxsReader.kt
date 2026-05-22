@@ -254,6 +254,7 @@ class NxsObject(
         if (offset + 4 > reader.size()) return false
         return reader.readU32(offset).toInt() and -1 != MAGIC_OBJ
     }
+
     private var staged = false
     private var bitmaskStart = 0
     private var offsetTableStart = 0
