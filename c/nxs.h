@@ -126,12 +126,17 @@ nxs_err_t nxs_get_f64 (nxs_object_t *obj, const char *key, double   *out);
 nxs_err_t nxs_get_bool(nxs_object_t *obj, const char *key, int      *out);
 // Writes a NUL-terminated string into `buf` (max `buf_len` bytes incl. NUL).
 nxs_err_t nxs_get_str (nxs_object_t *obj, const char *key, char *buf, size_t buf_len);
+// Copies up to `buf_len` bytes; sets *out_len to bytes written (may be < field length).
+nxs_err_t nxs_get_binary(nxs_object_t *obj, const char *key, uint8_t *buf, size_t buf_len,
+                          size_t *out_len);
 
 // Slot variants (skip key lookup — call nxs_slot() once, reuse).
 nxs_err_t nxs_get_i64_slot (nxs_object_t *obj, int slot, int64_t  *out);
 nxs_err_t nxs_get_f64_slot (nxs_object_t *obj, int slot, double   *out);
 nxs_err_t nxs_get_bool_slot(nxs_object_t *obj, int slot, int      *out);
 nxs_err_t nxs_get_str_slot (nxs_object_t *obj, int slot, char *buf, size_t buf_len);
+nxs_err_t nxs_get_binary_slot(nxs_object_t *obj, int slot, uint8_t *buf, size_t buf_len,
+                              size_t *out_len);
 
 // ── Bulk reducers ─────────────────────────────────────────────────────────────
 double  nxs_sum_f64(const nxs_reader_t *r, const char *key);

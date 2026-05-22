@@ -165,9 +165,9 @@ func isVarSigil(sig byte) bool {
 func fieldSectorLen(data []byte, sectorOff int, rc uint32, sigil byte) (int, error) {
 	bmLen := nullBitmapBytes(rc)
 	if !isVarSigil(sigil) {
-		return bmLen + int(rc)*8, nil
+		return bmLen + int(uint64(rc)*8), nil
 	}
-	offBytes := int((rc + 1) * 4)
+	offBytes := int((uint64(rc) + 1) * 4)
 	if sectorOff+bmLen+offBytes > len(data) {
 		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
 	}
@@ -180,9 +180,8 @@ func fieldSectorLen(data []byte, sectorOff int, rc uint32, sigil byte) (int, err
 }
 
 // VarStrAt reads one UTF-8 string from a variable-length column sector.
-func VarStrAt(offsets []byte, values []byte, recordIndex int) (string, bool) {
-	need := (recordIndex + 2) * 4
-	if len(offsets) < need {
+func VarStrAt(offsets []byte, values []byte, recordIndex uint32) (string, bool) {
+	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
 		return "", false
 	}
 	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
@@ -193,9 +192,8 @@ func VarStrAt(offsets []byte, values []byte, recordIndex int) (string, bool) {
 	return string(values[start:end]), true
 }
 
-func varBinaryAt(offsets []byte, values []byte, recordIndex int) ([]byte, bool) {
-	need := (recordIndex + 2) * 4
-	if len(offsets) < need {
+func varBinaryAt(offsets []byte, values []byte, recordIndex uint32) ([]byte, bool) {
+	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
 		return nil, false
 	}
 	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
@@ -212,7 +210,7 @@ func (r *Reader) colVarParts(slot int) (bm, offsets, values []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	offBytes := int((r.recordCount + 1) * 4)
+	offBytes := int((uint64(r.recordCount) + 1) * 4)
 	if len(tail) < offBytes {
 		return nil, nil, nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
 	}
@@ -238,7 +236,7 @@ func (r *Reader) colVarPartsAt(rec uint32, slot int) (bm, offsets, values []byte
 			return nil, nil, nil, false
 		}
 		rc := r.pageRecCount[pi]
-		offBytes := int((rc + 1) * 4)
+		offBytes := int((uint64(rc) + 1) * 4)
 		if len(tail) < offBytes {
 			return nil, nil, nil, false
 		}
@@ -265,12 +263,12 @@ func (r *Reader) ColGetStr(key string, recordIndex uint32) (string, bool) {
 		if !found || !colBit(bm, uint32(li)) {
 			return "", false
 		}
-		return VarStrAt(offsets, values, li)
+		return VarStrAt(offsets, values, uint32(li))
 	}
 	if !colBit(bm, recordIndex) {
 		return "", false
 	}
-	return VarStrAt(offsets, values, int(recordIndex))
+	return VarStrAt(offsets, values, recordIndex)
 }
 
 // ColGetBinary reads a binary field at recordIndex in columnar or PAX layout.
@@ -291,12 +289,12 @@ func (r *Reader) ColGetBinary(key string, recordIndex uint32) ([]byte, bool) {
 		if !found || !colBit(bm, uint32(li)) {
 			return nil, false
 		}
-		return varBinaryAt(offsets, values, li)
+		return varBinaryAt(offsets, values, uint32(li))
 	}
 	if !colBit(bm, recordIndex) {
 		return nil, false
 	}
-	return varBinaryAt(offsets, values, int(recordIndex))
+	return varBinaryAt(offsets, values, recordIndex)
 }
 
 // colNumericBytes returns the 8-byte fixed cell for a record/slot in columnar or PAX layout.

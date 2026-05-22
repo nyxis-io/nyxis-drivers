@@ -142,12 +142,35 @@ function isVarSigilByte(sig) {
   return sig === SIGIL_STR || sig === SIGIL_BINARY;
 }
 
+/** u32 offset table bytes for `rc` records: (rc+1)*4, or -1 on overflow. */
+function varOffBytes(rc) {
+  const rcU = rc >>> 0;
+  const n = BigInt(rcU) + 1n;
+  const off = n * 4n;
+  if (off > BigInt(Number.MAX_SAFE_INTEGER)) return -1;
+  return Number(off);
+}
+
+/** bytes required in offsets for index `recordIndex`: (recordIndex+2)*4, or -1. */
+function varNeedBytes(recordIndex) {
+  const ri = recordIndex >>> 0;
+  const need = (BigInt(ri) + 2n) * 4n;
+  if (need > BigInt(Number.MAX_SAFE_INTEGER)) return -1;
+  return Number(need);
+}
+
 function fieldSectorLen(bytes, sectorOff, rc, sigil) {
-  const bmLen = nullBitmapBytesLen(rc);
-  if (!isVarSigilByte(sigil)) return bmLen + rc * 8;
-  const offBytes = (rc + 1) * 4;
+  const rcU = rc >>> 0;
+  const bmLen = nullBitmapBytesLen(rcU);
+  if (!isVarSigilByte(sigil)) {
+    const tail = BigInt(rcU) * 8n;
+    if (tail > BigInt(Number.MAX_SAFE_INTEGER)) return -1;
+    return bmLen + Number(tail);
+  }
+  const offBytes = varOffBytes(rcU);
+  if (offBytes < 0) return -1;
   if (sectorOff + bmLen + offBytes > bytes.length) return -1;
-  const end = rdU32(bytes, sectorOff + bmLen + rc * 4);
+  const end = rdU32(bytes, sectorOff + bmLen + rcU * 4);
   const total = bmLen + offBytes + end;
   if (sectorOff + total > bytes.length) return -1;
   return total;
@@ -438,8 +461,10 @@ export class NxsReader {
 
   _colVarParts(slot) {
     const { bitmap, values } = this._colFieldParts(slot);
-    const offBytes = (this.recordCount + 1) * 4;
-    if (values.length < offBytes) throw new NxsError("ERR_OUT_OF_BOUNDS", "var offsets");
+    const offBytes = varOffBytes(this.recordCount);
+    if (offBytes < 0 || values.length < offBytes) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", "var offsets");
+    }
     return {
       bitmap,
       offsets: values.subarray(0, offBytes),
@@ -456,8 +481,8 @@ export class NxsReader {
       const parts = this._pageFieldParts(loc.page, slot);
       if (!parts) return null;
       const rc = parts.pageRecCount;
-      const offBytes = (rc + 1) * 4;
-      if (parts.values.length < offBytes) return null;
+      const offBytes = varOffBytes(rc);
+      if (offBytes < 0 || parts.values.length < offBytes) return null;
       return {
         bitmap: parts.bitmap,
         offsets: parts.values.subarray(0, offBytes),
@@ -469,12 +494,23 @@ export class NxsReader {
   }
 
   _varStrAt(offsets, values, recordIndex) {
-    const need = (recordIndex + 2) * 4;
-    if (offsets.length < need) return null;
-    const start = rdU32(offsets, recordIndex * 4);
-    const end = rdU32(offsets, recordIndex * 4 + 4);
+    const need = varNeedBytes(recordIndex);
+    if (need < 0 || offsets.length < need) return null;
+    const ri = recordIndex >>> 0;
+    const start = rdU32(offsets, ri * 4);
+    const end = rdU32(offsets, ri * 4 + 4);
     if (end < start || end > values.length) return null;
     return decodeUtf8Fast(values, start, end - start);
+  }
+
+  _varBinaryAt(offsets, values, recordIndex) {
+    const need = varNeedBytes(recordIndex);
+    if (need < 0 || offsets.length < need) return null;
+    const ri = recordIndex >>> 0;
+    const start = rdU32(offsets, ri * 4);
+    const end = rdU32(offsets, ri * 4 + 4);
+    if (end < start || end > values.length) return null;
+    return values.subarray(start, end);
   }
 
   /** UTF-8 string at `recordIndex` in a columnar/PAX column (null → null). */
@@ -487,6 +523,18 @@ export class NxsReader {
     const bitIdx = this._layout === "pax" ? parts.local : recordIndex;
     if (!this._colBit(parts.bitmap, bitIdx)) return null;
     return this._varStrAt(parts.offsets, parts.values, bitIdx);
+  }
+
+  /** Binary blob at `recordIndex` in a columnar/PAX column (null → null). */
+  colGetBinary(key, recordIndex) {
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this.keySigils[slot] !== SIGIL_BINARY) return null;
+    const parts = this._colVarPartsAt(recordIndex, slot);
+    if (!parts) return null;
+    const bitIdx = this._layout === "pax" ? parts.local : recordIndex;
+    if (!this._colBit(parts.bitmap, bitIdx)) return null;
+    return this._varBinaryAt(parts.offsets, parts.values, bitIdx);
   }
 
   _colNumericBytes(rec, slot) {
@@ -1677,6 +1725,20 @@ export class NxsObject {
     if (off < 0) return undefined;
     const bytes = r.bytes;
     return decodeUtf8Fast(bytes, off + 4, rdU32(bytes, off));
+  }
+
+  getBinaryBySlot(slot) {
+    if (slot === undefined) return undefined;
+    const r = this.reader;
+    if (r._layout === "columnar" || r._layout === "pax") {
+      const ri = this.recordIndex ?? this.offset;
+      return r.colGetBinary(r.keys[slot], ri);
+    }
+    const off = this._resolveSlot(slot);
+    if (off < 0) return undefined;
+    const bytes = r.bytes;
+    const len = rdU32(bytes, off);
+    return bytes.subarray(off + 4, off + 4 + len);
   }
 
   _decodeList(offset) {
