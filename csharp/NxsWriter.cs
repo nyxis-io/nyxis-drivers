@@ -90,11 +90,11 @@ namespace Nxs
 
     internal static class Sigils
     {
-        internal const byte Str    = 0x22; // '"' — string / var-length
-        internal const byte I64    = 0x69; // 'i'
-        internal const byte F64    = 0x64; // 'd'
-        internal const byte Bool   = 0x62; // 'b'
-        internal const byte Null   = 0x6E; // 'n'
+        internal const byte Str = 0x22; // '"' — string / var-length
+        internal const byte I64 = 0x69; // 'i'
+        internal const byte F64 = 0x64; // 'd'
+        internal const byte Bool = 0x62; // 'b'
+        internal const byte Null = 0x6E; // 'n'
         internal const byte Binary = 0x42; // 'B'
     }
 
