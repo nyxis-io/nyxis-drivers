@@ -476,6 +476,32 @@ test("PAX stream — first complete page before seal", () => {
   assertClose(sr.colSumF64("score"), want, 1e-6, "stream page1 sum");
 });
 
+test("columnar layout — colGetStr strings (conformance vector)", () => {
+  const colPath = join(fixtureDir, "../../nyxis/conformance/columnar_flat8_strings_100.nxb");
+  const alt = join(fixtureDir, "../conformance/columnar_flat8_strings_100.nxb");
+  const path = existsSync(colPath) ? colPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const r = new NxsReader(readFileSync(path));
+  assertEq(r.layout, "columnar", "layout");
+  assertEq(r.recordCount, 100, "record count");
+  assertEq(r.colGetStr("name", 0), "user_0", "name record 0");
+  assertEq(r.colGetStr("name", 42), "user_42", "name record 42");
+  assertEq(r.record(42).getStr("name"), "user_42", "Record.getStr name 42");
+});
+
+test("PAX layout — colGetStr strings across pages (conformance vector)", () => {
+  const colPath = join(fixtureDir, "../../nyxis/conformance/pax_flat8_strings_p128_300.nxb");
+  const alt = join(fixtureDir, "../conformance/pax_flat8_strings_p128_300.nxb");
+  const path = existsSync(colPath) ? colPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const r = new NxsReader(readFileSync(path));
+  assertEq(r.layout, "pax", "layout");
+  for (const idx of [0, 127, 128, 257, 299]) {
+    assertEq(r.colGetStr("name", idx), `user_${idx}`, `name record ${idx}`);
+    assertEq(r.record(idx).getStr("name"), `user_${idx}`, `Record.getStr name ${idx}`);
+  }
+});
+
 test("columnar — null bitmap uses integer byte index (colGetF64)", async () => {
   const wasmPath = join(fixtureDir, "nxs_compile_wasm_bg.wasm");
   if (!existsSync(wasmPath)) return;

@@ -415,6 +415,12 @@ func (o *Object) GetBoolBySlot(slot int) (bool, bool) {
 }
 
 func (o *Object) GetStrBySlot(slot int) (string, bool) {
+	if o.reader.layout != LayoutRow {
+		if slot < 0 || slot >= len(o.reader.KeySigils) || o.reader.KeySigils[slot] != '"' {
+			return "", false
+		}
+		return o.reader.ColGetStr(o.reader.Keys[slot], o.recordIndex)
+	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
 		return "", false

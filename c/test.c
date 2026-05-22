@@ -124,6 +124,39 @@ int main(int argc, char **argv) {
 
     nxs_close(&r);
 
+    // PAX string column across pages (optional conformance vector)
+    {
+        const char *paths[] = {
+            "../../nyxis/conformance/pax_flat8_strings_p128_300.nxb",
+            "../nyxis/conformance/pax_flat8_strings_p128_300.nxb",
+            "nyxis/conformance/pax_flat8_strings_p128_300.nxb"
+        };
+        uint8_t *pax_data = NULL;
+        size_t pax_size = 0;
+        for (int i = 0; i < 3 && !pax_data; i++) {
+            pax_data = read_file(paths[i], &pax_size);
+        }
+        if (pax_data) {
+            nxs_reader_t pr;
+            nxs_err_t e = nxs_open(&pr, pax_data, pax_size);
+            CHECK("PAX strings: opens without error", e == NXS_OK);
+            if (e == NXS_OK) {
+                CHECK("PAX strings: layout is PAX", pr.layout == NXS_LAYOUT_PAX);
+                nxs_object_t obj;
+                char name[32] = {0};
+                nxs_record(&pr, 257, &obj);
+                e = nxs_get_str(&obj, "name", name, sizeof(name));
+                CHECK("PAX strings: record(257) name", e == NXS_OK && strcmp(name, "user_257") == 0);
+                e = nxs_get_str(&obj, "name", name, 0);
+                CHECK("PAX strings: zero-length buffer rejected", e == NXS_ERR_OUT_OF_BOUNDS);
+                nxs_close(&pr);
+            }
+            free(pax_data);
+        } else {
+            printf("  - PAX string conformance vector missing; skipping\n");
+        }
+    }
+
     // ── Security tests ────────────────────────────────────────────────────────
     {
         uint8_t *bad = malloc(nxb_size);
@@ -355,6 +388,47 @@ int main(int argc, char **argv) {
 
             nxs_close(&qr);
             free(nxb2_data);
+        }
+    }
+
+    /* Columnar variable-length strings (Phase 3 conformance vector) */
+    {
+        char col_path[512];
+        const char *col_candidates[] = {
+            "%s/../../nyxis/conformance/columnar_flat8_strings_100.nxb",
+            "%s/../nyxis/conformance/columnar_flat8_strings_100.nxb",
+            "%s/../../conformance/columnar_flat8_strings_100.nxb",
+        };
+        size_t col_size = 0;
+        uint8_t *col_data = NULL;
+        for (size_t ci = 0; ci < sizeof(col_candidates) / sizeof(col_candidates[0]); ci++) {
+            snprintf(col_path, sizeof(col_path), col_candidates[ci], dir);
+            col_data = read_file(col_path, &col_size);
+            if (col_data) break;
+        }
+        if (col_data) {
+            nxs_reader_t cr;
+            if (nxs_open(&cr, col_data, col_size) == NXS_OK) {
+                int name_slot = nxs_slot(&cr, "name");
+                nxs_object_t obj;
+                char name[64] = {0};
+
+                nxs_record(&cr, 0, &obj);
+                CHECK("columnar strings record(0) name",
+                      nxs_get_str_slot(&obj, name_slot, name, sizeof(name)) == NXS_OK &&
+                      strcmp(name, "user_0") == 0);
+
+                nxs_record(&cr, 42, &obj);
+                memset(name, 0, sizeof(name));
+                CHECK("columnar strings record(42) name",
+                      nxs_get_str_slot(&obj, name_slot, name, sizeof(name)) == NXS_OK &&
+                      strcmp(name, "user_42") == 0);
+
+                nxs_close(&cr);
+            } else {
+                CHECK("columnar strings conformance opens", 0);
+            }
+            free(col_data);
         }
     }
 
