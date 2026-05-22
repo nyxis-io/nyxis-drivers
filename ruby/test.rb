@@ -273,6 +273,132 @@ puts
 
 ].each { |r| r ? (passes += 1) : (fails += 1) }
 
+# ── Columnar read tests ─────────────────────────────────────────────────────
+puts
+puts 'NXS Ruby Columnar — Tests'
+puts '━' * 60
+puts
+
+# Build a minimal dense columnar .nxb with fields: id (i64), score (f64), active (bool).
+def build_columnar_nxb(n)
+  magic_file = 0x4E595842
+  magic_footer = 0x2153584E
+  flag_schema = 0x0002
+  flag_col = 0x0001
+  version = 0x0101
+  mask64 = 0xFFFFFFFFFFFFFFFF
+  c1 = 0xFF51AFD7ED558CCD
+  c2 = 0xC4CEB9FE1A85EC53
+
+  # Schema: 3 keys with sigils '=' (i64), '~' (f64), '?' (bool)
+  keys = %w[id score active]
+  sigils = [0x3D, 0x7E, 0x3F]
+  schema = [keys.length].pack('v')
+  sigils.each { |sg| schema << sg.chr }
+  keys.each { |k| schema << k.b << "\x00".b }
+  schema << "\x00".b until (schema.bytesize % 8).zero?
+
+  # DictHash via MurmurHash3-64
+  h = 0x93681D6255313A99
+  ln = schema.bytesize
+  i = 0
+  while i < ln
+    k = 0
+    8.times { |b| k |= schema.getbyte(i + b) << (b * 8) if i + b < ln }
+    k = (k * c1) & mask64
+    k ^= k >> 33
+    h ^= k
+    h = (h * c2) & mask64
+    h ^= h >> 33
+    i += 8
+  end
+  h ^= ln
+  h ^= h >> 33
+  h = (h * c1) & mask64
+  h ^= h >> 33
+  dict_hash_le = [h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF].pack('VV')
+
+  # Dense null bitmap: all n bits set, padded to 8-byte boundary
+  bm_raw = (n + 7) / 8
+  bm_len = (bm_raw + 7) & ~7
+  bm = "\x00".b * bm_len
+  n.times { |idx| bm.setbyte(idx >> 3, bm.getbyte(idx >> 3) | (1 << (idx & 7))) }
+
+  # id column: bm + n * i64
+  id_col = bm + (0...n).map { |idx| [idx].pack('q<') }.join
+
+  # score column: bm + n * f64 (idx * 0.5)
+  sc_col = bm + (0...n).map { |idx| [idx * 0.5].pack('E') }.join
+
+  # active column: bm + n * 8-byte bool (even → true)
+  ac_vals = (0...n).map { |idx| (idx.even? ? "\x01" : "\x00").b + "\x00".b * 7 }.join
+  ac_col = bm + ac_vals
+
+  cols = [id_col, sc_col, ac_col]
+  data_base = 32 + schema.bytesize
+  col_data = String.new(encoding: 'BINARY')
+  tail_entries = []
+  cols.each do |col|
+    tail_entries << [data_base + col_data.bytesize, col.bytesize]
+    col_data << col
+  end
+  tail_index_off = data_base + col_data.bytesize
+
+  # Tail index: per-field { fid u16, pad u16, off u64, len u64 } = 20 bytes
+  tail = String.new(encoding: 'BINARY')
+  tail_entries.each_with_index do |(off, col_len), fi|
+    tail << [fi, 0].pack('vv')
+    tail << [off & 0xFFFFFFFF, (off >> 32) & 0xFFFFFFFF].pack('VV')
+    tail << [col_len & 0xFFFFFFFF, (col_len >> 32) & 0xFFFFFFFF].pack('VV')
+  end
+  # Columnar footer: TailIndexOff(8) + RecordCount(8) + MagicFooter(4)
+  tail << [tail_index_off & 0xFFFFFFFF, (tail_index_off >> 32) & 0xFFFFFFFF].pack('VV')
+  tail << [n & 0xFFFFFFFF, (n >> 32) & 0xFFFFFFFF].pack('VV')
+  tail << [magic_footer].pack('V')
+
+  # Preamble (32 bytes)
+  flags = flag_schema | flag_col
+  out = String.new(encoding: 'BINARY')
+  out << [magic_file].pack('V')
+  out << [version, flags].pack('vv')
+  out << dict_hash_le
+  out << [tail_index_off & 0xFFFFFFFF, (tail_index_off >> 32) & 0xFFFFFFFF].pack('VV')
+  out << ("\x00".b * 8) # reserved
+  out << schema << col_data << tail
+end
+
+[
+  check('columnar: opens without error') do
+    r = Nxs::Reader.new(build_columnar_nxb(5))
+    r.record_count == 5
+  end,
+
+  check("columnar: keys include 'id', 'score', 'active'") do
+    r = Nxs::Reader.new(build_columnar_nxb(5))
+    %w[id score active].all? { |k| r.keys.include?(k) }
+  end,
+
+  check("columnar: record(4).get_i64('id') == 4") do
+    r = Nxs::Reader.new(build_columnar_nxb(10))
+    r.record(4).get_i64('id') == 4
+  end,
+
+  check("columnar: record(4).get_f64('score') ≈ 2.0") do
+    r = Nxs::Reader.new(build_columnar_nxb(10))
+    (r.record(4).get_f64('score') - 2.0).abs < 1e-9
+  end,
+
+  check("columnar: record(4).get_bool('active') == true (even index)") do
+    r = Nxs::Reader.new(build_columnar_nxb(10))
+    r.record(4).get_bool('active') == true
+  end,
+
+  check("columnar: record(3).get_bool('active') == false (odd index)") do
+    r = Nxs::Reader.new(build_columnar_nxb(10))
+    r.record(3).get_bool('active') == false
+  end
+].each { |r| r ? (passes += 1) : (fails += 1) }
+
 # ── Security tests ──────────────────────────────────────────────────────────
 [
   check('bad magic raises ERR_BAD_MAGIC') do
