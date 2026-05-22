@@ -12,28 +12,39 @@ kotlin/.gradle/
 kotlin/build/
 csharp/bin/
 csharp/obj/
+csharp/nupkg/
 swift/.build/
 swift/.swiftlint-cache/
 
 ruby/ext/nxs/Makefile
 ruby/ext/nxs/*.o
 ruby/ext/nxs/*.bundle
+ruby/ext/nxs/*.bundle.dSYM/
 ruby/ext/nxs/mkmf.log
 
 php/nxs_ext/.libs/
 php/nxs_ext/autom4te.cache/
 php/nxs_ext/modules/
 php/nxs_ext/config.h
+php/nxs_ext/config.h.in~
 php/nxs_ext/config.log
+php/nxs_ext/config.nice
 php/nxs_ext/config.status
 php/nxs_ext/configure
 php/nxs_ext/libtool
 php/nxs_ext/Makefile
+php/nxs_ext/Makefile.fragments
+php/nxs_ext/Makefile.objects
+php/nxs_ext/nxs.la
+php/nxs_ext/nxs_ext.c.bak
 php/nxs_ext/*.lo
+php/nxs_ext/*.dep
 
 go/bench
 c/test
 c/bench
+c/bench_wal
+c/profile-selective
 
 *.png
 !devtools-extension/icons/*.png
