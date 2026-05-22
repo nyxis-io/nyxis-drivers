@@ -134,7 +134,7 @@ func paxStreamDetectSealed(data []byte) (uint64, bool) {
 		return 0, false
 	}
 	tp := binary.LittleEndian.Uint64(data[len(data)-footerPaxBytes : len(data)-footerPaxBytes+8])
-	if tp == 0 || int(tp) >= len(data) || len(data)-int(tp) < 16 {
+	if tp == 0 || int(tp) >= len(data) || len(data)-int(tp) < footerPaxBytes {
 		return 0, false
 	}
 	return tp, true

@@ -339,7 +339,7 @@ export class NxsReader {
     }
     for (let i = 0; i < this.pageCount; i++) {
       const poff = this._pageOffset[i];
-      if (poff + 4 > this.bytes.length || this.view.getUint32(poff, true) !== MAGIC_PAGE) {
+      if (poff > this.bytes.length - 4 || this.view.getUint32(poff, true) !== MAGIC_PAGE) {
         throw new NxsError("ERR_INVALID_PAGE_MAGIC", "PAX page magic mismatch");
       }
     }
@@ -1068,7 +1068,10 @@ export class NxsPaxStreamReader {
     if (this.bytes.length < FOOTER_PAX_BYTES) return false;
     if (rdU32(this.bytes, this.bytes.length - 4) !== MAGIC_FOOTER) return false;
     const tailOff = Number(this.view.getBigUint64(this.bytes.length - FOOTER_PAX_BYTES, true));
-    if (tailOff === 0 || tailOff >= this.bytes.length) return false;
+    if (tailOff === 0 || tailOff >= this.bytes.length ||
+        this.bytes.length - tailOff < FOOTER_PAX_BYTES) {
+      return false;
+    }
     this._loadSealedTail(tailOff);
     this.sealed = true;
     this.onSealed?.();
@@ -1086,12 +1089,14 @@ export class NxsPaxStreamReader {
     this._pageLength = [];
     for (let i = 0; i < this.pageCount; i++) {
       const e = tailOff + i * 28;
+      if (e + 28 > this.bytes.length) break;
       this._pageIndex.push(rdU32(this.bytes, e));
       this._pageRecStart.push(Number(this.view.getBigUint64(e + 4, true)));
       this._pageRecCount.push(rdU32(this.bytes, e + 12));
       this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
       this._pageLength.push(rdU32(this.bytes, e + 24));
     }
+    this.pageCount = this._pageIndex.length;
     this._scanCursor = this.bytes.length;
   }
 
