@@ -261,6 +261,38 @@ func (r *Reader) colVarPartsAt(rec uint32, slot int) (bm, offsets, values []byte
 	return nil, nil, nil, false
 }
 
+// ColVarBuffer exposes zero-copy string/binary column sectors (columnar/PAX only).
+type ColVarBuffer struct {
+	Bitmap  []byte
+	Offsets []byte
+	Values  []byte
+	Count   uint32
+}
+
+// ColVarBuffer returns the null bitmap, u32 offset table, and values blob for a var field.
+func (r *Reader) ColVarBuffer(key string) (ColVarBuffer, error) {
+	if r.layout != LayoutColumnar {
+		return ColVarBuffer{}, fmt.Errorf("ERR_LAYOUT: ColVarBuffer is columnar-only (use ColGetStr per record on PAX)")
+	}
+	slot, ok := r.keyIndex[key]
+	if !ok {
+		return ColVarBuffer{}, fmt.Errorf("ERR_KEY_NOT_FOUND: %s", key)
+	}
+	if slot < 0 || slot >= len(r.KeySigils) || !isVarSigil(r.KeySigils[slot]) {
+		return ColVarBuffer{}, fmt.Errorf("ERR_UNSUPPORTED_FIELD_TYPE: %s", key)
+	}
+	bm, offsets, values, err := r.colVarParts(slot)
+	if err != nil {
+		return ColVarBuffer{}, err
+	}
+	return ColVarBuffer{
+		Bitmap:  bm,
+		Offsets: offsets,
+		Values:  values,
+		Count:   r.recordCount,
+	}, nil
+}
+
 // ColGetStr reads a string field at recordIndex in columnar or PAX layout.
 func (r *Reader) ColGetStr(key string, recordIndex uint32) (string, bool) {
 	slot, ok := r.keyIndex[key]

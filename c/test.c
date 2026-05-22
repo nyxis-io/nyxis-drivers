@@ -25,6 +25,12 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
 
 static int passed = 0, failed = 0;
 
+static uint32_t rd_u32_le(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
 #define CHECK(name, expr) do { \
     if (expr) { printf("  ✓ %s\n", name); passed++; } \
     else      { printf("  ✗ %s\n", name); failed++; } \
@@ -423,6 +429,19 @@ int main(int argc, char **argv) {
                 CHECK("columnar strings record(42) name",
                       nxs_get_str_slot(&obj, name_slot, name, sizeof(name)) == NXS_OK &&
                       strcmp(name, "user_42") == 0);
+
+                {
+                    const uint8_t *bm = NULL, *off = NULL, *vals = NULL;
+                    size_t bm_len = 0, off_len = 0, val_len = 0;
+                    CHECK("columnar col_var_buffer opens",
+                          nxs_col_var_buffer(&cr, "name", &bm, &bm_len, &off, &off_len,
+                                             &vals, &val_len) == NXS_OK);
+                    CHECK("columnar col_var_buffer offsets size",
+                          off_len == (size_t)(cr.record_count + 1) * 4);
+                    CHECK("columnar col_var_buffer user_0 len",
+                          rd_u32_le(off) == 0 && rd_u32_le(off + 4) == 6 &&
+                          val_len >= 6 && memcmp(vals, "user_0", 6) == 0);
+                }
 
                 nxs_close(&cr);
             } else {

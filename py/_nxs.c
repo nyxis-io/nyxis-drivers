@@ -596,6 +596,61 @@ Reader_col_buffer_dict(ReaderObject *self, const char *field)
 }
 
 static PyObject *
+Reader_col_var_buffer(ReaderObject *self, PyObject *key)
+{
+    PyObject *tmp = NULL;
+    const char *field = reader_key_cstr(key, &tmp);
+    if (!field) {
+        Py_XDECREF(tmp);
+        return NULL;
+    }
+    if (!self->has_nxs || self->nxs.layout != NXS_LAYOUT_COLUMNAR) {
+        Py_XDECREF(tmp);
+        PyErr_SetString(PyExc_RuntimeError,
+                         "ERR_LAYOUT: col_var_buffer is columnar-only (use record get_str on PAX)");
+        return NULL;
+    }
+    const uint8_t *bitmap = NULL, *offsets = NULL, *values = NULL;
+    size_t bm_len = 0, off_len = 0, val_len = 0;
+    nxs_err_t err = nxs_col_var_buffer(&self->nxs, field, &bitmap, &bm_len,
+                                       &offsets, &off_len, &values, &val_len);
+    Py_XDECREF(tmp);
+    if (err != NXS_OK) {
+        PyErr_SetString(PyExc_ValueError, nxs_err_msg(err));
+        return NULL;
+    }
+    PyObject *dict = PyDict_New();
+    PyObject *bitmap_mv = PyMemoryView_FromMemory((char *)bitmap, (Py_ssize_t)bm_len, PyBUF_READ);
+    PyObject *offsets_mv = PyMemoryView_FromMemory((char *)offsets, (Py_ssize_t)off_len, PyBUF_READ);
+    PyObject *values_mv = PyMemoryView_FromMemory((char *)values, (Py_ssize_t)val_len, PyBUF_READ);
+    PyObject *count = PyLong_FromUnsignedLong(self->record_count);
+    if (!dict || !bitmap_mv || !offsets_mv || !values_mv || !count) {
+        Py_XDECREF(dict);
+        Py_XDECREF(bitmap_mv);
+        Py_XDECREF(offsets_mv);
+        Py_XDECREF(values_mv);
+        Py_XDECREF(count);
+        return NULL;
+    }
+    if (PyDict_SetItemString(dict, "bitmap", bitmap_mv) < 0 ||
+        PyDict_SetItemString(dict, "offsets", offsets_mv) < 0 ||
+        PyDict_SetItemString(dict, "values", values_mv) < 0 ||
+        PyDict_SetItemString(dict, "count", count) < 0) {
+        Py_DECREF(dict);
+        Py_DECREF(bitmap_mv);
+        Py_DECREF(offsets_mv);
+        Py_DECREF(values_mv);
+        Py_DECREF(count);
+        return NULL;
+    }
+    Py_DECREF(bitmap_mv);
+    Py_DECREF(offsets_mv);
+    Py_DECREF(values_mv);
+    Py_DECREF(count);
+    return dict;
+}
+
+static PyObject *
 Reader_col_buffer(ReaderObject *self, PyObject *key)
 {
     PyObject *tmp = NULL;
@@ -808,6 +863,8 @@ static PyMethodDef Reader_methods[] = {
     {"col_sum_f64", (PyCFunction)Reader_col_sum_f64, METH_O, "Columnar/PAX sum of f64 field."},
     {"col_buffer", (PyCFunction)Reader_col_buffer, METH_O,
      "dict(values, bitmap, count) memoryviews for columnar/PAX numeric field."},
+    {"col_var_buffer", (PyCFunction)Reader_col_var_buffer, METH_O,
+     "dict(bitmap, offsets, values, count) for string/binary columns."},
     {"col_numpy_f64", (PyCFunction)Reader_col_numpy_f64, METH_O,
      "numpy.ndarray view of f64 column (requires numpy)."},
     {"min_f64",  (PyCFunction)Reader_min_f64,  METH_O, "Min of an f64 field across all records."},

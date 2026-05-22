@@ -592,8 +592,28 @@ export class NxsReader {
     }
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._isVarSigil(this.keySigils[slot])) {
+      throw new NxsError("ERR_UNSUPPORTED_FIELD_TYPE", "use colVarBuffer for string/binary columns");
+    }
     const { bitmap, values } = this._colFieldParts(slot);
     return { values, bitmap, count: this.recordCount };
+  }
+
+  /**
+   * Zero-copy string/binary column: null bitmap + u32 offsets + values blob.
+   * @returns {{ bitmap: Uint8Array, offsets: Uint8Array, values: Uint8Array, count: number }}
+   */
+  colVarBuffer(key) {
+    if (this.layout !== "columnar") {
+      throw new NxsError("ERR_LAYOUT", "colVarBuffer is columnar-only (use colGetStr per record on PAX)");
+    }
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (!this._isVarSigil(this.keySigils[slot])) {
+      throw new NxsError("ERR_UNSUPPORTED_FIELD_TYPE", "colVarBuffer requires string or binary field");
+    }
+    const { bitmap, offsets, values } = this._colVarParts(slot);
+    return { bitmap, offsets, values, count: this.recordCount };
   }
 
   /** f64 at `recordIndex` in a columnar column (null → null). */

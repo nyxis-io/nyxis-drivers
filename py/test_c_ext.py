@@ -139,6 +139,22 @@ def main() -> int:
     case("columnar col_buffer + col_sum_f64", col_buffer_columnar)
     case("columnar col_numpy_f64", col_numpy_columnar)
 
+    def col_var_buffer_columnar():
+        candidates = [
+            fixture_dir.parent.parent / "conformance/columnar_flat8_strings_100.nxb",
+            Path(__file__).resolve().parent / "../../nyxis/conformance/columnar_flat8_strings_100.nxb",
+        ]
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
+            return
+        r = _nxs.Reader(path.read_bytes())
+        vb = r.col_var_buffer("name")
+        assert vb["count"] == 100
+        assert len(vb["offsets"]) == 101 * 4
+        assert bytes(vb["values"][:6]) == b"user_0"
+
+    case("columnar col_var_buffer", col_var_buffer_columnar)
+
     print(f"\n{passed} passed, {failed} failed\n")
     return 0 if failed == 0 else 1
 
