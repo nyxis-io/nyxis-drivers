@@ -7,6 +7,14 @@ import (
 	"math"
 )
 
+func varOffBytesLen(rc uint32) (int, error) {
+	off := (uint64(rc) + 1) * 4
+	if off > uint64(math.MaxInt) {
+		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets overflow")
+	}
+	return int(off), nil
+}
+
 const (
 	flagColumnar uint16 = 0x0001
 	flagPAX      uint16 = 0x0004
@@ -167,7 +175,10 @@ func fieldSectorLen(data []byte, sectorOff int, rc uint32, sigil byte) (int, err
 	if !isVarSigil(sigil) {
 		return bmLen + int(uint64(rc)*8), nil
 	}
-	offBytes := int((uint64(rc) + 1) * 4)
+	offBytes, err := varOffBytesLen(rc)
+	if err != nil {
+		return 0, err
+	}
 	if sectorOff+bmLen+offBytes > len(data) {
 		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
 	}
@@ -210,7 +221,10 @@ func (r *Reader) colVarParts(slot int) (bm, offsets, values []byte, err error) {
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	offBytes := int((uint64(r.recordCount) + 1) * 4)
+	offBytes, err := varOffBytesLen(r.recordCount)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	if len(tail) < offBytes {
 		return nil, nil, nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
 	}
@@ -236,8 +250,8 @@ func (r *Reader) colVarPartsAt(rec uint32, slot int) (bm, offsets, values []byte
 			return nil, nil, nil, false
 		}
 		rc := r.pageRecCount[pi]
-		offBytes := int((uint64(rc) + 1) * 4)
-		if len(tail) < offBytes {
+		offBytes, err := varOffBytesLen(rc)
+		if err != nil || len(tail) < offBytes {
 			return nil, nil, nil, false
 		}
 		return bm, tail[:offBytes], tail[offBytes:], true

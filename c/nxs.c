@@ -58,6 +58,18 @@ static size_t null_bitmap_bytes(uint32_t n) {
     return (raw + 7u) & ~(size_t)7u;
 }
 
+static int var_off_bytes(uint32_t rc, size_t *out) {
+    size_t t;
+    if (size_add_overflow((size_t)rc, 1u, &t) || size_mul_overflow(t, 4u, out)) return 1;
+    return 0;
+}
+
+static int var_need_bytes(uint32_t rec, size_t *out) {
+    size_t t;
+    if (size_add_overflow((size_t)rec, 2u, &t) || size_mul_overflow(t, 4u, out)) return 1;
+    return 0;
+}
+
 static int pax_page_sizes(uint32_t rc, uint16_t field_count,
                             size_t *body_out, size_t *page_len_out) {
     if (field_count == 0 || field_count > NXS_MAX_KEYS) return 1;
@@ -135,7 +147,8 @@ static nxs_err_t col_var_parts(const nxs_reader_t *r, int slot,
     nxs_err_t err = col_field_parts(r, slot, bitmap, bm_len, &sector, &sector_len);
     if (err != NXS_OK) return err;
     uint32_t n = r->record_count;
-    size_t off_bytes = ((size_t)n + 1u) * 4u;
+    size_t off_bytes;
+    if (var_off_bytes(n, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
     if (sector_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
     *offsets = sector;
     *off_len = off_bytes;
@@ -148,7 +161,8 @@ static nxs_err_t col_var_str_at(const uint8_t *offsets, size_t off_len,
                                 const uint8_t *values, size_t val_len,
                                 uint32_t rec, char *buf, size_t buf_len) {
     if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
-    size_t need = ((size_t)rec + 2u) * 4u;
+    size_t need;
+    if (var_need_bytes(rec, &need)) return NXS_ERR_OUT_OF_BOUNDS;
     if (off_len < need) return NXS_ERR_OUT_OF_BOUNDS;
     uint32_t start = rd_u32(offsets + (size_t)rec * 4u);
     uint32_t end = rd_u32(offsets + (size_t)rec * 4u + 4u);
@@ -164,7 +178,8 @@ static nxs_err_t col_var_binary_at(const uint8_t *offsets, size_t off_len,
                                    const uint8_t *values, size_t val_len,
                                    uint32_t rec, uint8_t *buf, size_t buf_len,
                                    size_t *out_len) {
-    size_t need = ((size_t)rec + 2u) * 4u;
+    size_t need;
+    if (var_need_bytes(rec, &need)) return NXS_ERR_OUT_OF_BOUNDS;
     if (off_len < need) return NXS_ERR_OUT_OF_BOUNDS;
     uint32_t start = rd_u32(offsets + (size_t)rec * 4u);
     uint32_t end = rd_u32(offsets + (size_t)rec * 4u + 4u);
@@ -181,11 +196,21 @@ static size_t col_field_sector_len(const uint8_t *data, size_t size, size_t pos,
     size_t bm_len = null_bitmap_bytes(rc);
     if (pos + bm_len > size) return 0;
     if (col_is_var_sigil(sig)) {
-        size_t off_bytes = ((size_t)rc + 1u) * 4u;
-        if (pos + bm_len + off_bytes > size) return 0;
-        uint32_t end = rd_u32(data + pos + bm_len + (size_t)rc * 4u);
-        size_t total = bm_len + off_bytes + (size_t)end;
-        if (pos + total > size) return 0;
+        size_t off_bytes, a, b, end_off, total;
+        if (var_off_bytes(rc, &off_bytes)) return 0;
+        if (size_add_overflow(pos, bm_len, &a) ||
+            size_add_overflow(a, off_bytes, &b) || b > size)
+            return 0;
+        size_t bm_start;
+        if (size_add_overflow(pos, bm_len, &bm_start)) return 0;
+        if (size_mul_overflow((size_t)rc, 4u, &a) ||
+            size_add_overflow(bm_start, a, &end_off) || end_off + 4 > size)
+            return 0;
+        uint32_t end = rd_u32(data + end_off);
+        if (size_add_overflow(bm_len, off_bytes, &a) ||
+            size_add_overflow(a, (size_t)end, &total) ||
+            size_add_overflow(pos, total, &b) || b > size)
+            return 0;
         return total;
     }
     size_t total = bm_len + (size_t)rc * 8u;
@@ -248,7 +273,8 @@ static nxs_err_t col_get_str_pax(const nxs_object_t *obj, int slot,
                                         &bm, &bm_len, &vals, &val_len);
     if (err != NXS_OK) return err;
     if (!col_bit(bm, (uint32_t)li)) return NXS_ERR_FIELD_ABSENT;
-    size_t off_bytes = ((size_t)rc + 1u) * 4u;
+    size_t off_bytes;
+    if (var_off_bytes(rc, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
     if (val_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
     return col_var_str_at(vals, off_bytes, vals + off_bytes, val_len - off_bytes,
                           (uint32_t)li, buf, buf_len);
@@ -289,7 +315,8 @@ static nxs_err_t col_get_binary_pax(const nxs_object_t *obj, int slot,
                                         &bm, &bm_len, &vals, &val_len);
     if (err != NXS_OK) return err;
     if (!col_bit(bm, (uint32_t)li)) return NXS_ERR_FIELD_ABSENT;
-    size_t off_bytes = ((size_t)rc + 1u) * 4u;
+    size_t off_bytes;
+    if (var_off_bytes(rc, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
     if (val_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
     return col_var_binary_at(vals, off_bytes, vals + off_bytes, val_len - off_bytes,
                              (uint32_t)li, buf, buf_len, out_len);
@@ -625,14 +652,6 @@ static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
     nxs_err_t err = pax_field_sector_at(data, size, poff + 24, rc, sigils, (int)fc,
                                         slot, bm, bm_len, vals, val_len);
     if (err != NXS_OK) return err;
-    if (col_is_var_sigil(sigils[slot])) {
-        size_t off_bytes = ((size_t)rc + 1u) * 4u;
-        if (*val_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
-        uint32_t end = rd_u32(*vals + (size_t)rc * 4u);
-        *val_len = off_bytes + (size_t)end;
-    } else {
-        *val_len = (size_t)rc * 8u;
-    }
     *record_count = rc;
     return NXS_OK;
 }
@@ -667,7 +686,8 @@ static nxs_err_t pax_field_values(const nxs_reader_t *r, uint32_t rec, int slot,
     if (poff + 24 > r->size || rd_u32(r->data + poff) != MAGIC_PAGE)
         return NXS_ERR_BAD_PAGE_MAGIC;
     uint16_t fc = rd_u16(r->data + poff + 20);
-    if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
+    if (slot < 0 || slot >= (int)fc || fc > (uint16_t)r->key_count)
+        return NXS_ERR_OUT_OF_BOUNDS;
     uint32_t rc = r->page_rec_count[pi];
     const uint8_t *bm;
     size_t bm_len, sector_tail_len;
