@@ -35,16 +35,8 @@ jobs:
       - name: Publish
         working-directory: js
         env:
-          NODE_AUTH_TOKEN: ""
-          NPM_CONFIG_USERCONFIG: ""
-        run: |
-          echo "npm=$(npm --version)"
-          echo "node=$(node --version)"
-          echo "NODE_AUTH_TOKEN=${NODE_AUTH_TOKEN:+set}"
-          echo "NPM_CONFIG_USERCONFIG=${NPM_CONFIG_USERCONFIG:-unset}"
-          echo "OIDC_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
-          echo "OIDC_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+set}"
-          npm publish --access public
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
 
       - name: Smoke test (install from registry)
         # Wait out npm's index propagation (can lag ~30-60s after publish).
