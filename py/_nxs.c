@@ -17,6 +17,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../c/nxs.h"
@@ -203,11 +204,20 @@ make_object(ReaderObject *reader, Py_ssize_t offset)
 }
 
 static int
+object_obj_at_nyxo(const ObjectView *self)
+{
+    if (self->offset + 4 > self->reader->size)
+        return 0;
+    return rd_u32(self->reader->data + self->offset) == MAGIC_OBJ;
+}
+
+/* Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+static int
 object_layout_access(const ObjectView *self)
 {
-    return self->layout_record &&
-           self->reader->has_nxs &&
-           self->reader->nxs.layout != NXS_LAYOUT_ROW;
+    if (!self->reader->has_nxs || self->reader->nxs.layout == NXS_LAYOUT_ROW)
+        return 0;
+    return !object_obj_at_nyxo(self);
 }
 
 static int
@@ -427,6 +437,49 @@ Object_get_bool(ObjectView *self, PyObject *key)
 }
 
 static PyObject *
+py_unicode_from_nxs_str(nxs_object_t *obj, const char *key)
+{
+    char stack[4096];
+    nxs_err_t err = nxs_get_str(obj, key, stack, sizeof(stack));
+    if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+        return NULL;
+    if (err != NXS_OK) {
+        object_nxs_err_to_py(err, "str");
+        return NULL;
+    }
+    size_t n = strlen(stack);
+    if (n < sizeof(stack) - 1)
+        return PyUnicode_FromString(stack);
+
+    for (size_t cap = 8192; cap <= (size_t)32 * 1024 * 1024; cap *= 2) {
+        char *heap = (char *)malloc(cap);
+        if (!heap) {
+            PyErr_NoMemory();
+            return NULL;
+        }
+        err = nxs_get_str(obj, key, heap, cap);
+        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND) {
+            free(heap);
+            return NULL;
+        }
+        if (err != NXS_OK) {
+            free(heap);
+            object_nxs_err_to_py(err, "str");
+            return NULL;
+        }
+        n = strlen(heap);
+        if (n < cap - 1) {
+            PyObject *out = PyUnicode_FromString(heap);
+            free(heap);
+            return out;
+        }
+        free(heap);
+    }
+    PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str too large");
+    return NULL;
+}
+
+static PyObject *
 Object_get_str(ObjectView *self, PyObject *key)
 {
     if (object_layout_access(self)) {
@@ -437,15 +490,9 @@ Object_get_str(ObjectView *self, PyObject *key)
             PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: record");
             return NULL;
         }
-        char buf[4096];
-        nxs_err_t err = nxs_get_str(&obj, k, buf, sizeof(buf));
-        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
-            Py_RETURN_NONE;
-        if (err != NXS_OK) {
-            object_nxs_err_to_py(err, "str");
-            return NULL;
-        }
-        return PyUnicode_FromString(buf);
+        PyObject *s = py_unicode_from_nxs_str(&obj, k);
+        if (!s) Py_RETURN_NONE;
+        return s;
     }
 
     int slot = resolve_slot(self, key);

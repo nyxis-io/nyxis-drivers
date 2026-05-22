@@ -329,10 +329,14 @@ public final class NYXObject {
         self.recordIndex = recordIndex
     }
 
-    private func usesColumnarFieldAccess() -> Bool {
-        if reader.col.layout == .row { return false }
+    private func objAtNyxo() -> Bool {
         if offset + 4 > reader.data.count { return false }
-        return rdU32(reader.data, offset) != magicObj
+        return rdU32(reader.data, offset) == magicObj
+    }
+
+    /// Columnar/PAX top-level records use record index; nested NYXO blobs use row paths.
+    private func usesColumnarFieldAccess() -> Bool {
+        reader.col.layout != .row && !objAtNyxo()
     }
 
     private func locateBitmask() throws {

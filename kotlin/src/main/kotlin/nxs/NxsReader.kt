@@ -249,10 +249,14 @@ class NxsObject(
     private val offset: Int,
     private val recordIndex: Int,
 ) {
-    private fun usesColumnarFieldAccess(): Boolean {
-        if (reader.layout == Layout.ROW) return false
+    private fun objAtNyxo(): Boolean {
         if (offset + 4 > reader.size()) return false
-        return reader.readU32(offset).toInt() and -1 != MAGIC_OBJ
+        return reader.readU32(offset).toInt() and -1 == MAGIC_OBJ
+    }
+
+    /** Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+    private fun usesColumnarFieldAccess(): Boolean {
+        return reader.layout != Layout.ROW && !objAtNyxo()
     }
 
     private var staged = false

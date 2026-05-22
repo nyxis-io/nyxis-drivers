@@ -194,16 +194,19 @@ class NxsObject
         $this->recordIndex = $recordIndex >= 0 ? $recordIndex : $offset;
     }
 
-    private function usesColumnarFieldAccess(): bool
+    private function objAtNyxo(): bool
     {
-        if ($this->reader->layout() === 'row') {
-            return false;
-        }
         $bytes = $this->reader->rawBytes();
         if ($this->offset + 4 > strlen($bytes)) {
             return false;
         }
-        return rdU32($bytes, $this->offset) !== MAGIC_OBJ;
+        return rdU32($bytes, $this->offset) === MAGIC_OBJ;
+    }
+
+    /** Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+    private function usesColumnarFieldAccess(): bool
+    {
+        return $this->reader->layout() !== 'row' && !$this->objAtNyxo();
     }
 
     // ── Internal: parse bitmask + build offset-table index ────────────────

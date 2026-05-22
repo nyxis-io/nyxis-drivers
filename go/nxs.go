@@ -337,14 +337,19 @@ func (o *Object) resolveSlot(slot int) int {
 
 // ── Typed accessors ──────────────────────────────────────────────────────────
 
+func (o *Object) objAtNyxo() bool {
+	if o.offset+4 > len(o.reader.data) {
+		return false
+	}
+	return binary.LittleEndian.Uint32(o.reader.data[o.offset:]) == magicObj
+}
+
+// usesColumnarFieldAccess: columnar/PAX top-level records use record index; nested NYXO uses row paths.
 func (o *Object) usesColumnarFieldAccess() bool {
 	if o.reader.layout == LayoutRow {
 		return false
 	}
-	if o.offset+4 > len(o.reader.data) {
-		return false
-	}
-	return binary.LittleEndian.Uint32(o.reader.data[o.offset:]) != magicObj
+	return !o.objAtNyxo()
 }
 
 func (o *Object) GetI64(key string) (int64, bool) {

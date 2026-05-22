@@ -82,7 +82,15 @@ public sealed class NxsReader
     private ulong[] _pageOffset = Array.Empty<ulong>();
     private uint[] _pageLength = Array.Empty<uint>();
 
-    public int RecordCount => (int)_recordCount;
+    public int RecordCount
+    {
+        get
+        {
+            if (_recordCount > int.MaxValue)
+                throw new NxsException("ERR_OUT_OF_BOUNDS", "record_count exceeds int.MaxValue");
+            return (int)_recordCount;
+        }
+    }
 
     public NxsReader(byte[] data)
     {
@@ -174,7 +182,7 @@ public sealed class NxsReader
         if (size < FooterColBytes) throw new NxsException("ERR_OUT_OF_BOUNDS", "columnar footer");
         int fo = size - FooterColBytes;
         TailPtr = RdU64(fo);
-        _recordCount = (uint)RdU64(fo + 8);
+        _recordCount = RecordCountFromFooter(RdU64(fo + 8));
         int kc = Keys.Length;
         int tail = (int)TailPtr;
         for (int i = 0; i < kc; i++)
@@ -194,7 +202,7 @@ public sealed class NxsReader
         if (size < FooterPaxBytes) throw new NxsException("ERR_OUT_OF_BOUNDS", "PAX footer");
         int fo = size - FooterPaxBytes;
         TailPtr = RdU64(fo);
-        _recordCount = (uint)RdU64(fo + 8);
+        _recordCount = RecordCountFromFooter(RdU64(fo + 8));
         uint pageCount = RdU32(fo + 16);
         uint pageSizeHint = RdU32(fo + 20);
         int tail = (int)TailPtr;
@@ -337,16 +345,12 @@ public sealed class NxsReader
 
     public long SumI64(string key)
     {
+        if (LayoutKind != Layout.Row)
+            return ColSumI64(key);
         int s = Slot(key);
         long sum = 0;
         for (int i = 0; i < RecordCount; i++)
         {
-            if (LayoutKind != Layout.Row)
-            {
-                if (ColNumericBytes((uint)i, s, out var cell))
-                    sum += BitConverter.ToInt64(cell, 0);
-                continue;
-            }
             int abs = (int)RdU64(_tailStart + i * 10 + 2);
             int off = ScanOffset(abs, s);
             if (off >= 0) sum += RdI64(off);
@@ -356,23 +360,16 @@ public sealed class NxsReader
 
     public double? MinF64(string key)
     {
+        if (LayoutKind != Layout.Row)
+            return ColMinF64(key);
         int s = Slot(key);
         double? m = null;
         for (int i = 0; i < RecordCount; i++)
         {
-            double v;
-            if (LayoutKind != Layout.Row)
-            {
-                if (!ColNumericBytes((uint)i, s, out var cell)) continue;
-                v = BitConverter.ToDouble(cell, 0);
-            }
-            else
-            {
-                int abs = (int)RdU64(_tailStart + i * 10 + 2);
-                int off = ScanOffset(abs, s);
-                if (off < 0) continue;
-                v = RdF64(off);
-            }
+            int abs = (int)RdU64(_tailStart + i * 10 + 2);
+            int off = ScanOffset(abs, s);
+            if (off < 0) continue;
+            double v = RdF64(off);
             m = m is null ? v : Math.Min(m.Value, v);
         }
         return m;
@@ -380,27 +377,77 @@ public sealed class NxsReader
 
     public double? MaxF64(string key)
     {
+        if (LayoutKind != Layout.Row)
+            return ColMaxF64(key);
         int s = Slot(key);
         double? m = null;
         for (int i = 0; i < RecordCount; i++)
         {
-            double v;
-            if (LayoutKind != Layout.Row)
-            {
-                if (!ColNumericBytes((uint)i, s, out var cell)) continue;
-                v = BitConverter.ToDouble(cell, 0);
-            }
-            else
-            {
-                int abs = (int)RdU64(_tailStart + i * 10 + 2);
-                int off = ScanOffset(abs, s);
-                if (off < 0) continue;
-                v = RdF64(off);
-            }
+            int abs = (int)RdU64(_tailStart + i * 10 + 2);
+            int off = ScanOffset(abs, s);
+            if (off < 0) continue;
+            double v = RdF64(off);
             m = m is null ? v : Math.Max(m.Value, v);
         }
         return m;
     }
+
+    private static uint RecordCountFromFooter(ulong rc)
+    {
+        if (rc > uint.MaxValue)
+            throw new NxsException("ERR_OUT_OF_BOUNDS", "record_count overflow");
+        return (uint)rc;
+    }
+
+    private long ColSumI64(int slot)
+    {
+        var (bm, vals) = ColFieldParts(slot);
+        long sum = 0;
+        for (uint i = 0; i < _recordCount; i++)
+        {
+            if (!ColBit(bm, i)) continue;
+            int off = (int)i * 8;
+            if (off + 8 > vals.Length) break;
+            sum += RdI64(vals, off);
+        }
+        return sum;
+    }
+
+    public long ColSumI64(string key) => ColSumI64(Slot(key));
+
+    private double? ColMinF64(int slot)
+    {
+        var (bm, vals) = ColFieldParts(slot);
+        double? m = null;
+        for (uint i = 0; i < _recordCount; i++)
+        {
+            if (!ColBit(bm, i)) continue;
+            int off = (int)i * 8;
+            if (off + 8 > vals.Length) break;
+            double v = RdF64(vals, off);
+            m = m is null ? v : Math.Min(m.Value, v);
+        }
+        return m;
+    }
+
+    private double? ColMaxF64(int slot)
+    {
+        var (bm, vals) = ColFieldParts(slot);
+        double? m = null;
+        for (uint i = 0; i < _recordCount; i++)
+        {
+            if (!ColBit(bm, i)) continue;
+            int off = (int)i * 8;
+            if (off + 8 > vals.Length) break;
+            double v = RdF64(vals, off);
+            m = m is null ? v : Math.Max(m.Value, v);
+        }
+        return m;
+    }
+
+    public double? ColMinF64(string key) => ColMinF64(Slot(key));
+
+    public double? ColMaxF64(string key) => ColMaxF64(Slot(key));
 
     // ── Internal columnar/PAX ─────────────────────────────────────────────────
 
@@ -643,6 +690,9 @@ public sealed class NxsReader
     private static double RdF64(byte[] buf, int off) =>
         BitConverter.ToDouble(buf, off);
 
+    private static long RdI64(byte[] buf, int off) =>
+        BitConverter.ToInt64(buf, off);
+
     internal string RdStr(int off)
     {
         int len = (int)RdU32(off);
@@ -721,12 +771,15 @@ public sealed class NxsObject
         _recordIndex = recordIndex;
     }
 
-    private bool UsesColumnarFieldAccess()
+    private bool ObjAtNyxo()
     {
-        if (_reader.LayoutKind == Layout.Row) return false;
         if (_offset + 4 > _reader.DataSize) return false;
-        return _reader.RdU32(_offset) != MagicObj;
+        return _reader.RdU32(_offset) == MagicObj;
     }
+
+    /// <summary>Columnar/PAX top-level records use record index; nested NYXO blobs use row paths.</summary>
+    private bool UsesColumnarFieldAccess() =>
+        _reader.LayoutKind != Layout.Row && !ObjAtNyxo();
 
     private void LocateBitmask()
     {

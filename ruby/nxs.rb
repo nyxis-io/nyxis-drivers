@@ -871,11 +871,15 @@ module Nxs
       @record_index.nil? ? @offset : @record_index
     end
 
-    def uses_columnar_field_access?
-      return false if @reader.layout == :row
+    def obj_at_nyxo?
       return false if @offset + 4 > @reader.data.bytesize
 
-      @reader.data.unpack1("@#{@offset}L<") != MAGIC_OBJ
+      @reader.data.unpack1("@#{@offset}L<") == MAGIC_OBJ
+    end
+
+    # Columnar/PAX top-level records use record index; nested NYXO blobs use row paths.
+    def uses_columnar_field_access?
+      @reader.layout != :row && !obj_at_nyxo?
     end
 
     # Parse the object header (lazy — only on first field access).
