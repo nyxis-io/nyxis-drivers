@@ -10,7 +10,7 @@ on:
     paths: ['swift/**', 'Makefile', '.github/workflows/swift.yml']
 
 jobs:
-  ci:
+  ci-macos:
     runs-on: macos-15
     env:
       FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
@@ -22,4 +22,21 @@ jobs:
           token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN }}
 
       - run: make lint-swift
+      - run: make test-swift
+
+  ci-linux:
+    runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-core
+        with:
+          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN }}
+
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: '6.0'
+
       - run: make test-swift
