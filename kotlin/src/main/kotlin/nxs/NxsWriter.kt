@@ -75,7 +75,6 @@ class NxsWriter(private val schema: NxsSchema) {
     private val buf = ByteArrayOutputStream(4096)
     private val frames = ArrayDeque<Frame>()
     private val recordOffsets = mutableListOf<Int>()
-    // Sigil per slot: default str/var-length; updated on each typed write
     private val slotSigils = IntArray(schema.count) { sigilStr }
 
     fun beginObject() {
@@ -239,7 +238,7 @@ class NxsWriter(private val schema: NxsSchema) {
         slot: Int,
         values: LongArray,
     ) {
-        markSlot(slot) // list is var-length — keep sigilStr default
+        markSlot(slot)
         val total = 16 + values.size * 8
         writeU32(0x4E59584C)
         writeU32(total)
