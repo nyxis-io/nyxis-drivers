@@ -21,9 +21,11 @@ fi
 
 cc -O3 -Wall -Wextra -fPIC \
    -I"$PYINCLUDE" \
+   -I../c \
    -shared \
    $LDFLAGS \
    _nxs.c \
+   ../c/nxs.c \
    -o "$OUT"
 
 echo "Built $OUT"

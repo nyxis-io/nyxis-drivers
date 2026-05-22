@@ -98,6 +98,47 @@ def main() -> int:
     case("out-of-bounds raises IndexError", oob_raises_indexerror)
     case("full-scan sums match", full_scan_sums_equal)
 
+    def col_buffer_columnar():
+        candidates = [
+            fixture_dir.parent.parent / "conformance/columnar_flat8_dense_100.nxb",
+            Path(__file__).resolve().parent / "../../nyxis/conformance/columnar_flat8_dense_100.nxb",
+            fixture_dir / "../../conformance/columnar_flat8_dense_100.nxb",
+        ]
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
+            print("      (skip: columnar_flat8_dense_100.nxb not found)")
+            return
+        data = path.read_bytes()
+        r = _nxs.Reader(data)
+        assert r.layout == "columnar"
+        buf = r.col_buffer("score")
+        assert buf["count"] == 100
+        assert len(buf["values"]) == 100 * 8
+        assert len(buf["bitmap"]) >= 13
+        s = r.col_sum_f64("score")
+        assert math.isclose(s, 2475.0, rel_tol=1e-6)
+
+    def col_numpy_columnar():
+        try:
+            import numpy as np  # noqa: F401
+        except ImportError:
+            print("      (skip: numpy not installed)")
+            return
+        candidates = [
+            fixture_dir.parent.parent / "conformance/columnar_flat8_dense_100.nxb",
+            Path(__file__).resolve().parent / "../../nyxis/conformance/columnar_flat8_dense_100.nxb",
+        ]
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
+            return
+        r = _nxs.Reader(path.read_bytes())
+        arr = r.col_numpy_f64("score")
+        assert arr.shape == (100,)
+        assert math.isclose(float(arr.sum()), 2475.0, rel_tol=1e-6)
+
+    case("columnar col_buffer + col_sum_f64", col_buffer_columnar)
+    case("columnar col_numpy_f64", col_numpy_columnar)
+
     print(f"\n{passed} passed, {failed} failed\n")
     return 0 if failed == 0 else 1
 
