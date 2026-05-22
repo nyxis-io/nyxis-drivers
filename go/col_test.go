@@ -235,6 +235,73 @@ func BenchmarkColumnarColSumF64_100k(b *testing.B) {
 	}
 }
 
+func TestPAXStreamIncremental(t *testing.T) {
+	path := filepath.Join(conformanceDir(t), "pax_flat8_dense_p256_1000.nxb")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skip("conformance vector missing")
+	}
+	// Truncate after first complete page (256 records, page_size=256).
+	dataStart := paxDataStart(t, data)
+	off := dataStart
+	fieldCount := binary.LittleEndian.Uint16(data[32:34])
+	plen := PaxCompletePageAt(data, off, fieldCount)
+	if plen == 0 {
+		t.Fatal("first page not complete in sealed vector")
+	}
+	partial := make([]byte, off+plen)
+	copy(partial, data[:off+plen])
+	binary.LittleEndian.PutUint64(partial[16:24], 0)
+	sr, err := OpenPaxStream(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sr.Poll()
+	if sr.RecordsAvailable() != 256 {
+		t.Fatalf("records after page 1: got %d want 256", sr.RecordsAvailable())
+	}
+	sum1 := sr.ColSumF64("score")
+	var want1 float64
+	for i := 0; i < 256; i++ {
+		want1 += float64(i) * 0.5
+	}
+	if !closeEnough(sum1, want1) {
+		t.Fatalf("page1 sum: got %v want %v", sum1, want1)
+	}
+	r, err := NewReader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wantFull float64
+	for i := 0; i < 1000; i++ {
+		wantFull += float64(i) * 0.5
+	}
+	if !closeEnough(r.ColSumF64("score"), wantFull) {
+		t.Fatalf("sealed ColSumF64: got %v want %v", r.ColSumF64("score"), wantFull)
+	}
+}
+
+func paxDataStart(t *testing.T, data []byte) int {
+	t.Helper()
+	r, err := NewReader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Flags&flagSchemaEmbedded == 0 {
+		t.Fatal("expected embedded schema")
+	}
+	off := 32
+	kc := int(binary.LittleEndian.Uint16(data[off : off+2]))
+	off += 2 + kc
+	for i := 0; i < kc; i++ {
+		for off < len(data) && data[off] != 0 {
+			off++
+		}
+		off++
+	}
+	return (off + 7) &^ 7
+}
+
 func TestColumnarInvalidFlags(t *testing.T) {
 	path := filepath.Join(conformanceDir(t), "columnar_invalid_flags_both.nxb")
 	data, err := os.ReadFile(path)

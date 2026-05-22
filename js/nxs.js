@@ -337,6 +337,28 @@ export class NxsReader {
       this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
       this._pageLength.push(this.view.getUint32(e + 24, true));
     }
+    for (let i = 0; i < this.pageCount; i++) {
+      const poff = this._pageOffset[i];
+      if (poff > this.bytes.length - 4 || this.view.getUint32(poff, true) !== MAGIC_PAGE) {
+        throw new NxsError("ERR_INVALID_PAGE_MAGIC", "PAX page magic mismatch");
+      }
+    }
+  }
+
+  _paxSumF64(slot) {
+    if (slot < 0) throw new NxsError("ERR_KEY", "key not in schema");
+    let sum = 0;
+    for (let pi = 0; pi < this.pageCount; pi++) {
+      const parts = this._pageFieldParts(pi, slot);
+      if (!parts) continue;
+      const { bitmap, values, pageRecCount: rc } = parts;
+      for (let i = 0; i < rc; i++) {
+        if (!this._colBit(bitmap, i)) continue;
+        const off = i * 8;
+        if (off + 8 <= values.length) sum += rdF64(values, off);
+      }
+    }
+    return sum;
   }
 
   _paxFindPage(rec) {
@@ -361,12 +383,9 @@ export class NxsReader {
     const fieldCount = this.view.getUint16(poff + 20, true);
     if (slot < 0 || slot >= fieldCount) return null;
     const rc = this._pageRecCount[pageIndex];
-    let body = poff + 24;
-    for (let fi = 0; fi < slot; fi++) {
-      const bmLen = this._nullBitmapBytes(rc);
-      body += bmLen + rc * 8;
-    }
     const bmLen = this._nullBitmapBytes(rc);
+    const fieldStride = bmLen + rc * 8;
+    const body = poff + 24 + slot * fieldStride;
     if (body + bmLen + rc * 8 > this.bytes.length) return null;
     const sector = this.bytes.subarray(body, body + bmLen + rc * 8);
     return {
@@ -447,7 +466,10 @@ export class NxsReader {
    * Sum a columnar f64 column (dense fast path when bitmap is all-ones).
    */
   colSumF64(key) {
-    if (this.layout !== "columnar" && this.layout !== "pax") {
+    if (this.layout === "pax") {
+      return this._paxSumF64(this._slotOf(key));
+    }
+    if (this.layout !== "columnar") {
       return this.sumF64(key);
     }
     const slot = this._slotOf(key);
@@ -903,7 +925,240 @@ export class NxsReader {
   }
 }
 
-// ── Streaming reader ───────────────────────────────────────────────────────
+// ── PAX streaming reader (OLAP.md §4.5) ────────────────────────────────────
+
+/** Returns 8-byte-aligned page length when NXSP page at `off` is complete, else 0. */
+export function paxCompletePageAt(bytes, off, fieldCount) {
+  if (off + 28 > bytes.length || fieldCount === 0) return 0;
+  if (rdU32(bytes, off) !== MAGIC_PAGE) return 0;
+  const rc = rdU32(bytes, off + 16);
+  const rawBm = (rc + 7) >> 3;
+  const alignedBm = (rawBm + 7) & ~7;
+  const fieldStride = alignedBm + rc * 8;
+  const pageLen = 24 + fieldCount * fieldStride + 4;
+  const aligned = (pageLen + 7) & ~7;
+  if (off + pageLen > bytes.length) return 0;
+  if (rdU32(bytes, off + pageLen - 4) !== pageLen) return 0;
+  if (off + aligned > bytes.length) return 0;
+  return aligned;
+}
+
+export class NxsPaxStreamReader {
+  constructor({ onPage, onSealed, onError } = {}) {
+    this.onPage = onPage;
+    this.onSealed = onSealed;
+    this.onError = onError;
+    this.bytes = new Uint8Array(0);
+    this._buffer = new Uint8Array(0);
+    this._length = 0;
+    this.keys = [];
+    this.keySigils = [];
+    this.keyIndex = new Map();
+    this._dataStart = 0;
+    this._scanCursor = 0;
+    this._headerParsed = false;
+    this.sealed = false;
+    this.pageCount = 0;
+    this.recordsAvailable = 0;
+    this._pageIndex = [];
+    this._pageRecStart = [];
+    this._pageRecCount = [];
+    this._pageOffset = [];
+    this._pageLength = [];
+  }
+
+  push(chunk) {
+    try {
+      const incoming = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+      this._ensureCapacity(this._length + incoming.length);
+      this._buffer.set(incoming, this._length);
+      this._length += incoming.length;
+      this.bytes = this._buffer.subarray(0, this._length);
+      this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+      this._parseAvailable();
+    } catch (err) {
+      this.onError?.(err);
+      throw err;
+    }
+  }
+
+  /** @returns {NxsReader} sealed random-access reader */
+  finish() {
+    this._parseAvailable();
+    return new NxsReader(this.bytes);
+  }
+
+  completePageAt(off) {
+    if (!this._headerParsed) return 0;
+    return paxCompletePageAt(this.bytes, off, this.keys.length);
+  }
+
+  colSumF64(key) {
+    const slot = this.keyIndex.get(key);
+    if (slot === undefined) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    let sum = 0;
+    for (let pi = 0; pi < this.pageCount; pi++) {
+      const parts = this._pageFieldParts(pi, slot);
+      if (!parts) continue;
+      const { bitmap, values, pageRecCount: rc } = parts;
+      for (let i = 0; i < rc; i++) {
+        if (!this._colBit(bitmap, i)) continue;
+        const cellOff = i * 8;
+        if (cellOff + 8 <= values.length) sum += rdF64(values, cellOff);
+      }
+    }
+    return sum;
+  }
+
+  _pageFieldParts(pageIndex, slot) {
+    const poff = this._pageOffset[pageIndex];
+    if (poff + 24 > this.bytes.length) return null;
+    if (rdU32(this.bytes, poff) !== MAGIC_PAGE) return null;
+    const fieldCount = this.view.getUint16(poff + 20, true);
+    if (slot < 0 || slot >= fieldCount) return null;
+    const rc = this._pageRecCount[pageIndex];
+    const bmLen = this._nullBitmapBytes(rc);
+    const fieldStride = bmLen + rc * 8;
+    const body = poff + 24 + slot * fieldStride;
+    if (body + bmLen + rc * 8 > this.bytes.length) return null;
+    const sector = this.bytes.subarray(body, body + bmLen + rc * 8);
+    return {
+      bitmap: sector.subarray(0, bmLen),
+      values: sector.subarray(bmLen),
+      pageRecCount: rc,
+    };
+  }
+
+  _nullBitmapBytes(n) {
+    const raw = Math.ceil(n / 8);
+    return (raw + 7) & ~7;
+  }
+
+  _colBit(bitmap, rec) {
+    return ((bitmap[rec >> 3] >> (rec & 7)) & 1) === 1;
+  }
+
+  _parseAvailable() {
+    if (!this._headerParsed && !this._parseHeader()) return;
+    if (!this.sealed && this._detectSealed()) return;
+    if (this.sealed) return;
+    const fc = this.keys.length;
+    while (this._scanCursor + 28 <= this.bytes.length) {
+      if (rdU32(this.bytes, this._scanCursor) !== MAGIC_PAGE) break;
+      const plen = paxCompletePageAt(this.bytes, this._scanCursor, fc);
+      if (plen === 0) break;
+      const pidx = rdU32(this.bytes, this._scanCursor + 4);
+      const rstart = Number(this.view.getBigUint64(this._scanCursor + 8, true));
+      const rc = rdU32(this.bytes, this._scanCursor + 16);
+      const fieldStride = this._nullBitmapBytes(rc) + rc * 8;
+      const pageLen = 24 + fc * fieldStride + 4;
+      this._pageIndex.push(pidx);
+      this._pageRecStart.push(rstart);
+      this._pageRecCount.push(rc);
+      this._pageOffset.push(this._scanCursor);
+      this._pageLength.push(pageLen);
+      this.pageCount++;
+      this.recordsAvailable += rc;
+      this.onPage?.(this.pageCount - 1, rc);
+      this._scanCursor += plen;
+    }
+  }
+
+  _detectSealed() {
+    if (this.bytes.length < FOOTER_PAX_BYTES) return false;
+    if (rdU32(this.bytes, this.bytes.length - 4) !== MAGIC_FOOTER) return false;
+    const tailOff = Number(this.view.getBigUint64(this.bytes.length - FOOTER_PAX_BYTES, true));
+    if (tailOff === 0 || tailOff >= this.bytes.length ||
+        this.bytes.length - tailOff < FOOTER_PAX_BYTES) {
+      return false;
+    }
+    try {
+      this._loadSealedTail(tailOff);
+    } catch (err) {
+      this.onError?.(err);
+      return false;
+    }
+    this.sealed = true;
+    this.onSealed?.();
+    return true;
+  }
+
+  _loadSealedTail(tailOff) {
+    const fo = this.bytes.length - FOOTER_PAX_BYTES;
+    this.pageCount = this.view.getUint32(fo + 16, true);
+    this.recordsAvailable = Number(this.view.getBigUint64(fo + 8, true));
+    this._pageIndex = [];
+    this._pageRecStart = [];
+    this._pageRecCount = [];
+    this._pageOffset = [];
+    this._pageLength = [];
+    for (let i = 0; i < this.pageCount; i++) {
+      const e = tailOff + i * 28;
+      if (e + 28 > this.bytes.length) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", "PAX tail entry incomplete");
+      }
+      this._pageIndex.push(rdU32(this.bytes, e));
+      this._pageRecStart.push(Number(this.view.getBigUint64(e + 4, true)));
+      this._pageRecCount.push(rdU32(this.bytes, e + 12));
+      this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
+      this._pageLength.push(rdU32(this.bytes, e + 24));
+    }
+    this._scanCursor = this.bytes.length;
+  }
+
+  _parseHeader() {
+    if (this.bytes.length < 34) return false;
+    if (rdU32(this.bytes, 0) !== MAGIC_FILE) {
+      throw new NxsError("ERR_BAD_MAGIC", "preamble");
+    }
+    this.version = this.view.getUint16(4, true);
+    this.flags = this.view.getUint16(6, true);
+    if ((this.flags & FLAG_PAX) === 0) {
+      throw new NxsError("ERR_INVALID_FLAGS", "PAX stream requires FLAG_PAX");
+    }
+    if (Number(this.view.getBigUint64(16, true)) !== 0) {
+      throw new NxsError("ERR_INCOMPATIBLE_FLAGS", "PAX stream requires TailPtr=0");
+    }
+    this.dictHash = this.view.getBigUint64(8, true);
+    if ((this.flags & FLAG_SCHEMA_EMBEDDED) === 0) {
+      throw new NxsError("ERR_DICT_MISMATCH", "PAX stream requires embedded schema");
+    }
+    const keyCount = this.view.getUint16(32, true);
+    let offset = 34 + keyCount;
+    if (this.bytes.length < offset) return false;
+    this.keySigils = Array.from(this.bytes.subarray(34, 34 + keyCount));
+    const keys = [];
+    for (let i = 0; i < keyCount; i++) {
+      let end = offset;
+      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      if (end >= this.bytes.length) return false;
+      keys.push(_decodeMaybeShared(this.bytes, offset, end));
+      offset = end + 1;
+    }
+    this.keys = keys;
+    this.keyIndex = new Map(keys.map((key, index) => [key, index]));
+    this._dataStart = (offset + 7) & ~7;
+    if (this.bytes.length < this._dataStart) return false;
+    const computedHash = murmur3_64(this.bytes, 32, this._dataStart - 32);
+    if (computedHash !== this.dictHash) {
+      throw new NxsError("ERR_DICT_MISMATCH", "schema hash mismatch");
+    }
+    this._scanCursor = this._dataStart;
+    this._headerParsed = true;
+    return true;
+  }
+
+  _ensureCapacity(required) {
+    if (required <= this._buffer.length) return;
+    let nextCap = this._buffer.length || 4096;
+    while (nextCap < required) nextCap *= 2;
+    const next = new Uint8Array(nextCap);
+    next.set(this.bytes);
+    this._buffer = next;
+  }
+}
+
+// ── Row streaming reader ───────────────────────────────────────────────────
 
 export class NxsStreamReader {
   constructor({ onSchema, onRecord, onEnd, onError } = {}) {

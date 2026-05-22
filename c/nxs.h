@@ -221,6 +221,59 @@ nxs_page_t* nxs_page_next(nxs_page_t *page);
 const void* nxs_page_col_buffer(nxs_page_t *page, const char *field, size_t *out_len);
 void        nxs_page_free(nxs_page_t *page);
 
+/* ── PAX streaming (OLAP.md §4.5, TailPtr=0 until seal) ─────────────────────── */
+
+/**
+ * Returns the 8-byte-aligned byte length of a complete NXSP page at `off`,
+ * or 0 if the page header is present but the full page is not yet in `data`.
+ * `field_count` must match the schema (flat-8 fixed cells per field).
+ */
+size_t nxs_pax_complete_page_at(const uint8_t *data, size_t size, size_t off,
+                                uint16_t field_count);
+
+typedef struct {
+    const uint8_t *data;
+    size_t         size;
+    uint16_t       version;
+    uint16_t       flags;
+    uint64_t       dict_hash;
+    int            key_count;
+    char          *keys[NXS_MAX_KEYS];
+    uint8_t        key_sigils[NXS_MAX_KEYS];
+
+    size_t         data_start;
+    size_t         scan_cursor;
+    int            sealed;
+
+    uint32_t       page_count;
+    uint32_t       page_capacity;
+    uint64_t       records_available;
+    uint32_t      *page_index;
+    uint64_t      *page_rec_start;
+    uint32_t      *page_rec_count;
+    uint64_t      *page_offset;
+    uint32_t      *page_length;
+
+    char           _pool[NXS_MAX_KEYS * 64];
+} nxs_pax_stream_reader_t;
+
+/** Open an unsealed PAX stream (`FLAG_PAX`, preamble `TailPtr == 0`). */
+nxs_err_t nxs_pax_stream_open(nxs_pax_stream_reader_t *sr,
+                              const uint8_t *data, size_t size);
+
+/** Release heap page tables allocated by the stream reader. */
+void nxs_pax_stream_close(nxs_pax_stream_reader_t *sr);
+
+/** Scan for newly complete pages after the buffer grows. Returns new page count. */
+uint32_t nxs_pax_stream_poll(nxs_pax_stream_reader_t *sr);
+
+int      nxs_pax_stream_is_sealed(const nxs_pax_stream_reader_t *sr);
+uint32_t nxs_pax_stream_page_count(const nxs_pax_stream_reader_t *sr);
+uint64_t nxs_pax_stream_records_available(const nxs_pax_stream_reader_t *sr);
+
+/** Sum f64 field across all records in complete pages only. */
+double nxs_pax_stream_col_sum_f64(const nxs_pax_stream_reader_t *sr, const char *field);
+
 #ifdef __cplusplus
 }
 #endif

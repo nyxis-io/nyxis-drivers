@@ -112,6 +112,18 @@ func (r *Reader) parsePAXFooter() error {
 			r.pageOffset[i] = binary.LittleEndian.Uint64(r.data[e+16 : e+24])
 			r.pageLength[i] = binary.LittleEndian.Uint32(r.data[e+24 : e+28])
 		}
+		const magicPage uint32 = 0x4E585350
+		dlen := uint64(len(r.data))
+		for i := uint32(0); i < r.pageCount; i++ {
+			poff64 := r.pageOffset[i]
+			if poff64 > dlen || poff64+4 > dlen || poff64 > uint64(math.MaxInt) {
+				return fmt.Errorf("ERR_OUT_OF_BOUNDS: PAX page offset")
+			}
+			poff := int(poff64)
+			if binary.LittleEndian.Uint32(r.data[poff:]) != magicPage {
+				return fmt.Errorf("ERR_INVALID_PAGE_MAGIC: PAX page magic mismatch")
+			}
+		}
 	}
 	return nil
 }
