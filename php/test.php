@@ -211,6 +211,24 @@ $manyOk = true;
 foreach ($keys as $i => $k) { if ($rtm->record(0)->getI64($k) !== $i * 100) { $manyOk = false; break; } }
 check('writer many fields (multi-byte bitmask)', $manyOk);
 
+// null field read-back: writeNull marks slot present with 8 zero bytes;
+// getI64 returns 0, getStr returns "" (zero-length string) — not null.
+// Callers should avoid calling typed getters on null-written slots.
+$wnr = new Nxs\Writer(new Nxs\Schema(['x', 'y']));
+$wnr->beginObject(); $wnr->writeI64(0, 7); $wnr->writeNull(1); $wnr->endObject();
+$rtnr = new Nxs\Reader($wnr->finish());
+check('writer null field: x == 7', $rtnr->record(0)->getI64('x') === 7);
+check('writer null field: null slot is present (getI64 returns 0)', $rtnr->record(0)->getI64('y') === 0);
+
+// f64 null round-trip
+$wfn = new Nxs\Writer(new Nxs\Schema(['val', 'tag']));
+$wfn->beginObject(); $wfn->writeF64(0, 3.14); $wfn->writeNull(1); $wfn->endObject();
+$wfn->beginObject(); $wfn->writeNull(0); $wfn->writeStr(1, 'hi'); $wfn->endObject();
+$rtfn = new Nxs\Reader($wfn->finish());
+check('writer f64 null: record(0).getF64 ≈ 3.14', abs((float)$rtfn->record(0)->getF64('val') - 3.14) < 1e-9);
+check('writer f64 null: record(1).getF64 returns 0.0 (null slot present as zeros)', abs((float)$rtfn->record(1)->getF64('val')) < 1e-15);
+check('writer f64 null: record(1).getStr("tag") == "hi"', $rtfn->record(1)->getStr('tag') === 'hi');
+
 // ── Security tests ───────────────────────────────────────────────────────────
 
 $badMagic = $nxbBytes;
