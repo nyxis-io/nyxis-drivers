@@ -32,13 +32,16 @@ high  = reader.max_f64("score")
 ages  = reader.sum_i64("age")
 ```
 
-## C extension (hot path)
+## C extension (hot path + OLAP layouts)
 
-Build once:
+Build once (compiles `_nxs.c` with `../c/nxs.c` for row, columnar, and PAX):
 
 ```bash
 bash build_ext.sh
 ```
+
+Conformance for columnar/PAX vectors (`nyxis/conformance/run_py.py`) requires this
+build; pure `nxs.py` covers row layout only.
 
 Use the same API, significantly faster for columnar work:
 

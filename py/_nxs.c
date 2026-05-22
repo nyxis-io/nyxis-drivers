@@ -17,6 +17,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../c/nxs.h"
@@ -69,10 +70,12 @@ nxs_err_msg(nxs_err_t err)
 {
     switch (err) {
     case NXS_ERR_BAD_MAGIC: return "ERR_BAD_MAGIC";
+    case NXS_ERR_DICT_MISMATCH: return "ERR_DICT_MISMATCH";
     case NXS_ERR_OUT_OF_BOUNDS: return "ERR_OUT_OF_BOUNDS";
     case NXS_ERR_KEY_NOT_FOUND: return "ERR_KEY_NOT_FOUND";
     case NXS_ERR_INVALID_FLAGS: return "ERR_INVALID_FLAGS";
-    case NXS_ERR_INCOMPATIBLE: return "ERR_INCOMPATIBLE";
+    case NXS_ERR_INCOMPATIBLE: return "ERR_INCOMPATIBLE_FLAGS";
+    case NXS_ERR_BAD_PAGE_MAGIC: return "ERR_INVALID_PAGE_MAGIC";
     case NXS_ERR_UNSUPPORTED: return "ERR_UNSUPPORTED";
     case NXS_ERR_UNSUPPORTED_TYPE: return "ERR_UNSUPPORTED_FIELD_TYPE";
     default: return "ERR_UNKNOWN";
@@ -170,8 +173,10 @@ Reader_dealloc(ReaderObject *self)
 typedef struct {
     PyObject_HEAD
     ReaderObject *reader;            /* strong ref */
-    Py_ssize_t offset;               /* byte offset of NYXO magic */
+    Py_ssize_t offset;               /* row: NYXO offset; columnar/PAX: record index */
     Py_ssize_t offset_table_start;
+    uint32_t record_index;           /* logical record index (columnar/PAX) */
+    int layout_record;               /* 1 => use nxs_get_* via record_index */
     /* Expanded bitmask: 1 byte per slot (0 or 1). NULL if unparsed. */
     uint8_t *present;
     uint16_t present_len;
@@ -188,12 +193,45 @@ make_object(ReaderObject *reader, Py_ssize_t offset)
     Py_INCREF(reader);
     obj->reader = reader;
     obj->offset = offset;
+    obj->record_index = 0;
+    obj->layout_record = 0;
     obj->parsed = 0;
     obj->present = NULL;
     obj->rank = NULL;
     obj->present_len = 0;
     obj->offset_table_start = 0;
     return obj;
+}
+
+static int
+object_obj_at_nyxo(const ObjectView *self)
+{
+    if (self->offset + 4 > self->reader->size)
+        return 0;
+    return rd_u32(self->reader->data + self->offset) == MAGIC_OBJ;
+}
+
+/* Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+static int
+object_layout_access(const ObjectView *self)
+{
+    if (!self->reader->has_nxs || self->reader->nxs.layout == NXS_LAYOUT_ROW)
+        return 0;
+    return !object_obj_at_nyxo(self);
+}
+
+static int
+object_nxs_err_to_py(nxs_err_t err, const char *ctx)
+{
+    if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+        return 0;
+    const char *code = nxs_err_msg(err);
+    if (ctx) {
+        PyErr_Format(PyExc_ValueError, "%s: %s", code, ctx);
+    } else {
+        PyErr_SetString(PyExc_ValueError, code);
+    }
+    return -1;
 }
 
 static void
@@ -289,6 +327,25 @@ resolve_slot(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_i64(ObjectView *self, PyObject *key)
 {
+    if (object_layout_access(self)) {
+        const char *k = PyUnicode_AsUTF8(key);
+        if (!k) return NULL;
+        nxs_object_t obj;
+        if (nxs_record(&self->reader->nxs, self->record_index, &obj) != NXS_OK) {
+            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: record");
+            return NULL;
+        }
+        int64_t v;
+        nxs_err_t err = nxs_get_i64(&obj, k, &v);
+        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+            Py_RETURN_NONE;
+        if (err != NXS_OK) {
+            object_nxs_err_to_py(err, "i64");
+            return NULL;
+        }
+        return PyLong_FromLongLong(v);
+    }
+
     int slot = resolve_slot(self, key);
     if (slot == -2) return NULL;
     if (slot == -1) Py_RETURN_NONE;
@@ -307,6 +364,25 @@ Object_get_i64(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_f64(ObjectView *self, PyObject *key)
 {
+    if (object_layout_access(self)) {
+        const char *k = PyUnicode_AsUTF8(key);
+        if (!k) return NULL;
+        nxs_object_t obj;
+        if (nxs_record(&self->reader->nxs, self->record_index, &obj) != NXS_OK) {
+            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: record");
+            return NULL;
+        }
+        double v;
+        nxs_err_t err = nxs_get_f64(&obj, k, &v);
+        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+            Py_RETURN_NONE;
+        if (err != NXS_OK) {
+            object_nxs_err_to_py(err, "f64");
+            return NULL;
+        }
+        return PyFloat_FromDouble(v);
+    }
+
     int slot = resolve_slot(self, key);
     if (slot == -2) return NULL;
     if (slot == -1) Py_RETURN_NONE;
@@ -325,6 +401,26 @@ Object_get_f64(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_bool(ObjectView *self, PyObject *key)
 {
+    if (object_layout_access(self)) {
+        const char *k = PyUnicode_AsUTF8(key);
+        if (!k) return NULL;
+        nxs_object_t obj;
+        if (nxs_record(&self->reader->nxs, self->record_index, &obj) != NXS_OK) {
+            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: record");
+            return NULL;
+        }
+        int v;
+        nxs_err_t err = nxs_get_bool(&obj, k, &v);
+        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+            Py_RETURN_NONE;
+        if (err != NXS_OK) {
+            object_nxs_err_to_py(err, "bool");
+            return NULL;
+        }
+        if (v) Py_RETURN_TRUE;
+        Py_RETURN_FALSE;
+    }
+
     int slot = resolve_slot(self, key);
     if (slot == -2) return NULL;
     if (slot == -1) Py_RETURN_NONE;
@@ -341,8 +437,64 @@ Object_get_bool(ObjectView *self, PyObject *key)
 }
 
 static PyObject *
+py_unicode_from_nxs_str(nxs_object_t *obj, const char *key)
+{
+    char stack[4096];
+    nxs_err_t err = nxs_get_str(obj, key, stack, sizeof(stack));
+    if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND)
+        return NULL;
+    if (err != NXS_OK) {
+        object_nxs_err_to_py(err, "str");
+        return NULL;
+    }
+    size_t n = strlen(stack);
+    if (n < sizeof(stack) - 1)
+        return PyUnicode_FromString(stack);
+
+    for (size_t cap = 8192; cap <= (size_t)32 * 1024 * 1024; cap *= 2) {
+        char *heap = (char *)malloc(cap);
+        if (!heap) {
+            PyErr_NoMemory();
+            return NULL;
+        }
+        err = nxs_get_str(obj, key, heap, cap);
+        if (err == NXS_ERR_FIELD_ABSENT || err == NXS_ERR_KEY_NOT_FOUND) {
+            free(heap);
+            return NULL;
+        }
+        if (err != NXS_OK) {
+            free(heap);
+            object_nxs_err_to_py(err, "str");
+            return NULL;
+        }
+        n = strlen(heap);
+        if (n < cap - 1) {
+            PyObject *out = PyUnicode_FromString(heap);
+            free(heap);
+            return out;
+        }
+        free(heap);
+    }
+    PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str too large");
+    return NULL;
+}
+
+static PyObject *
 Object_get_str(ObjectView *self, PyObject *key)
 {
+    if (object_layout_access(self)) {
+        const char *k = PyUnicode_AsUTF8(key);
+        if (!k) return NULL;
+        nxs_object_t obj;
+        if (nxs_record(&self->reader->nxs, self->record_index, &obj) != NXS_OK) {
+            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: record");
+            return NULL;
+        }
+        PyObject *s = py_unicode_from_nxs_str(&obj, k);
+        if (!s) Py_RETURN_NONE;
+        return s;
+    }
+
     int slot = resolve_slot(self, key);
     if (slot == -2) return NULL;
     if (slot == -1) Py_RETURN_NONE;
@@ -363,12 +515,31 @@ Object_get_str(ObjectView *self, PyObject *key)
                                 n, "strict");
 }
 
+static PyObject *
+Object_field_offset_py(ObjectView *self, PyObject *key)
+{
+    if (object_layout_access(self)) {
+        Py_RETURN_NONE;
+    }
+    int slot = resolve_slot(self, key);
+    if (slot == -2) return NULL;
+    if (slot == -1) Py_RETURN_NONE;
+    Py_ssize_t off = Object_field_offset(self, slot);
+    if (off < 0) {
+        if (PyErr_Occurred()) return NULL;
+        Py_RETURN_NONE;
+    }
+    return PyLong_FromSsize_t(off);
+}
+
 static PyMethodDef Object_methods[] = {
     {"get_i64",  (PyCFunction)Object_get_i64,  METH_O, "Read i64 field."},
     {"get_f64",  (PyCFunction)Object_get_f64,  METH_O, "Read f64 field."},
     {"get_bool", (PyCFunction)Object_get_bool, METH_O, "Read bool field."},
     {"get_str",  (PyCFunction)Object_get_str,  METH_O, "Read UTF-8 string field."},
     {"get_time", (PyCFunction)Object_get_i64,  METH_O, "Read time field (unix ns)."},
+    {"field_offset", (PyCFunction)Object_field_offset_py, METH_O,
+     "Absolute byte offset of field, or None if absent (row layout)."},
     {NULL, NULL, 0, NULL}
 };
 
@@ -460,6 +631,13 @@ Reader_record(ReaderObject *self, PyObject *arg)
         PyErr_Format(PyExc_IndexError, "record %ld out of [0, %u)",
                      i, self->record_count);
         return NULL;
+    }
+    if (self->has_nxs && self->nxs.layout != NXS_LAYOUT_ROW) {
+        ObjectView *obj = make_object(self, i);
+        if (!obj) return NULL;
+        obj->record_index = (uint32_t)i;
+        obj->layout_record = 1;
+        return (PyObject *)obj;
     }
     Py_ssize_t entry = self->tail_start + i * 10;
     uint64_t abs_offset = rd_u64(self->data + entry + 2);
@@ -855,6 +1033,40 @@ Reader_get_keys(ReaderObject *self, void *closure)
     return self->keys;
 }
 
+static PyObject *
+Reader_get_key_index(ReaderObject *self, void *closure)
+{
+    (void)closure;
+    Py_INCREF(self->key_index);
+    return self->key_index;
+}
+
+static PyObject *
+Reader_get_key_sigils(ReaderObject *self, void *closure)
+{
+    (void)closure;
+    int kc = self->has_nxs ? self->nxs.key_count : (int)PyList_GET_SIZE(self->keys);
+    PyObject *tup = PyTuple_New(kc);
+    if (!tup) return NULL;
+    for (int i = 0; i < kc; i++) {
+        int sig = self->has_nxs ? (int)self->nxs.key_sigils[i] : 0x22;
+        PyObject *v = PyLong_FromLong(sig);
+        if (!v) {
+            Py_DECREF(tup);
+            return NULL;
+        }
+        PyTuple_SET_ITEM(tup, i, v);
+    }
+    return tup;
+}
+
+static PyObject *
+Reader_get_buffer(ReaderObject *self, void *closure)
+{
+    (void)closure;
+    return PyMemoryView_FromMemory((char *)self->data, self->size, PyBUF_READ);
+}
+
 static PyMethodDef Reader_methods[] = {
     {"record",   (PyCFunction)Reader_record,   METH_O, "Get the object at index i."},
     {"scan_f64", (PyCFunction)Reader_scan_f64, METH_O, "List of all f64 values for key."},
@@ -876,6 +1088,9 @@ static PyMethodDef Reader_methods[] = {
 static PyGetSetDef Reader_getset[] = {
     {"record_count", (getter)Reader_get_record_count, NULL, "Total top-level records.", NULL},
     {"keys",         (getter)Reader_get_keys,         NULL, "Schema keys.", NULL},
+    {"key_index",    (getter)Reader_get_key_index,    NULL, "dict key → slot.", NULL},
+    {"key_sigils",   (getter)Reader_get_key_sigils,   NULL, "tuple of schema sigil bytes.", NULL},
+    {"buffer",       (getter)Reader_get_buffer,       NULL, "memoryview over file bytes.", NULL},
     {"layout",       (getter)Reader_get_layout,       NULL, "row | columnar | pax", NULL},
     {NULL, NULL, NULL, NULL, NULL}
 };

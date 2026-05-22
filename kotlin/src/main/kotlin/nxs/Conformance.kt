@@ -212,11 +212,11 @@ private fun runPositive(
         }
     }
 
-    val tailStart = reader.tailPtr.toInt() + 4
     val records = expected.getJSONArray("records")
 
     for (ri in 0 until records.length()) {
         val expRec = records.getJSONObject(ri)
+        val obj = reader.record(ri)
         for (key in expRec.keys()) {
             val slot = reader.keys.indexOf(key)
             if (slot < 0) throw AssertionError("rec[$ri].$key: key not in schema")
@@ -227,11 +227,31 @@ private fun runPositive(
             }
 
             val expVal = expRec.get(key)
-            val (actual, present) = getFieldValue(data, tailStart, ri, slot, sigil)
-
             if (expVal == null || expVal === JSONObject.NULL) {
                 continue
             }
+
+            val (actual, present) =
+                when (sigil) {
+                    0x3D, 0x40 -> {
+                        val v = obj.tryGetI64BySlot(slot)
+                        if (v != null) Pair(v.toDouble(), true) else Pair(null, false)
+                    }
+                    0x7E -> {
+                        val v = obj.tryGetF64BySlot(slot)
+                        if (v != null) Pair(v, true) else Pair(null, false)
+                    }
+                    0x3F -> {
+                        val v = obj.tryGetBoolBySlot(slot)
+                        if (v != null) Pair(v, true) else Pair(null, false)
+                    }
+                    0x22 -> {
+                        val s = obj.tryGetStrBySlot(slot)
+                        if (s != null) Pair(s, true) else Pair(null, false)
+                    }
+                    else -> getFieldValue(data, reader.tailStart, ri, slot, sigil)
+                }
+
             if (!present) {
                 throw AssertionError("rec[$ri].$key: field absent, expected $expVal")
             }
@@ -279,11 +299,6 @@ fun main(args: Array<String>) {
     var failed = 0
 
     for (name in entries) {
-        if (name.startsWith("columnar_") || name.startsWith("pax_")) {
-            println("  SKIP  $name (columnar/PAX not implemented)")
-            passed++
-            continue
-        }
         val jsonPath = File(dir, "$name.expected.json")
         val expected = JSONObject(jsonPath.readText())
         val isNegative = expected.has("error")

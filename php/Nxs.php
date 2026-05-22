@@ -24,6 +24,15 @@ const MAGIC_OBJ    = 0x4E59584F; // NYXO
 const MAGIC_FOOTER = 0x2153584E; // NXS!
 
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
+const FLAG_COLUMNAR        = 0x0001;
+const FLAG_PAX             = 0x0004;
+const MAGIC_PAGE           = 0x4E585350; // NYSP
+
+const FOOTER_ROW_BYTES     = 12;
+const FOOTER_COL_BYTES     = 20;
+const FOOTER_PAX_BYTES     = 28;
+const COL_TAIL_ENTRY_BYTES = 20;
+const PAX_TAIL_ENTRY_BYTES = 28;
 
 // ── Exceptions ───────────────────────────────────────────────────────────────
 
@@ -103,6 +112,64 @@ function rdF64(string $bytes, int $off): float
     return unpack('dval', strrev(substr($bytes, $off, 8)))['val'];
 }
 
+function nullBitmapBytes(int $n): int
+{
+    $raw = (int)(($n + 7) / 8);
+    return ($raw + 7) & ~7;
+}
+
+function colBit(string $bm, int $rec): bool
+{
+    return ((ord($bm[$rec >> 3]) >> ($rec & 7)) & 1) === 1;
+}
+
+function isVarSigil(int $sigil): bool
+{
+    return $sigil === ord('"') || $sigil === ord('<');
+}
+
+function varOffBytesLen(int $rc): int
+{
+    $off = ($rc + 1) * 4;
+    if ($off < 0) {
+        throw new NxsException('ERR_OUT_OF_BOUNDS: var offsets overflow');
+    }
+    return $off;
+}
+
+function fieldSectorLen(string $bytes, int $sectorOff, int $rc, int $sigil): int
+{
+    $bmLen = nullBitmapBytes($rc);
+    if (!isVarSigil($sigil)) {
+        return $bmLen + $rc * 8;
+    }
+    $offBytes = varOffBytesLen($rc);
+    if ($sectorOff + $bmLen + $offBytes > strlen($bytes)) {
+        throw new NxsException('ERR_OUT_OF_BOUNDS: var offsets');
+    }
+    $end = rdU32($bytes, $sectorOff + $bmLen + $rc * 4);
+    $total = $bmLen + $offBytes + $end;
+    if ($sectorOff + $total > strlen($bytes)) {
+        throw new NxsException('ERR_OUT_OF_BOUNDS: var values');
+    }
+    return $total;
+}
+
+function varStrAt(string $offsets, string $values, int $recordIndex): ?string
+{
+    $need = ($recordIndex + 2) * 4;
+    if (strlen($offsets) < $need) {
+        return null;
+    }
+    $off = $recordIndex * 4;
+    $start = rdU32($offsets, $off);
+    $end   = rdU32($offsets, $off + 4);
+    if ($end < $start || $end > strlen($values)) {
+        return null;
+    }
+    return substr($values, $start, $end - $start);
+}
+
 // ── NxsObject ────────────────────────────────────────────────────────────────
 
 /**
@@ -113,16 +180,33 @@ class NxsObject
 {
     private Reader $reader;
     private int    $offset;
+    private int    $recordIndex;
 
     // Stage 0 = untouched; filled lazily:
     private int   $offsetTableStart = -1;   // absolute byte pos of OffsetTable
     private array $present          = [];   // bool per slot
     private array $rank             = [];   // rank[slot] = index into OffsetTable
 
-    public function __construct(Reader $reader, int $offset)
+    public function __construct(Reader $reader, int $offset, int $recordIndex = -1)
     {
-        $this->reader = $reader;
-        $this->offset = $offset;
+        $this->reader      = $reader;
+        $this->offset      = $offset;
+        $this->recordIndex = $recordIndex >= 0 ? $recordIndex : $offset;
+    }
+
+    private function objAtNyxo(): bool
+    {
+        $bytes = $this->reader->rawBytes();
+        if ($this->offset + 4 > strlen($bytes)) {
+            return false;
+        }
+        return rdU32($bytes, $this->offset) === MAGIC_OBJ;
+    }
+
+    /** Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+    private function usesColumnarFieldAccess(): bool
+    {
+        return $this->reader->layout() !== 'row' && !$this->objAtNyxo();
     }
 
     // ── Internal: parse bitmask + build offset-table index ────────────────
@@ -195,6 +279,9 @@ class NxsObject
     {
         $slot = $this->reader->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->usesColumnarFieldAccess()) {
+            return $this->reader->colGetStr($key, $this->recordIndex);
+        }
         $off = $this->resolveSlot($slot);
         if ($off < 0) return null;
         $bytes = $this->reader->rawBytes();
@@ -206,6 +293,10 @@ class NxsObject
     {
         $slot = $this->reader->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->usesColumnarFieldAccess()) {
+            $cell = $this->reader->colNumericBytes($this->recordIndex, $slot);
+            return $cell === null ? null : rdI64($cell, 0);
+        }
         $off = $this->resolveSlot($slot);
         if ($off < 0) return null;
         return rdI64($this->reader->rawBytes(), $off);
@@ -215,6 +306,10 @@ class NxsObject
     {
         $slot = $this->reader->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->usesColumnarFieldAccess()) {
+            $cell = $this->reader->colNumericBytes($this->recordIndex, $slot);
+            return $cell === null ? null : rdF64($cell, 0);
+        }
         $off = $this->resolveSlot($slot);
         if ($off < 0) return null;
         return rdF64($this->reader->rawBytes(), $off);
@@ -224,6 +319,10 @@ class NxsObject
     {
         $slot = $this->reader->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->usesColumnarFieldAccess()) {
+            $cell = $this->reader->colNumericBytes($this->recordIndex, $slot);
+            return $cell === null ? null : (ord($cell[0]) !== 0);
+        }
         $off = $this->resolveSlot($slot);
         if ($off < 0) return null;
         return ord($this->reader->rawBytes()[$off]) !== 0;
@@ -280,6 +379,14 @@ class Reader
     private array  $keyIndex  = [];  // name → index
     private array  $sigils    = [];  // index → sigil byte (ord of ASCII sigil char)
     private int    $tailStart;       // absolute offset of first tail-index entry
+    private string $layout    = 'row';
+    private array  $colBufOff = [];
+    private array  $colBufLen = [];
+    private int    $pageCount    = 0;
+    private array  $pageRecStart = [];
+    private array  $pageRecCount = [];
+    private array  $pageOffset   = [];
+    private array  $pageLength   = [];
 
     public function __construct(string $bytes)
     {
@@ -299,20 +406,14 @@ class Reader
 
         // ── Preamble ───────────────────────────────────────────────────────
         // Offset 4: version u16 (ignored)
-        $flags    = rdU16($bytes, 6);
-        $dictHash = rdU64($bytes, 8);
-        $tailPtr  = rdU64($bytes, 16);
+        $flags         = rdU16($bytes, 6);
+        $dictHash      = rdU64($bytes, 8);
+        $preambleTail  = rdU64($bytes, 16);
 
         // ── Footer check ───────────────────────────────────────────────────
         $footer = rdU32($bytes, $len - 4);
         if ($footer !== MAGIC_FOOTER) {
             throw new NxsException('ERR_BAD_MAGIC: footer magic mismatch');
-        }
-        if ($tailPtr === 0) {
-            if ($len < 44) {
-                throw new NxsException('ERR_OUT_OF_BOUNDS: stream footer missing tail pointer');
-            }
-            $tailPtr = rdU64($bytes, $len - 12);
         }
 
         // ── Schema (if embedded) ───────────────────────────────────────────
@@ -324,10 +425,342 @@ class Reader
             }
         }
 
-        // ── Tail-index ─────────────────────────────────────────────────────
-        $this->recordCount = rdU32($bytes, (int)$tailPtr);
-        // Each entry: u16 KeyID (2) + u64 AbsoluteOffset (8) = 10 bytes
-        $this->tailStart = (int)$tailPtr + 4;
+        $this->parseLayoutTail($flags, $preambleTail, $len);
+    }
+
+    /** @return 'row'|'columnar'|'pax' */
+    public function layout(): string
+    {
+        return $this->layout;
+    }
+
+    private function parseLayoutTail(int $flags, int $preambleTail, int $len): void
+    {
+        if (($flags & FLAG_COLUMNAR) && ($flags & FLAG_PAX)) {
+            throw new NxsException('ERR_INVALID_FLAGS: columnar and PAX both set');
+        }
+        if (($flags & FLAG_COLUMNAR) && $preambleTail === 0) {
+            throw new NxsException('ERR_INCOMPATIBLE_FLAGS: columnar with TailPtr=0');
+        }
+
+        if ($flags & FLAG_COLUMNAR) {
+            $this->layout = 'columnar';
+            $this->parseColumnarFooter($len);
+            return;
+        }
+        if ($flags & FLAG_PAX) {
+            $this->layout = 'pax';
+            $this->parsePAXFooter($len);
+            return;
+        }
+
+        $this->layout = 'row';
+        $tailPtr = $preambleTail;
+        if ($tailPtr === 0) {
+            if ($len < 44) {
+                throw new NxsException('ERR_OUT_OF_BOUNDS: stream footer missing tail pointer');
+            }
+            $tailPtr = rdU64($this->bytes, $len - FOOTER_ROW_BYTES);
+        }
+        if ((int)$tailPtr + 4 > $len) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: tail index');
+        }
+        $this->recordCount = rdU32($this->bytes, (int)$tailPtr);
+        $this->tailStart   = (int)$tailPtr + 4;
+    }
+
+    private function parseColumnarFooter(int $len): void
+    {
+        if ($len < FOOTER_COL_BYTES) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: columnar footer');
+        }
+        $fo = $len - FOOTER_COL_BYTES;
+        $tailPtr = rdU64($this->bytes, $fo);
+        $this->recordCount = (int)rdU64($this->bytes, $fo + 8);
+        $this->tailStart   = (int)$tailPtr;
+        $kc = count($this->keys);
+        $this->colBufOff = array_fill(0, $kc, 0);
+        $this->colBufLen = array_fill(0, $kc, 0);
+        for ($i = 0; $i < $kc; $i++) {
+            $e = $this->tailStart + $i * COL_TAIL_ENTRY_BYTES;
+            if ($e + COL_TAIL_ENTRY_BYTES > $len) {
+                throw new NxsException('ERR_OUT_OF_BOUNDS: columnar tail entry');
+            }
+            $fid = rdU16($this->bytes, $e);
+            if ($fid >= $kc) {
+                throw new NxsException(sprintf('ERR_OUT_OF_BOUNDS: invalid field ID %d', $fid));
+            }
+            $this->colBufOff[$fid] = rdU64($this->bytes, $e + 4);
+            $this->colBufLen[$fid] = rdU64($this->bytes, $e + 12);
+        }
+    }
+
+    private function parsePAXFooter(int $len): void
+    {
+        if ($len < FOOTER_PAX_BYTES) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: PAX footer');
+        }
+        $fo = $len - FOOTER_PAX_BYTES;
+        $tailPtr = rdU64($this->bytes, $fo);
+        $this->recordCount  = (int)rdU64($this->bytes, $fo + 8);
+        $this->pageCount = rdU32($this->bytes, $fo + 16);
+        $this->tailStart = (int)$tailPtr;
+        if ($this->pageCount > 0) {
+            for ($i = 0; $i < $this->pageCount; $i++) {
+                $e = $this->tailStart + $i * PAX_TAIL_ENTRY_BYTES;
+                if ($e + PAX_TAIL_ENTRY_BYTES > $len) {
+                    throw new NxsException('ERR_OUT_OF_BOUNDS: PAX tail entry');
+                }
+                $this->pageRecStart[] = rdU64($this->bytes, $e + 4);
+                $this->pageRecCount[] = rdU32($this->bytes, $e + 12);
+                $this->pageOffset[]   = rdU64($this->bytes, $e + 16);
+                $this->pageLength[]   = rdU32($this->bytes, $e + 24);
+            }
+            for ($i = 0; $i < $this->pageCount; $i++) {
+                $poff = (int)$this->pageOffset[$i];
+                $plen = (int)$this->pageLength[$i];
+                if ($poff > $len || $poff + 4 > $len || ($plen > 0 && $poff + $plen > $len)) {
+                    throw new NxsException('ERR_OUT_OF_BOUNDS: PAX page offset');
+                }
+                if (rdU32($this->bytes, $poff) !== MAGIC_PAGE) {
+                    throw new NxsException('ERR_INVALID_PAGE_MAGIC: PAX page magic mismatch');
+                }
+            }
+        }
+    }
+
+    private function paxFindPage(int $rec): ?array
+    {
+        if ($this->pageCount === 0) {
+            return null;
+        }
+        $lo = 0;
+        $hi = $this->pageCount - 1;
+        while ($lo <= $hi) {
+            $mid   = intdiv($lo + $hi, 2);
+            $start = $this->pageRecStart[$mid];
+            $count = $this->pageRecCount[$mid];
+            if ($rec < $start) {
+                $hi = $mid - 1;
+            } elseif ($rec >= $start + $count) {
+                $lo = $mid + 1;
+            } else {
+                return ['page' => $mid, 'local' => $rec - (int)$start];
+            }
+        }
+        return null;
+    }
+
+    /** @return array{0: string, 1: string} bitmap, values */
+    private function colFieldParts(int $slot): array
+    {
+        if ($slot < 0 || $slot >= count($this->colBufOff)) {
+            throw new NxsException('ERR_KEY_NOT_FOUND');
+        }
+        $off    = (int)$this->colBufOff[$slot];
+        $length = (int)$this->colBufLen[$slot];
+        if ($off + $length > strlen($this->bytes)) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        }
+        $bmLen = nullBitmapBytes($this->recordCount);
+        if ($length < $bmLen) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: null bitmap');
+        }
+        $bm   = substr($this->bytes, $off, $bmLen);
+        $vals = substr($this->bytes, $off + $bmLen, $length - $bmLen);
+        return [$bm, $vals];
+    }
+
+    /** @return array{0: string, 1: string, 2: string} bitmap, offsets, values */
+    private function colVarParts(int $slot): array
+    {
+        [$bm, $tail] = $this->colFieldParts($slot);
+        $offBytes = varOffBytesLen($this->recordCount);
+        if (strlen($tail) < $offBytes) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: var offsets');
+        }
+        return [$bm, substr($tail, 0, $offBytes), substr($tail, $offBytes)];
+    }
+
+    /** @return array{0: string, 1: string, 2: string, 3?: int}|null */
+    private function colVarPartsAt(int $rec, int $slot): ?array
+    {
+        if ($slot < 0 || $slot >= count($this->sigils) || !isVarSigil($this->sigils[$slot])) {
+            return null;
+        }
+        if ($this->layout === 'columnar') {
+            return $this->colVarParts($slot);
+        }
+        if ($this->layout === 'pax') {
+            $loc = $this->paxFindPage($rec);
+            if ($loc === null) {
+                return null;
+            }
+            $parts = $this->pageFieldParts($loc['page'], $slot);
+            if ($parts === null) {
+                return null;
+            }
+            $rc       = $this->pageRecCount[$loc['page']];
+            $offBytes = varOffBytesLen($rc);
+            if (strlen($parts[1]) < $offBytes) {
+                return null;
+            }
+            return [
+                $parts[0],
+                substr($parts[1], 0, $offBytes),
+                substr($parts[1], $offBytes),
+                $loc['local'],
+            ];
+        }
+        return null;
+    }
+
+    public function colGetStr(string $key, int $recordIndex): ?string
+    {
+        $slot = $this->slotOf($key);
+        if ($slot < 0 || $recordIndex >= $this->recordCount || $this->layout === 'row') {
+            return null;
+        }
+        if (($this->sigils[$slot] ?? 0) !== ord('"')) {
+            return null;
+        }
+        $parts = $this->colVarPartsAt($recordIndex, $slot);
+        if ($parts === null) {
+            return null;
+        }
+        if ($this->layout === 'pax') {
+            $bitIdx = $parts[3];
+            if (!colBit($parts[0], $bitIdx)) {
+                return null;
+            }
+            return varStrAt($parts[1], $parts[2], $bitIdx);
+        }
+        if (!colBit($parts[0], $recordIndex)) {
+            return null;
+        }
+        return varStrAt($parts[1], $parts[2], $recordIndex);
+    }
+
+    public function colNumericBytes(int $rec, int $slot): ?string
+    {
+        if ($slot >= 0 && $slot < count($this->sigils) && isVarSigil($this->sigils[$slot])) {
+            return null;
+        }
+        if ($this->layout === 'columnar') {
+            [$bm, $vals] = $this->colFieldParts($slot);
+            if ($rec >= $this->recordCount || !colBit($bm, $rec)) {
+                return null;
+            }
+            $off = $rec * 8;
+            if ($off + 8 > strlen($vals)) {
+                return null;
+            }
+            return substr($vals, $off, 8);
+        }
+        if ($this->layout === 'pax') {
+            $loc = $this->paxFindPage($rec);
+            if ($loc === null) {
+                return null;
+            }
+            $parts = $this->pageFieldParts($loc['page'], $slot);
+            if ($parts === null || !colBit($parts[0], $loc['local'])) {
+                return null;
+            }
+            $off = $loc['local'] * 8;
+            if ($off + 8 > strlen($parts[1])) {
+                return null;
+            }
+            return substr($parts[1], $off, 8);
+        }
+        return null;
+    }
+
+    /** @return array{0: string, 1: string}|null bitmap, values */
+    private function pageFieldParts(int $pageIndex, int $slot): ?array
+    {
+        $sector = $this->pageFieldSector($pageIndex, $slot);
+        if ($sector === null) {
+            return null;
+        }
+        $bmLen = nullBitmapBytes($this->pageRecCount[$pageIndex]);
+        if (strlen($sector) < $bmLen) {
+            return null;
+        }
+        return [substr($sector, 0, $bmLen), substr($sector, $bmLen)];
+    }
+
+    private function pageFieldSector(int $pageIndex, int $slot): ?string
+    {
+        $poff = (int)$this->pageOffset[$pageIndex];
+        if ($poff + 24 > strlen($this->bytes) || rdU32($this->bytes, $poff) !== MAGIC_PAGE) {
+            return null;
+        }
+        $fc = rdU16($this->bytes, $poff + 20);
+        if ($slot < 0 || $slot >= $fc || $fc > count($this->sigils)) {
+            return null;
+        }
+        $rc   = $this->pageRecCount[$pageIndex];
+        $body = $poff + 24;
+        for ($fi = 0; $fi < $slot; $fi++) {
+            $sig  = $this->sigils[$fi] ?? ord('=');
+            try {
+                $flen = fieldSectorLen($this->bytes, $body, $rc, $sig);
+            } catch (NxsException) {
+                return null;
+            }
+            $body += $flen;
+        }
+        $sig = $this->sigils[$slot] ?? ord('=');
+        try {
+            $flen = fieldSectorLen($this->bytes, $body, $rc, $sig);
+        } catch (NxsException) {
+            return null;
+        }
+        if ($body + $flen > strlen($this->bytes)) {
+            return null;
+        }
+        return substr($this->bytes, $body, $flen);
+    }
+
+    private function paxSumF64(int $slot): float
+    {
+        $sum = 0.0;
+        for ($pi = 0; $pi < $this->pageCount; $pi++) {
+            $parts = $this->pageFieldParts($pi, $slot);
+            if ($parts === null) {
+                continue;
+            }
+            [$bm, $vals] = $parts;
+            $rc = $this->pageRecCount[$pi];
+            for ($i = 0; $i < $rc; $i++) {
+                if (!colBit($bm, $i)) {
+                    continue;
+                }
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) {
+                    break;
+                }
+                $sum += rdF64($vals, $off);
+            }
+        }
+        return $sum;
+    }
+
+    private function colSumF64(int $slot): float
+    {
+        [$bm, $vals] = $this->colFieldParts($slot);
+        $sum = 0.0;
+        for ($i = 0; $i < $this->recordCount; $i++) {
+            if (!colBit($bm, $i)) {
+                continue;
+            }
+            $off = $i * 8;
+            if ($off + 8 > strlen($vals)) {
+                break;
+            }
+            $sum += rdF64($vals, $off);
+        }
+        return $sum;
     }
 
     // ── Schema parser ──────────────────────────────────────────────────────
@@ -427,6 +860,9 @@ class Reader
                 'ERR_OUT_OF_BOUNDS: record %d out of [0, %d)', $i, $this->recordCount
             ));
         }
+        if ($this->layout !== 'row') {
+            return new NxsObject($this, $i, $i);
+        }
         // Tail entry: KeyID u16 (skip 2) + AbsoluteOffset u64
         $entryOff  = $this->tailStart + $i * 10;
         $absOffset = rdU64($this->bytes, $entryOff + 2);
@@ -443,6 +879,12 @@ class Reader
     {
         $slot = $this->slotOf($key);
         if ($slot < 0) return 0.0;
+        if ($this->layout === 'pax') {
+            return $this->paxSumF64($slot);
+        }
+        if ($this->layout === 'columnar') {
+            return $this->colSumF64($slot);
+        }
 
         $bytes      = $this->bytes;
         $tailStart  = $this->tailStart;
@@ -464,6 +906,9 @@ class Reader
     {
         $slot = $this->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->layout !== 'row') {
+            return $this->colMinF64($slot);
+        }
 
         $bytes     = $this->bytes;
         $tailStart = $this->tailStart;
@@ -487,6 +932,9 @@ class Reader
     {
         $slot = $this->slotOf($key);
         if ($slot < 0) return null;
+        if ($this->layout !== 'row') {
+            return $this->colMaxF64($slot);
+        }
 
         $bytes     = $this->bytes;
         $tailStart = $this->tailStart;
@@ -510,6 +958,9 @@ class Reader
     {
         $slot = $this->slotOf($key);
         if ($slot < 0) return 0;
+        if ($this->layout !== 'row') {
+            return (int)$this->colSumI64($slot);
+        }
 
         $bytes     = $this->bytes;
         $tailStart = $this->tailStart;
@@ -522,6 +973,96 @@ class Reader
             $relOff    = $this->valueOffset($bytes, (int)$absOffset, $slot);
             if ($relOff >= 0) {
                 $sum += rdI64($bytes, (int)$absOffset + $relOff);
+            }
+        }
+        return $sum;
+    }
+
+    private function colMinF64(int $slot): ?float
+    {
+        $min  = PHP_FLOAT_MAX;
+        $have = false;
+        if ($this->layout === 'columnar') {
+            [$bm, $vals] = $this->colFieldParts($slot);
+            for ($i = 0; $i < $this->recordCount; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $v = rdF64($vals, $off);
+                if (!$have || $v < $min) { $min = $v; $have = true; }
+            }
+            return $have ? $min : null;
+        }
+        for ($pi = 0; $pi < $this->pageCount; $pi++) {
+            $parts = $this->pageFieldParts($pi, $slot);
+            if ($parts === null) continue;
+            [$bm, $vals] = $parts;
+            $rc = $this->pageRecCount[$pi];
+            for ($i = 0; $i < $rc; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $v = rdF64($vals, $off);
+                if (!$have || $v < $min) { $min = $v; $have = true; }
+            }
+        }
+        return $have ? $min : null;
+    }
+
+    private function colMaxF64(int $slot): ?float
+    {
+        $max  = -PHP_FLOAT_MAX;
+        $have = false;
+        if ($this->layout === 'columnar') {
+            [$bm, $vals] = $this->colFieldParts($slot);
+            for ($i = 0; $i < $this->recordCount; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $v = rdF64($vals, $off);
+                if (!$have || $v > $max) { $max = $v; $have = true; }
+            }
+            return $have ? $max : null;
+        }
+        for ($pi = 0; $pi < $this->pageCount; $pi++) {
+            $parts = $this->pageFieldParts($pi, $slot);
+            if ($parts === null) continue;
+            [$bm, $vals] = $parts;
+            $rc = $this->pageRecCount[$pi];
+            for ($i = 0; $i < $rc; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $v = rdF64($vals, $off);
+                if (!$have || $v > $max) { $max = $v; $have = true; }
+            }
+        }
+        return $have ? $max : null;
+    }
+
+    private function colSumI64(int $slot): int
+    {
+        $sum = 0;
+        if ($this->layout === 'columnar') {
+            [$bm, $vals] = $this->colFieldParts($slot);
+            for ($i = 0; $i < $this->recordCount; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $sum += rdI64($vals, $off);
+            }
+            return $sum;
+        }
+        for ($pi = 0; $pi < $this->pageCount; $pi++) {
+            $parts = $this->pageFieldParts($pi, $slot);
+            if ($parts === null) continue;
+            [$bm, $vals] = $parts;
+            $rc = $this->pageRecCount[$pi];
+            for ($i = 0; $i < $rc; $i++) {
+                if (!colBit($bm, $i)) continue;
+                $off = $i * 8;
+                if ($off + 8 > strlen($vals)) break;
+                $sum += rdI64($vals, $off);
             }
         }
         return $sum;

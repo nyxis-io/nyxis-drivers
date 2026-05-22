@@ -24,16 +24,26 @@ private const val FLAG_SCHEMA: Int = 0x0002
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
-class NxsReader(private val data: ByteArray) {
+class NxsReader(internal val data: ByteArray) {
     val version: Short
     val flags: Short
-    val dictHash: Long
-    val tailPtr: Long
+    var dictHash: Long
+    var tailPtr: Long
     val keys: List<String>
     val keySigils: ByteArray
     internal val keyIndex: Map<String, Int>
-    val recordCount: Int
-    private val tailStart: Int
+    var recordCount: Int = 0
+    internal var layout: Layout = Layout.ROW
+    internal var tailStart: Int = 0
+    internal var colBufOff: LongArray = longArrayOf()
+    internal var colBufLen: LongArray = longArrayOf()
+    internal var pageCount: Int = 0
+    internal var pageSizeHint: Int = 0
+    internal var pageIndex: IntArray = intArrayOf()
+    internal var pageRecStart: LongArray = longArrayOf()
+    internal var pageRecCount: IntArray = intArrayOf()
+    internal var pageOffset: LongArray = longArrayOf()
+    internal var pageLength: IntArray = intArrayOf()
 
     init {
         if (data.size < 32) throw NxsError("ERR_OUT_OF_BOUNDS", "file too small")
@@ -45,17 +55,7 @@ class NxsReader(private val data: ByteArray) {
         version = buf.getShort(4)
         flags = buf.getShort(6)
         dictHash = buf.getLong(8)
-        tailPtr =
-            buf.getLong(16).let { preambleTailPtr ->
-                if (preambleTailPtr != 0L) {
-                    preambleTailPtr
-                } else {
-                    if (data.size < 44) {
-                        throw NxsError("ERR_OUT_OF_BOUNDS", "stream footer")
-                    }
-                    buf.getLong(data.size - 12)
-                }
-            }
+        tailPtr = buf.getLong(16)
 
         val ks = mutableListOf<String>()
         val ki = mutableMapOf<String, Int>()
@@ -86,11 +86,10 @@ class NxsReader(private val data: ByteArray) {
         keySigils = kSigils
         keyIndex = ki
 
-        val tp = tailPtr.toInt()
-        if (tp + 4 > data.size) throw NxsError("ERR_OUT_OF_BOUNDS", "tail index")
-        recordCount = buf.getInt(tp)
-        tailStart = tp + 4
+        parseLayoutTail()
     }
+
+    fun layoutKind(): Layout = layout
 
     private val buf: ByteBuffer get() = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
 
@@ -100,9 +99,11 @@ class NxsReader(private val data: ByteArray) {
         if (i < 0 || i >= recordCount) {
             throw NxsError("ERR_OUT_OF_BOUNDS", "record $i out of [0, $recordCount)")
         }
-        val entryOff = tailStart + i * 10 + 2
-        val absOff = readU64(entryOff).toInt()
-        return NxsObject(this, absOff)
+        if (layout != Layout.ROW) {
+            return NxsObject(this, i, i)
+        }
+        val absOff = readU64(tailStart + i * 10 + 2).toInt()
+        return NxsObject(this, absOff, i)
     }
 
     // ── Internal: Little-endian reads ─────────────────────────────────────────
@@ -139,14 +140,9 @@ class NxsReader(private val data: ByteArray) {
     // ── Bulk reducers ─────────────────────────────────────────────────────────
 
     fun sumF64(key: String): Double {
+        if (layout != Layout.ROW) return colSumF64(key)
         val s = slot(key)
-        var sum = 0.0
-        for (i in 0 until recordCount) {
-            val abs = readU64(tailStart + i * 10 + 2).toInt()
-            val off = scanOffset(abs, s)
-            if (off >= 0) sum += readF64(off)
-        }
-        return sum
+        return sumF64Row(s)
     }
 
     fun sumI64(key: String): Long {
@@ -248,7 +244,21 @@ class NxsReader(private val data: ByteArray) {
 
 // ── Object ────────────────────────────────────────────────────────────────────
 
-class NxsObject(private val reader: NxsReader, private val offset: Int) {
+class NxsObject(
+    private val reader: NxsReader,
+    private val offset: Int,
+    private val recordIndex: Int,
+) {
+    private fun objAtNyxo(): Boolean {
+        if (offset + 4 > reader.size()) return false
+        return reader.readU32(offset).toInt() and -1 == MAGIC_OBJ
+    }
+
+    /** Columnar/PAX top-level records use record index; nested NYXO blobs use row paths. */
+    private fun usesColumnarFieldAccess(): Boolean {
+        return reader.layout != Layout.ROW && !objAtNyxo()
+    }
+
     private var staged = false
     private var bitmaskStart = 0
     private var offsetTableStart = 0
@@ -309,52 +319,164 @@ class NxsObject(private val reader: NxsReader, private val offset: Int) {
     /** Returns the I64 value for [key], or null if the field is absent. */
     fun tryGetI64(key: String): Long? {
         val slot = reader.keyIndex[key] ?: return null
-        val off = resolveSlot(slot)
-        return if (off < 0) null else reader.readI64(off)
+        return tryGetI64BySlot(slot)
     }
 
     /** Returns the F64 value for [key], or null if the field is absent. */
     fun tryGetF64(key: String): Double? {
         val slot = reader.keyIndex[key] ?: return null
-        val off = resolveSlot(slot)
-        return if (off < 0) null else reader.readF64(off)
+        return tryGetF64BySlot(slot)
     }
 
     /** Returns the Bool value for [key], or null if the field is absent. */
     fun tryGetBool(key: String): Boolean? {
         val slot = reader.keyIndex[key] ?: return null
-        val off = resolveSlot(slot)
-        return if (off < 0) null else reader.readByte(off) != 0
+        return tryGetBoolBySlot(slot)
     }
 
     /** Returns the Str value for [key], or null if the field is absent. */
     fun tryGetStr(key: String): String? {
         val slot = reader.keyIndex[key] ?: return null
-        val off = resolveSlot(slot)
-        return if (off < 0) null else reader.readStr(off)
+        return tryGetStrBySlot(slot)
     }
 
     fun getI64BySlot(slot: Int): Long {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            if (!ok) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            return reader.readI64Slice(cell, 0)
+        }
         val off = resolveSlot(slot)
         if (off < 0) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
         return reader.readI64(off)
     }
 
     fun getF64BySlot(slot: Int): Double {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            if (!ok) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            return reader.readF64Slice(cell, 0)
+        }
         val off = resolveSlot(slot)
         if (off < 0) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
         return reader.readF64(off)
     }
 
     fun getBoolBySlot(slot: Int): Boolean {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            if (!ok) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            return cell[0] != 0.toByte()
+        }
         val off = resolveSlot(slot)
         if (off < 0) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
         return reader.readByte(off) != 0
     }
 
     fun getStrBySlot(slot: Int): String {
+        if (usesColumnarFieldAccess()) {
+            if (slot < 0 || slot >= reader.keySigils.size || reader.keySigils[slot] != 0x22.toByte()) {
+                throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            }
+            val (s, ok) = reader.colGetStr(reader.keys[slot], recordIndex)
+            if (!ok) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            return s
+        }
         val off = resolveSlot(slot)
         if (off < 0) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
         return reader.readStr(off)
     }
+
+    fun getBinary(key: String): ByteArray = getBinaryBySlot(reader.slot(key))
+
+    fun getBinaryBySlot(slot: Int): ByteArray {
+        if (usesColumnarFieldAccess()) {
+            if (slot < 0 || slot >= reader.keySigils.size || reader.keySigils[slot] != 0x3C.toByte()) {
+                throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            }
+            val (b, ok) = reader.colGetBinary(reader.keys[slot], recordIndex)
+            if (!ok) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+            return b
+        }
+        val off = resolveSlot(slot)
+        if (off < 0) throw NxsError("ERR_FIELD_ABSENT", "slot $slot")
+        val len = reader.readU32(off).toInt()
+        return reader.data.copyOfRange(off + 4, off + 4 + len)
+    }
+
+    /** Returns the I64 value for [key], or null if the field is absent. */
+    fun tryGetI64BySlot(slot: Int): Long? {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            return if (ok) reader.readI64Slice(cell, 0) else null
+        }
+        val off = resolveSlot(slot)
+        return if (off < 0) null else reader.readI64(off)
+    }
+
+    /** Returns the F64 value for [key], or null if the field is absent. */
+    fun tryGetF64BySlot(slot: Int): Double? {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            return if (ok) reader.readF64Slice(cell, 0) else null
+        }
+        val off = resolveSlot(slot)
+        return if (off < 0) null else reader.readF64(off)
+    }
+
+    /** Returns the Bool value for [key], or null if the field is absent. */
+    fun tryGetBoolBySlot(slot: Int): Boolean? {
+        if (usesColumnarFieldAccess()) {
+            val (cell, ok) = reader.colNumericBytes(recordIndex, slot)
+            return if (ok) cell[0] != 0.toByte() else null
+        }
+        val off = resolveSlot(slot)
+        return if (off < 0) null else reader.readByte(off) != 0
+    }
+
+    /** Returns the Str value for [key], or null if the field is absent. */
+    fun tryGetStrBySlot(slot: Int): String? {
+        if (usesColumnarFieldAccess()) {
+            if (slot < 0 || slot >= reader.keySigils.size || reader.keySigils[slot] != 0x22.toByte()) return null
+            val (s, ok) = reader.colGetStr(reader.keys[slot], recordIndex)
+            return if (ok) s else null
+        }
+        val off = resolveSlot(slot)
+        return if (off < 0) null else reader.readStr(off)
+    }
+
+    fun tryGetBinaryBySlot(slot: Int): ByteArray? {
+        if (usesColumnarFieldAccess()) {
+            if (slot < 0 || slot >= reader.keySigils.size || reader.keySigils[slot] != 0x3C.toByte()) return null
+            val (b, ok) = reader.colGetBinary(reader.keys[slot], recordIndex)
+            return if (ok) b else null
+        }
+        val off = resolveSlot(slot)
+        if (off < 0) return null
+        val len = reader.readU32(off).toInt()
+        return reader.data.copyOfRange(off + 4, off + 4 + len)
+    }
 }
+
+internal fun NxsReader.readI64Slice(
+    slice: ByteArray,
+    off: Int,
+): Long = readU64Slice(slice, off)
+
+internal fun NxsReader.readF64Slice(
+    slice: ByteArray,
+    off: Int,
+): Double = java.lang.Double.longBitsToDouble(readU64Slice(slice, off))
+
+private fun NxsReader.readU64Slice(
+    slice: ByteArray,
+    off: Int,
+): Long =
+    (slice[off].toLong() and 0xFF) or
+        ((slice[off + 1].toLong() and 0xFF) shl 8) or
+        ((slice[off + 2].toLong() and 0xFF) shl 16) or
+        ((slice[off + 3].toLong() and 0xFF) shl 24) or
+        ((slice[off + 4].toLong() and 0xFF) shl 32) or
+        ((slice[off + 5].toLong() and 0xFF) shl 40) or
+        ((slice[off + 6].toLong() and 0xFF) shl 48) or
+        ((slice[off + 7].toLong() and 0xFF) shl 56)
