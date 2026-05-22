@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"testing"
 )
 
@@ -300,6 +301,62 @@ func paxDataStart(t *testing.T, data []byte) int {
 		off++
 	}
 	return (off + 7) &^ 7
+}
+
+func TestColumnarStringsConformance(t *testing.T) {
+	path := filepath.Join(conformanceDir(t), "columnar_flat8_strings_100.nxb")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skip("conformance vector missing; run: make -C nyxis conformance-generate")
+	}
+	r, err := NewReader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.LayoutKind() != LayoutColumnar {
+		t.Fatalf("layout: got %v", r.LayoutKind())
+	}
+	if r.RecordCount() != 100 {
+		t.Fatalf("records: got %d", r.RecordCount())
+	}
+	s0, ok := r.ColGetStr("name", 0)
+	if !ok || s0 != "user_0" {
+		t.Fatalf("ColGetStr(name, 0): %q ok=%v", s0, ok)
+	}
+	s42, ok := r.ColGetStr("name", 42)
+	if !ok || s42 != "user_42" {
+		t.Fatalf("ColGetStr(name, 42): %q ok=%v", s42, ok)
+	}
+	got, ok := r.Record(42).GetStr("name")
+	if !ok || got != "user_42" {
+		t.Fatalf("Record(42).GetStr(name): %q ok=%v", got, ok)
+	}
+}
+
+func TestPAXStringsConformance(t *testing.T) {
+	path := filepath.Join(conformanceDir(t), "pax_flat8_strings_p128_300.nxb")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Skip("conformance vector missing; run: make -C nyxis conformance-generate")
+	}
+	r, err := NewReader(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.LayoutKind() != LayoutPAX {
+		t.Fatalf("layout: got %v", r.LayoutKind())
+	}
+	for _, idx := range []uint32{0, 127, 128, 257, 299} {
+		want := "user_" + strconv.FormatUint(uint64(idx), 10)
+		got, ok := r.ColGetStr("name", idx)
+		if !ok || got != want {
+			t.Fatalf("ColGetStr(name, %d): %q ok=%v want %q", idx, got, ok, want)
+		}
+		recGot, ok := r.Record(int(idx)).GetStr("name")
+		if !ok || recGot != want {
+			t.Fatalf("Record(%d).GetStr(name): %q ok=%v want %q", idx, recGot, ok, want)
+		}
+	}
 }
 
 func TestColumnarInvalidFlags(t *testing.T) {

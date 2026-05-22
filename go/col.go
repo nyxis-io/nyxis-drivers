@@ -7,6 +7,14 @@ import (
 	"math"
 )
 
+func varOffBytesLen(rc uint32) (int, error) {
+	off := (uint64(rc) + 1) * 4
+	if off > uint64(math.MaxInt) {
+		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets overflow")
+	}
+	return int(off), nil
+}
+
 const (
 	flagColumnar uint16 = 0x0001
 	flagPAX      uint16 = 0x0004
@@ -158,8 +166,156 @@ func (r *Reader) paxFindPage(rec uint32) (page int, local int, ok bool) {
 	return 0, 0, false
 }
 
+func isVarSigil(sig byte) bool {
+	return sig == '"' || sig == '<'
+}
+
+func fieldSectorLen(data []byte, sectorOff int, rc uint32, sigil byte) (int, error) {
+	bmLen := nullBitmapBytes(rc)
+	if !isVarSigil(sigil) {
+		return bmLen + int(uint64(rc)*8), nil
+	}
+	offBytes, err := varOffBytesLen(rc)
+	if err != nil {
+		return 0, err
+	}
+	if sectorOff+bmLen+offBytes > len(data) {
+		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
+	}
+	end := int(binary.LittleEndian.Uint32(data[sectorOff+bmLen+int(rc)*4 : sectorOff+bmLen+int(rc)*4+4]))
+	total := bmLen + offBytes + end
+	if sectorOff+total > len(data) {
+		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: var values")
+	}
+	return total, nil
+}
+
+// VarStrAt reads one UTF-8 string from a variable-length column sector.
+func VarStrAt(offsets []byte, values []byte, recordIndex uint32) (string, bool) {
+	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
+		return "", false
+	}
+	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
+	end := int(binary.LittleEndian.Uint32(offsets[recordIndex*4+4 : recordIndex*4+8]))
+	if end < start || end > len(values) {
+		return "", false
+	}
+	return string(values[start:end]), true
+}
+
+func varBinaryAt(offsets []byte, values []byte, recordIndex uint32) ([]byte, bool) {
+	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
+		return nil, false
+	}
+	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
+	end := int(binary.LittleEndian.Uint32(offsets[recordIndex*4+4 : recordIndex*4+8]))
+	if end < start || end > len(values) {
+		return nil, false
+	}
+	return values[start:end], true
+}
+
+// colVarParts returns null bitmap, u32 offsets LE, and values bytes for a var-length field.
+func (r *Reader) colVarParts(slot int) (bm, offsets, values []byte, err error) {
+	bm, tail, err := r.colFieldParts(slot)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	offBytes, err := varOffBytesLen(r.recordCount)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(tail) < offBytes {
+		return nil, nil, nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: var offsets")
+	}
+	return bm, tail[:offBytes], tail[offBytes:], nil
+}
+
+func (r *Reader) colVarPartsAt(rec uint32, slot int) (bm, offsets, values []byte, ok bool) {
+	if slot < 0 || slot >= len(r.KeySigils) || !isVarSigil(r.KeySigils[slot]) {
+		return nil, nil, nil, false
+	}
+	if r.layout == LayoutColumnar {
+		var err error
+		bm, offsets, values, err = r.colVarParts(slot)
+		return bm, offsets, values, err == nil
+	}
+	if r.layout == LayoutPAX {
+		pi, _, found := r.paxFindPage(rec)
+		if !found {
+			return nil, nil, nil, false
+		}
+		bm, tail, pageOk := r.pageFieldParts(uint32(pi), slot)
+		if !pageOk {
+			return nil, nil, nil, false
+		}
+		rc := r.pageRecCount[pi]
+		offBytes, err := varOffBytesLen(rc)
+		if err != nil || len(tail) < offBytes {
+			return nil, nil, nil, false
+		}
+		return bm, tail[:offBytes], tail[offBytes:], true
+	}
+	return nil, nil, nil, false
+}
+
+// ColGetStr reads a string field at recordIndex in columnar or PAX layout.
+func (r *Reader) ColGetStr(key string, recordIndex uint32) (string, bool) {
+	slot, ok := r.keyIndex[key]
+	if !ok || recordIndex >= r.recordCount || r.layout == LayoutRow {
+		return "", false
+	}
+	if r.KeySigils[slot] != '"' {
+		return "", false
+	}
+	bm, offsets, values, ok := r.colVarPartsAt(recordIndex, slot)
+	if !ok {
+		return "", false
+	}
+	if r.layout == LayoutPAX {
+		_, li, found := r.paxFindPage(recordIndex)
+		if !found || !colBit(bm, uint32(li)) {
+			return "", false
+		}
+		return VarStrAt(offsets, values, uint32(li))
+	}
+	if !colBit(bm, recordIndex) {
+		return "", false
+	}
+	return VarStrAt(offsets, values, recordIndex)
+}
+
+// ColGetBinary reads a binary field at recordIndex in columnar or PAX layout.
+func (r *Reader) ColGetBinary(key string, recordIndex uint32) ([]byte, bool) {
+	slot, ok := r.keyIndex[key]
+	if !ok || recordIndex >= r.recordCount || r.layout == LayoutRow {
+		return nil, false
+	}
+	if r.KeySigils[slot] != '<' {
+		return nil, false
+	}
+	bm, offsets, values, ok := r.colVarPartsAt(recordIndex, slot)
+	if !ok {
+		return nil, false
+	}
+	if r.layout == LayoutPAX {
+		_, li, found := r.paxFindPage(recordIndex)
+		if !found || !colBit(bm, uint32(li)) {
+			return nil, false
+		}
+		return varBinaryAt(offsets, values, uint32(li))
+	}
+	if !colBit(bm, recordIndex) {
+		return nil, false
+	}
+	return varBinaryAt(offsets, values, recordIndex)
+}
+
 // colNumericBytes returns the 8-byte fixed cell for a record/slot in columnar or PAX layout.
 func (r *Reader) colNumericBytes(rec uint32, slot int) ([]byte, bool) {
+	if slot >= 0 && slot < len(r.KeySigils) && isVarSigil(r.KeySigils[slot]) {
+		return nil, false
+	}
 	if r.layout == LayoutColumnar {
 		bm, vals, err := r.colFieldParts(slot)
 		if err != nil || rec >= r.recordCount || !colBit(bm, rec) {
@@ -291,27 +447,50 @@ func (r *Reader) paxSumF64(slot int) float64 {
 	return sum
 }
 
-func (r *Reader) pageFieldParts(pi uint32, slot int) ([]byte, []byte, bool) {
+func (r *Reader) pageFieldSector(pi uint32, slot int) ([]byte, bool) {
 	const magicPage uint32 = 0x4E585350
 	poff := int(r.pageOffset[pi])
 	if poff+24 > len(r.data) || binary.LittleEndian.Uint32(r.data[poff:]) != magicPage {
-		return nil, nil, false
+		return nil, false
 	}
 	fc := int(binary.LittleEndian.Uint16(r.data[poff+20 : poff+22]))
 	if slot < 0 || slot >= fc {
-		return nil, nil, false
+		return nil, false
 	}
-	rc := int(r.pageRecCount[pi])
+	rc := r.pageRecCount[pi]
 	body := poff + 24
 	for fi := 0; fi < slot; fi++ {
-		bmLen := nullBitmapBytes(r.pageRecCount[pi])
-		body += bmLen + rc*8
+		sig := byte('=')
+		if fi < len(r.KeySigils) {
+			sig = r.KeySigils[fi]
+		}
+		flen, err := fieldSectorLen(r.data, body, rc, sig)
+		if err != nil {
+			return nil, false
+		}
+		body += flen
 	}
-	bmLen := nullBitmapBytes(r.pageRecCount[pi])
-	if body+bmLen+rc*8 > len(r.data) {
+	sig := byte('=')
+	if slot < len(r.KeySigils) {
+		sig = r.KeySigils[slot]
+	}
+	flen, err := fieldSectorLen(r.data, body, rc, sig)
+	if err != nil || body+flen > len(r.data) {
+		return nil, false
+	}
+	return r.data[body : body+flen], true
+}
+
+func (r *Reader) pageFieldParts(pi uint32, slot int) ([]byte, []byte, bool) {
+	sector, ok := r.pageFieldSector(pi, slot)
+	if !ok {
 		return nil, nil, false
 	}
-	return r.data[body : body+bmLen], r.data[body+bmLen : body+bmLen+rc*8], true
+	bmLen := nullBitmapBytes(r.pageRecCount[pi])
+	if len(sector) < bmLen {
+		return nil, nil, false
+	}
+	return sector[:bmLen], sector[bmLen:], true
 }
 
 // colSumF64Dense sums a dense columnar f64 buffer (skips null-bit checks when bitmap is all-ones).

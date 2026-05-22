@@ -58,6 +58,18 @@ static size_t null_bitmap_bytes(uint32_t n) {
     return (raw + 7u) & ~(size_t)7u;
 }
 
+static int var_off_bytes(uint32_t rc, size_t *out) {
+    size_t t;
+    if (size_add_overflow((size_t)rc, 1u, &t) || size_mul_overflow(t, 4u, out)) return 1;
+    return 0;
+}
+
+static int var_need_bytes(uint32_t rec, size_t *out) {
+    size_t t;
+    if (size_add_overflow((size_t)rec, 2u, &t) || size_mul_overflow(t, 4u, out)) return 1;
+    return 0;
+}
+
 static int pax_page_sizes(uint32_t rc, uint16_t field_count,
                             size_t *body_out, size_t *page_len_out) {
     if (field_count == 0 || field_count > NXS_MAX_KEYS) return 1;
@@ -118,6 +130,196 @@ static nxs_err_t col_field_parts(const nxs_reader_t *r, int slot,
     *values = r->data + off + *bm_len;
     *val_len = (size_t)(len - *bm_len);
     return NXS_OK;
+}
+
+static int pax_find_page(const nxs_reader_t *r, uint32_t rec, int *local_idx);
+
+static int col_is_var_sigil(uint8_t sig) {
+    return sig == 0x22 || sig == 0x3c;
+}
+
+static nxs_err_t col_var_parts(const nxs_reader_t *r, int slot,
+                               const uint8_t **bitmap, size_t *bm_len,
+                               const uint8_t **offsets, size_t *off_len,
+                               const uint8_t **values, size_t *val_len) {
+    const uint8_t *sector;
+    size_t sector_len;
+    nxs_err_t err = col_field_parts(r, slot, bitmap, bm_len, &sector, &sector_len);
+    if (err != NXS_OK) return err;
+    uint32_t n = r->record_count;
+    size_t off_bytes;
+    if (var_off_bytes(n, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (sector_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
+    *offsets = sector;
+    *off_len = off_bytes;
+    *values = sector + off_bytes;
+    *val_len = sector_len - off_bytes;
+    return NXS_OK;
+}
+
+static nxs_err_t col_var_str_at(const uint8_t *offsets, size_t off_len,
+                                const uint8_t *values, size_t val_len,
+                                uint32_t rec, char *buf, size_t buf_len) {
+    if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t need;
+    if (var_need_bytes(rec, &need)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (off_len < need) return NXS_ERR_OUT_OF_BOUNDS;
+    uint32_t start = rd_u32(offsets + (size_t)rec * 4u);
+    uint32_t end = rd_u32(offsets + (size_t)rec * 4u + 4u);
+    if (end < start || (size_t)end > val_len) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t len = (size_t)(end - start);
+    size_t copy = (len < buf_len - 1) ? len : buf_len - 1;
+    memcpy(buf, values + start, copy);
+    buf[copy] = '\0';
+    return NXS_OK;
+}
+
+static nxs_err_t col_var_binary_at(const uint8_t *offsets, size_t off_len,
+                                   const uint8_t *values, size_t val_len,
+                                   uint32_t rec, uint8_t *buf, size_t buf_len,
+                                   size_t *out_len) {
+    size_t need;
+    if (var_need_bytes(rec, &need)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (off_len < need) return NXS_ERR_OUT_OF_BOUNDS;
+    uint32_t start = rd_u32(offsets + (size_t)rec * 4u);
+    uint32_t end = rd_u32(offsets + (size_t)rec * 4u + 4u);
+    if (end < start || (size_t)end > val_len) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t len = (size_t)(end - start);
+    size_t copy = len < buf_len ? len : buf_len;
+    memcpy(buf, values + start, copy);
+    if (out_len) *out_len = copy;
+    return NXS_OK;
+}
+
+static size_t col_field_sector_len(const uint8_t *data, size_t size, size_t pos,
+                                   uint32_t rc, uint8_t sig) {
+    size_t bm_len = null_bitmap_bytes(rc);
+    if (pos + bm_len > size) return 0;
+    if (col_is_var_sigil(sig)) {
+        size_t off_bytes, a, b, end_off, total;
+        if (var_off_bytes(rc, &off_bytes)) return 0;
+        if (size_add_overflow(pos, bm_len, &a) ||
+            size_add_overflow(a, off_bytes, &b) || b > size)
+            return 0;
+        size_t bm_start;
+        if (size_add_overflow(pos, bm_len, &bm_start)) return 0;
+        if (size_mul_overflow((size_t)rc, 4u, &a) ||
+            size_add_overflow(bm_start, a, &end_off) || end_off + 4 > size)
+            return 0;
+        uint32_t end = rd_u32(data + end_off);
+        if (size_add_overflow(bm_len, off_bytes, &a) ||
+            size_add_overflow(a, (size_t)end, &total) ||
+            size_add_overflow(pos, total, &b) || b > size)
+            return 0;
+        return total;
+    }
+    size_t total = bm_len + (size_t)rc * 8u;
+    if (pos + total > size) return 0;
+    return total;
+}
+
+static nxs_err_t pax_field_sector_at(const uint8_t *data, size_t size, size_t body,
+                                     uint32_t rc, const uint8_t *sigils, int field_count,
+                                     int slot, const uint8_t **bm, size_t *bm_len,
+                                     const uint8_t **vals, size_t *val_len) {
+    if (slot < 0 || slot >= field_count) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t pos = body;
+    for (int fi = 0; fi < field_count; fi++) {
+        size_t sector_len = col_field_sector_len(data, size, pos, rc, sigils[fi]);
+        if (sector_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
+        if (fi == slot) {
+            *bm = data + pos;
+            *bm_len = null_bitmap_bytes(rc);
+            *vals = data + pos + *bm_len;
+            *val_len = sector_len - *bm_len;
+            return NXS_OK;
+        }
+        pos += sector_len;
+    }
+    return NXS_ERR_OUT_OF_BOUNDS;
+}
+
+static nxs_err_t col_get_str_columnar(const nxs_object_t *obj, int slot,
+                                      char *buf, size_t buf_len) {
+    const nxs_reader_t *r = obj->reader;
+    if (r->key_sigils[slot] != 0x22) return NXS_ERR_UNSUPPORTED_TYPE;
+    const uint8_t *bm, *offsets, *values;
+    size_t bm_len, off_len, val_len;
+    nxs_err_t err = col_var_parts(r, slot, &bm, &bm_len, &offsets, &off_len, &values, &val_len);
+    if (err != NXS_OK) return err;
+    uint32_t ri = obj->record_index;
+    if (ri >= r->record_count) return NXS_ERR_OUT_OF_BOUNDS;
+    if (!col_bit(bm, ri)) return NXS_ERR_FIELD_ABSENT;
+    return col_var_str_at(offsets, off_len, values, val_len, ri, buf, buf_len);
+}
+
+static nxs_err_t col_get_str_pax(const nxs_object_t *obj, int slot,
+                                 char *buf, size_t buf_len) {
+    const nxs_reader_t *r = obj->reader;
+    if (r->key_sigils[slot] != 0x22) return NXS_ERR_UNSUPPORTED_TYPE;
+    int li = 0;
+    int pi = pax_find_page(r, obj->record_index, &li);
+    if (pi < 0) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t poff = (size_t)r->page_offset[pi];
+    if (poff + 24 > r->size || rd_u32(r->data + poff) != MAGIC_PAGE)
+        return NXS_ERR_BAD_PAGE_MAGIC;
+    uint16_t fc = rd_u16(r->data + poff + 20);
+    if (fc > (uint16_t)r->key_count) return NXS_ERR_OUT_OF_BOUNDS;
+    uint32_t rc = r->page_rec_count[pi];
+    const uint8_t *bm, *vals;
+    size_t bm_len, val_len;
+    nxs_err_t err = pax_field_sector_at(r->data, r->size, poff + 24, rc,
+                                        r->key_sigils, (int)fc, slot,
+                                        &bm, &bm_len, &vals, &val_len);
+    if (err != NXS_OK) return err;
+    if (!col_bit(bm, (uint32_t)li)) return NXS_ERR_FIELD_ABSENT;
+    size_t off_bytes;
+    if (var_off_bytes(rc, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (val_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
+    return col_var_str_at(vals, off_bytes, vals + off_bytes, val_len - off_bytes,
+                          (uint32_t)li, buf, buf_len);
+}
+
+static nxs_err_t col_get_binary_columnar(const nxs_object_t *obj, int slot,
+                                         uint8_t *buf, size_t buf_len,
+                                         size_t *out_len) {
+    const nxs_reader_t *r = obj->reader;
+    if (r->key_sigils[slot] != 0x3c) return NXS_ERR_UNSUPPORTED_TYPE;
+    const uint8_t *bm, *offsets, *values;
+    size_t bm_len, off_len, val_len;
+    nxs_err_t err = col_var_parts(r, slot, &bm, &bm_len, &offsets, &off_len, &values, &val_len);
+    if (err != NXS_OK) return err;
+    uint32_t ri = obj->record_index;
+    if (ri >= r->record_count) return NXS_ERR_OUT_OF_BOUNDS;
+    if (!col_bit(bm, ri)) return NXS_ERR_FIELD_ABSENT;
+    return col_var_binary_at(offsets, off_len, values, val_len, ri, buf, buf_len, out_len);
+}
+
+static nxs_err_t col_get_binary_pax(const nxs_object_t *obj, int slot,
+                                    uint8_t *buf, size_t buf_len, size_t *out_len) {
+    const nxs_reader_t *r = obj->reader;
+    if (r->key_sigils[slot] != 0x3c) return NXS_ERR_UNSUPPORTED_TYPE;
+    int li = 0;
+    int pi = pax_find_page(r, obj->record_index, &li);
+    if (pi < 0) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t poff = (size_t)r->page_offset[pi];
+    if (poff + 24 > r->size || rd_u32(r->data + poff) != MAGIC_PAGE)
+        return NXS_ERR_BAD_PAGE_MAGIC;
+    uint16_t fc = rd_u16(r->data + poff + 20);
+    if (fc > (uint16_t)r->key_count) return NXS_ERR_OUT_OF_BOUNDS;
+    uint32_t rc = r->page_rec_count[pi];
+    const uint8_t *bm, *vals;
+    size_t bm_len, val_len;
+    nxs_err_t err = pax_field_sector_at(r->data, r->size, poff + 24, rc,
+                                        r->key_sigils, (int)fc, slot,
+                                        &bm, &bm_len, &vals, &val_len);
+    if (err != NXS_OK) return err;
+    if (!col_bit(bm, (uint32_t)li)) return NXS_ERR_FIELD_ABSENT;
+    size_t off_bytes;
+    if (var_off_bytes(rc, &off_bytes)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (val_len < off_bytes) return NXS_ERR_OUT_OF_BOUNDS;
+    return col_var_binary_at(vals, off_bytes, vals + off_bytes, val_len - off_bytes,
+                             (uint32_t)li, buf, buf_len, out_len);
 }
 
 static int pax_find_page(const nxs_reader_t *r, uint32_t rec, int *local_idx) {
@@ -437,6 +639,7 @@ size_t nxs_pax_complete_page_at(const uint8_t *data, size_t size, size_t off,
 
 static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
                                          size_t poff, int slot,
+                                         const uint8_t *sigils, int key_count,
                                          const uint8_t **bm, size_t *bm_len,
                                          const uint8_t **vals, size_t *val_len,
                                          uint32_t *record_count) {
@@ -445,26 +648,10 @@ static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
     uint32_t rc = rd_u32(data + poff + 16);
     uint16_t fc = rd_u16(data + poff + 20);
     if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
-    if (fc > (uint16_t)NXS_MAX_KEYS) return NXS_ERR_OUT_OF_BOUNDS;
-    size_t bl = null_bitmap_bytes(rc);
-    size_t cells;
-    size_t field_stride;
-    if (size_mul_overflow((size_t)rc, 8u, &cells) ||
-        size_add_overflow(bl, cells, &field_stride))
-        return NXS_ERR_OUT_OF_BOUNDS;
-    size_t skip;
-    if (size_mul_overflow(field_stride, (size_t)slot, &skip)) return NXS_ERR_OUT_OF_BOUNDS;
-    size_t body;
-    if (size_add_overflow(poff + 24, skip, &body)) return NXS_ERR_OUT_OF_BOUNDS;
-    size_t val_bytes;
-    size_t end;
-    if (size_mul_overflow((size_t)rc, 8u, &val_bytes) ||
-        size_add_overflow(body + bl, val_bytes, &end) || end > size)
-        return NXS_ERR_OUT_OF_BOUNDS;
-    *bm = data + body;
-    *bm_len = bl;
-    *vals = data + body + bl;
-    *val_len = (size_t)rc * 8u;
+    if (fc > (uint16_t)NXS_MAX_KEYS || key_count < (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
+    nxs_err_t err = pax_field_sector_at(data, size, poff + 24, rc, sigils, (int)fc,
+                                        slot, bm, bm_len, vals, val_len);
+    if (err != NXS_OK) return err;
     *record_count = rc;
     return NXS_OK;
 }
@@ -477,6 +664,7 @@ static double pax_col_sum_f64_slot(const nxs_reader_t *r, int slot) {
         uint32_t rc;
         size_t poff = (size_t)r->page_offset[pi];
         if (pax_page_field_parts_at(r->data, r->size, poff, slot,
+                                    r->key_sigils, r->key_count,
                                     &bm, &bm_len, &vals, &val_len, &rc) != NXS_OK)
             continue;
         for (uint32_t i = 0; i < rc; i++) {
@@ -498,17 +686,19 @@ static nxs_err_t pax_field_values(const nxs_reader_t *r, uint32_t rec, int slot,
     if (poff + 24 > r->size || rd_u32(r->data + poff) != MAGIC_PAGE)
         return NXS_ERR_BAD_PAGE_MAGIC;
     uint16_t fc = rd_u16(r->data + poff + 20);
-    if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
+    if (slot < 0 || slot >= (int)fc || fc > (uint16_t)r->key_count)
+        return NXS_ERR_OUT_OF_BOUNDS;
     uint32_t rc = r->page_rec_count[pi];
-    size_t body = poff + 24;
-    for (int fi = 0; fi < slot; fi++) {
-        size_t bm = null_bitmap_bytes(rc);
-        body += bm + (size_t)rc * 8u;
-    }
-    size_t bm_len = null_bitmap_bytes(rc);
-    if (body + bm_len + (size_t)rc * 8u > r->size) return NXS_ERR_OUT_OF_BOUNDS;
-    if (!col_bit(r->data + body, li)) return NXS_ERR_FIELD_ABSENT;
-    *vals = r->data + body + bm_len + (size_t)li * 8u;
+    const uint8_t *bm;
+    size_t bm_len, sector_tail_len;
+    nxs_err_t err = pax_field_sector_at(r->data, r->size, poff + 24, rc,
+                                        r->key_sigils, (int)fc, slot,
+                                        &bm, &bm_len, vals, &sector_tail_len);
+    if (err != NXS_OK) return err;
+    if (!col_bit(bm, (uint32_t)li)) return NXS_ERR_FIELD_ABSENT;
+    uint8_t sig = r->key_sigils[slot];
+    if (col_is_var_sigil(sig)) return NXS_ERR_UNSUPPORTED_TYPE;
+    *vals = *vals + (size_t)li * 8u;
     *val_len = 8;
     *local_idx = (uint32_t)li;
     return NXS_OK;
@@ -584,6 +774,12 @@ nxs_err_t nxs_get_bool_slot(nxs_object_t *obj, int slot, int *out) {
 }
 
 nxs_err_t nxs_get_str_slot(nxs_object_t *obj, int slot, char *buf, size_t buf_len) {
+    if (slot < 0 || slot >= obj->reader->key_count) return NXS_ERR_KEY_NOT_FOUND;
+    if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
+    if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
+        return col_get_str_columnar(obj, slot, buf, buf_len);
+    if (obj->reader->layout == NXS_LAYOUT_PAX)
+        return col_get_str_pax(obj, slot, buf, buf_len);
     int64_t off = nxs_resolve_slot(obj, slot);
     if (off < 0) return NXS_ERR_FIELD_ABSENT;
     const uint8_t *data = obj->reader->data;
@@ -608,6 +804,32 @@ nxs_err_t nxs_get_bool(nxs_object_t *obj, const char *key, int *out) {
 }
 nxs_err_t nxs_get_str(nxs_object_t *obj, const char *key, char *buf, size_t buf_len) {
     return nxs_get_str_slot(obj, nxs_slot(obj->reader, key), buf, buf_len);
+}
+
+nxs_err_t nxs_get_binary_slot(nxs_object_t *obj, int slot, uint8_t *buf, size_t buf_len,
+                              size_t *out_len) {
+    if (slot < 0 || slot >= obj->reader->key_count) return NXS_ERR_KEY_NOT_FOUND;
+    if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
+    if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
+        return col_get_binary_columnar(obj, slot, buf, buf_len, out_len);
+    if (obj->reader->layout == NXS_LAYOUT_PAX)
+        return col_get_binary_pax(obj, slot, buf, buf_len, out_len);
+    int64_t off = nxs_resolve_slot(obj, slot);
+    if (off < 0) return NXS_ERR_FIELD_ABSENT;
+    const uint8_t *data = obj->reader->data;
+    size_t sz = obj->reader->size;
+    if ((size_t)off + 4 > sz) return NXS_ERR_OUT_OF_BOUNDS;
+    uint32_t len = rd_u32(data + off);
+    if ((size_t)off + 4 + len > sz) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t copy = len < buf_len ? len : buf_len;
+    memcpy(buf, data + off + 4, copy);
+    if (out_len) *out_len = copy;
+    return NXS_OK;
+}
+
+nxs_err_t nxs_get_binary(nxs_object_t *obj, const char *key, uint8_t *buf, size_t buf_len,
+                         size_t *out_len) {
+    return nxs_get_binary_slot(obj, nxs_slot(obj->reader, key), buf, buf_len, out_len);
 }
 
 // ── Bulk reducers (allocation-free) ──────────────────────────────────────────
@@ -1070,6 +1292,7 @@ double nxs_pax_stream_col_sum_f64(const nxs_pax_stream_reader_t *sr, const char 
         uint32_t rc;
         size_t poff = (size_t)sr->page_offset[pi];
         if (pax_page_field_parts_at(sr->data, sr->size, poff, slot,
+                                    sr->key_sigils, sr->key_count,
                                     &bm, &bm_len, &vals, &val_len, &rc) != NXS_OK)
             continue;
         for (uint32_t i = 0; i < rc; i++) {
