@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
-      DOTNET_FRAMEWORK: net9.0
+      DOTNET_FRAMEWORK: net10.0
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +24,7 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '9.0'
+          dotnet-version: '10.0'
 
       - run: make lint-csharp
       - run: make test-csharp
