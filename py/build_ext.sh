@@ -19,11 +19,13 @@ else
   LDFLAGS=$(python3-config --ldflags --embed 2>/dev/null || python3-config --ldflags)
 fi
 
-cc -O3 -Wall -Wextra -fPIC \
+cc -O3 -Wall -Wextra -Wno-unknown-pragmas -fPIC \
    -I"$PYINCLUDE" \
+   -I../c \
    -shared \
    $LDFLAGS \
    _nxs.c \
+   ../c/nxs.c \
    -o "$OUT"
 
 echo "Built $OUT"

@@ -46,6 +46,12 @@ Use the same API, significantly faster for columnar work:
 import _nxs
 
 reader = _nxs.Reader(buf)
+
+# Columnar / PAX: zero-copy field buffers (numpy optional)
+if reader.layout == "columnar":
+    buf = reader.col_buffer("score")  # dict: values, bitmap, count (memoryviews)
+    arr = reader.col_numpy_f64("score")  # numpy.ndarray, requires numpy
+    total = reader.col_sum_f64("score")
 print(reader.record(42).get_str("username"))   # ~374 ns vs ~1.2 µs pure Python
 total = reader.sum_f64("score")                # 3.15 ms at 1M records
 ```

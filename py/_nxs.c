@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "../c/nxs.h"
+
 /* ── Format constants (must match writer.rs) ─────────────────────────────── */
 
 #define MAGIC_FILE    0x4E595842u   /* NYXB */
@@ -58,68 +60,33 @@ typedef struct {
     PyObject *key_index;             /* dict: str → int (slot) */
     PyObject *keys;                  /* list of str, for introspection */
     int schema_embedded;
+    nxs_reader_t nxs;                /* Full layout-aware reader (c/nxs.c) */
+    int has_nxs;
 } ReaderObject;
+
+static const char *
+nxs_err_msg(nxs_err_t err)
+{
+    switch (err) {
+    case NXS_ERR_BAD_MAGIC: return "ERR_BAD_MAGIC";
+    case NXS_ERR_OUT_OF_BOUNDS: return "ERR_OUT_OF_BOUNDS";
+    case NXS_ERR_KEY_NOT_FOUND: return "ERR_KEY_NOT_FOUND";
+    case NXS_ERR_INVALID_FLAGS: return "ERR_INVALID_FLAGS";
+    case NXS_ERR_INCOMPATIBLE: return "ERR_INCOMPATIBLE";
+    case NXS_ERR_UNSUPPORTED: return "ERR_UNSUPPORTED";
+    case NXS_ERR_UNSUPPORTED_TYPE: return "ERR_UNSUPPORTED_FIELD_TYPE";
+    default: return "ERR_UNKNOWN";
+    }
+}
 
 static PyTypeObject ReaderType;
 static PyTypeObject ObjectType;
 
 static int
-Reader_parse_schema_and_tail(ReaderObject *self)
-{
-    const uint8_t *data = self->data;
-    Py_ssize_t size = self->size;
-    Py_ssize_t p = 32;
-
-    if (self->schema_embedded) {
-        if (p + 2 > size) {
-            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: schema header");
-            return -1;
-        }
-        uint16_t key_count = rd_u16(data + p);
-        p += 2;
-        p += key_count; /* skip TypeManifest */
-
-        self->keys = PyList_New(key_count);
-        self->key_index = PyDict_New();
-        if (!self->keys || !self->key_index) return -1;
-
-        for (uint16_t i = 0; i < key_count; i++) {
-            Py_ssize_t start = p;
-            while (p < size && data[p] != 0) p++;
-            if (p >= size) {
-                PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: string pool");
-                return -1;
-            }
-            PyObject *s = PyUnicode_DecodeUTF8((const char *)(data + start),
-                                                p - start, "strict");
-            if (!s) return -1;
-            PyList_SET_ITEM(self->keys, i, s); /* steals ref */
-
-            PyObject *idx = PyLong_FromLong(i);
-            if (!idx) return -1;
-            if (PyDict_SetItem(self->key_index, s, idx) < 0) {
-                Py_DECREF(idx);
-                return -1;
-            }
-            Py_DECREF(idx);
-            p++; /* skip null terminator */
-        }
-    }
-
-    /* Tail-index */
-    if ((Py_ssize_t)self->tail_ptr + 4 > size) {
-        PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: tail index");
-        return -1;
-    }
-    self->record_count = rd_u32(data + self->tail_ptr);
-    self->tail_start = self->tail_ptr + 4;
-    return 0;
-}
-
-static int
 Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
 {
     PyObject *buf_obj;
+    (void)kwds;
     if (!PyArg_ParseTuple(args, "O", &buf_obj)) return -1;
 
     if (PyObject_GetBuffer(buf_obj, &self->view, PyBUF_SIMPLE) < 0) return -1;
@@ -156,13 +123,39 @@ Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
         self->tail_ptr = rd_u64(self->data + self->size - 12);
     }
 
-    if (Reader_parse_schema_and_tail(self) < 0) return -1;
+    memset(&self->nxs, 0, sizeof(self->nxs));
+    nxs_err_t err = nxs_open(&self->nxs, self->data, (size_t)self->size);
+    if (err != NXS_OK) {
+        PyErr_SetString(PyExc_ValueError, nxs_err_msg(err));
+        return -1;
+    }
+    self->has_nxs = 1;
+    self->record_count = self->nxs.record_count;
+    self->tail_start = (Py_ssize_t)self->nxs.tail_start;
+
+    int kc = self->nxs.key_count;
+    self->keys = PyList_New(kc);
+    self->key_index = PyDict_New();
+    if (!self->keys || !self->key_index) return -1;
+    for (int i = 0; i < kc; i++) {
+        PyObject *s = PyUnicode_FromString(self->nxs.keys[i]);
+        if (!s) return -1;
+        PyList_SET_ITEM(self->keys, i, s);
+        PyObject *idx = PyLong_FromLong(i);
+        if (!idx) return -1;
+        if (PyDict_SetItem(self->key_index, s, idx) < 0) {
+            Py_DECREF(idx);
+            return -1;
+        }
+        Py_DECREF(idx);
+    }
     return 0;
 }
 
 static void
 Reader_dealloc(ReaderObject *self)
 {
+    if (self->has_nxs) nxs_close(&self->nxs);
     if (self->buffer_obj) {
         PyBuffer_Release(&self->view);
         Py_DECREF(self->buffer_obj);
@@ -363,7 +356,7 @@ Object_get_str(ObjectView *self, PyObject *key)
         PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str len"); return NULL;
     }
     uint32_t n = rd_u32(self->reader->data + off);
-    if (off + 4 + n > (uint64_t)self->reader->size) {
+    if ((size_t)off + 4u + (size_t)n > (size_t)self->reader->size) {
         PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str bytes"); return NULL;
     }
     return PyUnicode_DecodeUTF8((const char *)(self->reader->data + off + 4),
@@ -546,10 +539,163 @@ Reader_scan_i64(ReaderObject *self, PyObject *key)
     return list;
 }
 
+static const char *
+reader_key_cstr(PyObject *key, PyObject **tmp)
+{
+    if (PyUnicode_Check(key)) {
+        return PyUnicode_AsUTF8(key);
+    }
+    *tmp = PyObject_Str(key);
+    if (!*tmp) return NULL;
+    return PyUnicode_AsUTF8(*tmp);
+}
+
+static PyObject *
+Reader_col_buffer_dict(ReaderObject *self, const char *field)
+{
+    if (!self->has_nxs || self->nxs.layout == NXS_LAYOUT_ROW) {
+        PyErr_SetString(PyExc_RuntimeError, "ERR_LAYOUT: col_buffer requires columnar or PAX layout");
+        return NULL;
+    }
+    size_t val_len = 0;
+    const void *vals = nxs_col_buffer(&self->nxs, field, &val_len);
+    if (!vals) {
+        PyErr_SetString(PyExc_KeyError, "col_buffer unavailable for field");
+        return NULL;
+    }
+    size_t bm_len = 0;
+    const uint8_t *bm = nxs_col_null_bitmap(&self->nxs, field, &bm_len);
+    if (!bm) {
+        PyErr_SetString(PyExc_KeyError, "col_null_bitmap unavailable for field");
+        return NULL;
+    }
+    PyObject *dict = PyDict_New();
+    PyObject *values_mv = PyMemoryView_FromMemory((char *)vals, (Py_ssize_t)val_len, PyBUF_READ);
+    PyObject *bitmap_mv = PyMemoryView_FromMemory((char *)bm, (Py_ssize_t)bm_len, PyBUF_READ);
+    PyObject *count = PyLong_FromUnsignedLong(self->record_count);
+    if (!dict || !values_mv || !bitmap_mv || !count) {
+        Py_XDECREF(dict);
+        Py_XDECREF(values_mv);
+        Py_XDECREF(bitmap_mv);
+        Py_XDECREF(count);
+        return NULL;
+    }
+    if (PyDict_SetItemString(dict, "values", values_mv) < 0 ||
+        PyDict_SetItemString(dict, "bitmap", bitmap_mv) < 0 ||
+        PyDict_SetItemString(dict, "count", count) < 0) {
+        Py_DECREF(dict);
+        Py_DECREF(values_mv);
+        Py_DECREF(bitmap_mv);
+        Py_DECREF(count);
+        return NULL;
+    }
+    Py_DECREF(values_mv);
+    Py_DECREF(bitmap_mv);
+    Py_DECREF(count);
+    return dict;
+}
+
+static PyObject *
+Reader_col_buffer(ReaderObject *self, PyObject *key)
+{
+    PyObject *tmp = NULL;
+    const char *field = reader_key_cstr(key, &tmp);
+    if (!field) {
+        Py_XDECREF(tmp);
+        return NULL;
+    }
+    PyObject *out = Reader_col_buffer_dict(self, field);
+    Py_XDECREF(tmp);
+    return out;
+}
+
+static PyObject *
+Reader_col_numpy_f64(ReaderObject *self, PyObject *key)
+{
+    PyObject *tmp = NULL;
+    const char *field = reader_key_cstr(key, &tmp);
+    if (!field) {
+        Py_XDECREF(tmp);
+        return NULL;
+    }
+    PyObject *buf = Reader_col_buffer_dict(self, field);
+    Py_XDECREF(tmp);
+    if (!buf) return NULL;
+
+    PyObject *numpy = PyImport_ImportModule("numpy");
+    if (!numpy) {
+        Py_DECREF(buf);
+        return NULL;
+    }
+    PyObject *values = PyDict_GetItemString(buf, "values");
+    PyObject *count_obj = PyDict_GetItemString(buf, "count");
+    if (!values || !count_obj) {
+        Py_DECREF(buf);
+        Py_DECREF(numpy);
+        PyErr_SetString(PyExc_RuntimeError, "col_buffer dict missing keys");
+        return NULL;
+    }
+    PyObject *dtype = PyObject_GetAttrString(numpy, "float64");
+    if (!dtype) {
+        Py_DECREF(buf);
+        Py_DECREF(numpy);
+        return NULL;
+    }
+    long count = PyLong_AsLong(count_obj);
+    if (count < 0 && PyErr_Occurred()) {
+        Py_DECREF(dtype);
+        Py_DECREF(buf);
+        Py_DECREF(numpy);
+        return NULL;
+    }
+    PyObject *arr = PyObject_CallMethod(numpy, "frombuffer", "Osl", values, dtype, count);
+    Py_DECREF(dtype);
+    Py_DECREF(buf);
+    Py_DECREF(numpy);
+    return arr;
+}
+
+static PyObject *
+Reader_col_sum_f64(ReaderObject *self, PyObject *key)
+{
+    PyObject *tmp = NULL;
+    const char *field = reader_key_cstr(key, &tmp);
+    if (!field) {
+        Py_XDECREF(tmp);
+        return NULL;
+    }
+    if (!self->has_nxs) {
+        Py_XDECREF(tmp);
+        PyErr_SetString(PyExc_RuntimeError, "reader not initialized");
+        return NULL;
+    }
+    double sum = nxs_col_sum_f64(&self->nxs, field);
+    Py_XDECREF(tmp);
+    return PyFloat_FromDouble(sum);
+}
+
+static PyObject *
+Reader_get_layout(ReaderObject *self, void *closure)
+{
+    (void)closure;
+    const char *name = "row";
+    if (self->has_nxs) {
+        switch (self->nxs.layout) {
+        case NXS_LAYOUT_COLUMNAR: name = "columnar"; break;
+        case NXS_LAYOUT_PAX: name = "pax"; break;
+        default: break;
+        }
+    }
+    return PyUnicode_FromString(name);
+}
+
 /* In-native reducers: sum / min / max / count over an f64 field. */
 static PyObject *
 Reader_sum_f64(ReaderObject *self, PyObject *key)
 {
+    if (self->has_nxs && self->nxs.layout != NXS_LAYOUT_ROW) {
+        return Reader_col_sum_f64(self, key);
+    }
     int slot = reader_resolve_slot(self, key);
     if (slot == -2) return NULL;
     if (slot == -1) {
@@ -642,12 +788,14 @@ Reader_sum_i64(ReaderObject *self, PyObject *key)
 static PyObject *
 Reader_get_record_count(ReaderObject *self, void *closure)
 {
+    (void)closure;
     return PyLong_FromUnsignedLong(self->record_count);
 }
 
 static PyObject *
 Reader_get_keys(ReaderObject *self, void *closure)
 {
+    (void)closure;
     Py_INCREF(self->keys);
     return self->keys;
 }
@@ -657,6 +805,11 @@ static PyMethodDef Reader_methods[] = {
     {"scan_f64", (PyCFunction)Reader_scan_f64, METH_O, "List of all f64 values for key."},
     {"scan_i64", (PyCFunction)Reader_scan_i64, METH_O, "List of all i64 values for key."},
     {"sum_f64",  (PyCFunction)Reader_sum_f64,  METH_O, "Sum of an f64 field across all records."},
+    {"col_sum_f64", (PyCFunction)Reader_col_sum_f64, METH_O, "Columnar/PAX sum of f64 field."},
+    {"col_buffer", (PyCFunction)Reader_col_buffer, METH_O,
+     "dict(values, bitmap, count) memoryviews for columnar/PAX numeric field."},
+    {"col_numpy_f64", (PyCFunction)Reader_col_numpy_f64, METH_O,
+     "numpy.ndarray view of f64 column (requires numpy)."},
     {"min_f64",  (PyCFunction)Reader_min_f64,  METH_O, "Min of an f64 field across all records."},
     {"max_f64",  (PyCFunction)Reader_max_f64,  METH_O, "Max of an f64 field across all records."},
     {"sum_i64",  (PyCFunction)Reader_sum_i64,  METH_O, "Sum of an i64 field across all records."},
@@ -666,7 +819,8 @@ static PyMethodDef Reader_methods[] = {
 static PyGetSetDef Reader_getset[] = {
     {"record_count", (getter)Reader_get_record_count, NULL, "Total top-level records.", NULL},
     {"keys",         (getter)Reader_get_keys,         NULL, "Schema keys.", NULL},
-    {NULL}
+    {"layout",       (getter)Reader_get_layout,       NULL, "row | columnar | pax", NULL},
+    {NULL, NULL, NULL, NULL, NULL}
 };
 
 static PyTypeObject ReaderType = {
@@ -762,7 +916,7 @@ Schema_get_keys(SchemaObject *self, void *closure)
 
 static PyGetSetDef Schema_getset[] = {
     {"keys", (getter)Schema_get_keys, NULL, "Schema key list.", NULL},
-    {NULL}
+    {NULL, NULL, NULL, NULL, NULL}
 };
 
 static PyTypeObject SchemaType = {
