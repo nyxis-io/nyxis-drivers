@@ -32,9 +32,16 @@ jobs:
         env:
           FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
 
+      - name: Debug trusted publishing
+        run: |
+          node --version
+          npm --version
+          echo "OIDC URL: ${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
+          echo "OIDC TOKEN: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+set}"
+
       - name: Publish
         working-directory: js
-        run: npm publish
+        run: npm publish --access public
 
       - name: Smoke test (install from registry)
         # Wait out npm's index propagation (can lag ~30-60s after publish).
