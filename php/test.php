@@ -307,6 +307,158 @@ check(
     "got=$allCount, expected=" . $reader->recordCount()
 );
 
+// ── Columnar read tests ────────────────────────────────────────────────────────
+
+echo "\nNXS PHP Columnar — Tests\n";
+echo str_repeat('─', 56) . "\n";
+
+/**
+ * Build a minimal dense columnar .nxb with fields: id (i64), score (f64), active (bool).
+ * Schema sigils: '=' (0x3D), '~' (0x7E), '?' (0x3F).
+ */
+function buildColumnarNxb(int $n): string
+{
+    $MAGIC_FILE   = 0x4E595842;
+    $MAGIC_FOOTER = 0x2153584E;
+    $FLAG_SCHEMA  = 0x0002;
+    $FLAG_COL     = 0x0001;
+    $VERSION      = 0x0101;
+
+    // Schema bytes: KeyCount(2) + TypeManifest(3) + null-terminated keys, padded to 8
+    $keys   = ['id', 'score', 'active'];
+    $sigils = [0x3D, 0x7E, 0x3F]; // '=', '~', '?'
+    $schema = pack('v', count($keys));
+    foreach ($sigils as $sg) { $schema .= chr($sg); }
+    foreach ($keys as $k)    { $schema .= $k . "\x00"; }
+    while (strlen($schema) % 8 !== 0) { $schema .= "\x00"; }
+
+    // Compute DictHash (MurmurHash3-64) over schema bytes
+    $mask = gmp_init('0xFFFFFFFFFFFFFFFF');
+    $c1   = gmp_init('0xFF51AFD7ED558CCD');
+    $c2   = gmp_init('0xC4CEB9FE1A85EC53');
+    $h    = gmp_init('0x93681D6255313A99');
+    $data = $schema;
+    $len  = strlen($data);
+    $i    = 0;
+    while ($i < $len) {
+        $chunk = substr($data, $i, 8);
+        $k     = gmp_init(0);
+        for ($j = 0; $j < strlen($chunk); $j++) {
+            $k = gmp_or($k, gmp_mul(gmp_init(ord($chunk[$j])), gmp_pow(2, $j * 8)));
+        }
+        $k = gmp_and(gmp_mul($k, $c1), $mask);
+        $k = gmp_xor($k, gmp_div_q($k, gmp_pow(2, 33)));
+        $h = gmp_xor($h, $k);
+        $h = gmp_and(gmp_mul($h, $c2), $mask);
+        $h = gmp_xor($h, gmp_div_q($h, gmp_pow(2, 33)));
+        $i += 8;
+    }
+    $h = gmp_xor($h, gmp_init($len));
+    $h = gmp_xor($h, gmp_div_q($h, gmp_pow(2, 33)));
+    $h = gmp_and(gmp_mul($h, $c1), $mask);
+    $h = gmp_xor($h, gmp_div_q($h, gmp_pow(2, 33)));
+    $hex      = gmp_strval($h, 16);
+    $hashBytes = str_pad(hex2bin(str_pad($hex, 16, '0', STR_PAD_LEFT)), 8, "\x00", STR_PAD_LEFT);
+    $dictHashLE = strrev($hashBytes); // big-endian → little-endian
+
+    // Dense null bitmap: all n bits set, padded to 8-byte boundary
+    $bmRaw = intdiv($n + 7, 8);
+    $bmLen = ($bmRaw + 7) & ~7;
+    $bm = str_repeat("\x00", $bmLen);
+    for ($idx = 0; $idx < $n; $idx++) {
+        $bm[$idx >> 3] = chr(ord($bm[$idx >> 3]) | (1 << ($idx & 7)));
+    }
+
+    // id column: bm + n * i64
+    $idVals = '';
+    for ($idx = 0; $idx < $n; $idx++) { $idVals .= pack('q', $idx); }
+    $idCol = $bm . $idVals;
+
+    // score column: bm + n * f64 (idx * 0.5)
+    $scVals = '';
+    for ($idx = 0; $idx < $n; $idx++) { $scVals .= pack('e', $idx * 0.5); }
+    $scCol = $bm . $scVals;
+
+    // active column: bm + n * 8-byte bool (even → true)
+    $acVals = '';
+    for ($idx = 0; $idx < $n; $idx++) {
+        $acVals .= ($idx % 2 === 0 ? "\x01" : "\x00") . str_repeat("\x00", 7);
+    }
+    $acCol = $bm . $acVals;
+
+    $cols     = [$idCol, $scCol, $acCol];
+    $dataBase = 32 + strlen($schema);
+    $colData  = '';
+    $tailEntries = [];
+    foreach ($cols as $fi => $col) {
+        $tailEntries[] = [$dataBase + strlen($colData), strlen($col)];
+        $colData .= $col;
+    }
+    $tailIndexOff = $dataBase + strlen($colData);
+
+    // Tail index: per-field { fid u16, pad u16, off u64, len u64 } = 20 bytes each
+    $tail = '';
+    foreach ($tailEntries as $fi => [$off, $colLen]) {
+        $tail .= pack('vv', $fi, 0);
+        $tail .= pack('VV', $off & 0xFFFFFFFF, ($off >> 32) & 0xFFFFFFFF);
+        $tail .= pack('VV', $colLen & 0xFFFFFFFF, ($colLen >> 32) & 0xFFFFFFFF);
+    }
+    // Columnar footer (20 bytes): TailIndexOff(8) + RecordCount(8) + MagicFooter(4)
+    $tail .= pack('VV', $tailIndexOff & 0xFFFFFFFF, ($tailIndexOff >> 32) & 0xFFFFFFFF);
+    $tail .= pack('VV', $n & 0xFFFFFFFF, 0); // RecordCount as u64
+    $tail .= pack('V', $MAGIC_FOOTER);
+
+    // Preamble (32 bytes)
+    $flags = $FLAG_SCHEMA | $FLAG_COL;
+    $out  = pack('V', $MAGIC_FILE);
+    $out .= pack('vv', $VERSION, $flags);
+    $out .= $dictHashLE;
+    $out .= pack('VV', $tailIndexOff & 0xFFFFFFFF, ($tailIndexOff >> 32) & 0xFFFFFFFF); // TailPtr
+    $out .= str_repeat("\x00", 8); // reserved
+
+    return $out . $schema . $colData . $tail;
+}
+
+// Test: columnar reader opens
+try {
+    $colData = buildColumnarNxb(5);
+    $cr = new Nxs\Reader($colData);
+    check('columnar: opens without error', true);
+} catch (\Throwable $e) {
+    check('columnar: opens without error', false, $e->getMessage());
+    $cr = null;
+}
+
+if ($cr !== null) {
+    // recordCount
+    check('columnar: recordCount() === 5', $cr->recordCount() === 5, 'got ' . $cr->recordCount());
+
+    // keys
+    $ck = $cr->keys();
+    check('columnar: keys() contains "id"',     in_array('id',     $ck, true));
+    check('columnar: keys() contains "score"',  in_array('score',  $ck, true));
+    check('columnar: keys() contains "active"', in_array('active', $ck, true));
+
+    // Build a 10-record file for value checks
+    $cr10 = new Nxs\Reader(buildColumnarNxb(10));
+
+    // record(4)->getI64("id") == 4
+    $gotId4 = $cr10->record(4)->getI64('id');
+    check('columnar: record(4)->getI64("id") == 4', $gotId4 === 4, "got=$gotId4");
+
+    // record(4)->getF64("score") ≈ 2.0  (4 * 0.5)
+    $gotSc4 = $cr10->record(4)->getF64('score');
+    check('columnar: record(4)->getF64("score") ≈ 2.0', abs((float)$gotSc4 - 2.0) < 1e-9, "got=$gotSc4");
+
+    // record(4)->getBool("active") == true  (even index)
+    $gotAc4 = $cr10->record(4)->getBool('active');
+    check('columnar: record(4)->getBool("active") === true', $gotAc4 === true, 'got=' . var_export($gotAc4, true));
+
+    // record(3)->getBool("active") == false  (odd index)
+    $gotAc3 = $cr10->record(3)->getBool('active');
+    check('columnar: record(3)->getBool("active") === false', $gotAc3 === false, 'got=' . var_export($gotAc3, true));
+}
+
 // ── Summary ───────────────────────────────────────────────────────────────────
 
 echo str_repeat('─', 56) . "\n";

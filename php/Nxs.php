@@ -41,11 +41,13 @@ class NxsException extends \RuntimeException {}
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /**
- * Decode a LEB128 unsigned integer from $bytes at $pos.
- * Advances $pos past the consumed bytes.
- * Returns the decoded integer.
+ * NXS custom 7-bit bitmask encoding (not standard LEB128).
+ *
+ * Reads continuation bytes until the MSB is clear, extracting 7 data bits
+ * per byte in LSB-first order (NXS object presence mask encoding).
+ * Advances $pos past the consumed bytes and returns the decoded integer.
  */
-function leb128(string $bytes, int &$pos): int
+function scanBitmask(string $bytes, int &$pos): int
 {
     $result = 0;
     $shift  = 0;

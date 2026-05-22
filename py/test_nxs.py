@@ -268,6 +268,142 @@ def main() -> int:
     case("query: first() returns correct record",             test_query_first_returns_correct_record)
     case("query: no predicate counts all records",            test_query_count_all)
 
+    # ── Columnar read tests ──────────────────────────────────────────────────
+    print("\nNXS Python Columnar / PAX — Tests\n")
+
+    def _build_columnar_nxb(n: int) -> bytes:
+        """Build a minimal dense columnar .nxb with fields: id (i64), score (f64), active (bool)."""
+        import struct as _s
+
+        MAGIC_FILE   = 0x4E595842
+        MAGIC_FOOTER = 0x2153584E
+        FLAG_SCHEMA  = 0x0002
+        FLAG_COL     = 0x0001
+        VERSION      = 0x0101
+        MASK64       = 0xFFFFFFFFFFFFFFFF
+        C1           = 0xFF51AFD7ED558CCD
+        C2           = 0xC4CEB9FE1A85EC53
+
+        def mm3(data: bytes) -> int:
+            h = 0x93681D6255313A99
+            ln = len(data)
+            i = 0
+            while i < ln:
+                k = 0
+                for b in range(8):
+                    if i + b < ln:
+                        k |= data[i + b] << (b * 8)
+                k = (k * C1) & MASK64; k ^= k >> 33
+                h ^= k; h = (h * C2) & MASK64; h ^= h >> 33
+                i += 8
+            h ^= ln; h ^= h >> 33; h = (h * C1) & MASK64; h ^= h >> 33
+            return h
+
+        # Schema: 3 keys with sigils '=' (i64), '~' (f64), '?' (bool)
+        keys = [b"id", b"score", b"active"]
+        sigils = [0x3D, 0x7E, 0x3F]  # '=', '~', '?'
+        kc = len(keys)
+        schema = bytearray()
+        schema += _s.pack("<H", kc)
+        for sg in sigils:
+            schema += bytes([sg])
+        for k in keys:
+            schema += k + b"\x00"
+        # Pad to 8 bytes
+        while len(schema) % 8:
+            schema += b"\x00"
+        schema = bytes(schema)
+
+        dict_hash = mm3(schema)
+
+        # Build dense null bitmap: all n bits set
+        bm_raw = (n + 7) // 8
+        bm_len = (bm_raw + 7) & ~7
+        bm = bytearray(bm_len)
+        for i in range(n):
+            bm[i // 8] |= 1 << (i % 8)
+        bm = bytes(bm)
+
+        # id column: bm + n * i64
+        id_vals = _s.pack(f"<{n}q", *range(n))
+        id_col  = bm + id_vals
+
+        # score column: bm + n * f64 (i * 0.5)
+        sc_vals = _s.pack(f"<{n}d", *[i * 0.5 for i in range(n)])
+        sc_col  = bm + sc_vals
+
+        # active column: bm + n * 8-byte bool (even indices = True)
+        ac_vals = bytearray(n * 8)
+        for i in range(n):
+            ac_vals[i * 8] = 1 if i % 2 == 0 else 0
+        ac_col = bm + bytes(ac_vals)
+
+        cols = [id_col, sc_col, ac_col]
+
+        # Data starts after 32-byte preamble + schema
+        data_base = 32 + len(schema)
+
+        col_data = b""
+        tail_entries = []
+        for col in cols:
+            off = data_base + len(col_data)
+            tail_entries.append((off, len(col)))
+            col_data += col
+
+        tail_index_off = data_base + len(col_data)
+
+        # Tail index: for each field, u16 fid + u16 pad + u64 off + u64 len
+        tail = bytearray()
+        for fi, (off, length) in enumerate(tail_entries):
+            tail += _s.pack("<HH", fi, 0)
+            tail += _s.pack("<QQ", off, length)
+
+        # Columnar footer (20 bytes): TailIndexOff(8) + RecordCount(8) + MagicFooter(4)
+        tail += _s.pack("<QQ", tail_index_off, n)
+        tail += _s.pack("<I", MAGIC_FOOTER)
+
+        # Preamble
+        flags = FLAG_SCHEMA | FLAG_COL
+        out = bytearray()
+        out += _s.pack("<I", MAGIC_FILE)
+        out += _s.pack("<HH", VERSION, flags)
+        out += _s.pack("<Q", dict_hash)
+        out += _s.pack("<Q", tail_index_off)  # TailPtr (non-zero for columnar)
+        out += bytes(8)  # reserved
+        out += schema
+        out += col_data
+        out += tail
+        return bytes(out)
+
+    def columnar_opens():
+        data = _build_columnar_nxb(5)
+        r = NxsReader(data)
+        assert r.record_count == 5, r.record_count
+
+    def columnar_keys():
+        r = NxsReader(_build_columnar_nxb(5))
+        for k in ("id", "score", "active"):
+            assert k in r.keys, f"missing key {k}"
+
+    def columnar_record_values():
+        r = NxsReader(_build_columnar_nxb(10))
+        obj = r.record(4)
+        # id == 4
+        assert obj.get_i64("id") == 4, f"id mismatch: {obj.get_i64('id')}"
+        # score == 4 * 0.5 == 2.0
+        assert math.isclose(obj.get_f64("score"), 2.0), f"score mismatch: {obj.get_f64('score')}"
+        # active: index 4 is even → True
+        assert obj.get_bool("active") is True, f"active mismatch: {obj.get_bool('active')}"
+
+    def columnar_record_count_large():
+        r = NxsReader(_build_columnar_nxb(100))
+        assert r.record_count == 100
+
+    case("columnar: opens without error",           columnar_opens)
+    case("columnar: schema keys present",           columnar_keys)
+    case("columnar: record(4) field values correct", columnar_record_values)
+    case("columnar: record_count == 100",           columnar_record_count_large)
+
     print(f"\n{passed} passed, {failed} failed\n")
     return 0 if failed == 0 else 1
 
