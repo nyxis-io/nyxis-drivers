@@ -62,8 +62,8 @@ mavenPublishing {
         url.set("https://github.com/nyxis-io/nyxis-drivers")
         licenses {
             license {
-                name.set("Business Source License 1.1")
-                url.set("https://spdx.org/licenses/BUSL-1.1.html")
+                name.set("MIT License")
+                url.set("https://spdx.org/licenses/MIT.html")
             }
         }
         developers {
