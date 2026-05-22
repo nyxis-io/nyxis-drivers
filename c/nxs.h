@@ -84,8 +84,10 @@ typedef struct {
 // The buffer must remain valid for the lifetime of the reader.
 nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size);
 
-// Release any resources held by the reader (currently a no-op; provided
-// for API symmetry with implementations that allocate).
+// Release any resources held by the reader.
+// Frees the PAX page-table arrays (page_index, page_rec_start, page_rec_count,
+// page_offset, page_length) allocated by nxs_open for PAX-layout files.
+// Safe to call on row and columnar readers (no-op when no pages were allocated).
 void nxs_close(nxs_reader_t *r);
 
 // Total number of top-level records.
@@ -218,7 +220,7 @@ const uint8_t* nxs_col_null_bitmap(const nxs_reader_t *r, const char *field, siz
 /**
  * Zero-copy string (`"`) or binary (`<`) column in columnar/PAX layout.
  * `bitmap`: null bitmap; `offsets`: (N+1)×4 u32 LE; `values`: concatenated payload.
- * Returns NXS_ERR_LAYOUT on row layout, NXS_ERR_UNSUPPORTED_TYPE on numeric fields.
+ * Returns NXS_ERR_UNSUPPORTED on row or PAX layout, NXS_ERR_UNSUPPORTED_TYPE on numeric fields.
  */
 nxs_err_t nxs_col_var_buffer(const nxs_reader_t *r, const char *field,
                              const uint8_t **bitmap, size_t *bitmap_len,
