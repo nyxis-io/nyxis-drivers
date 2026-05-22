@@ -396,8 +396,8 @@ export class NxsWriter {
         } else if (typeof val === "bigint") {
           w.writeI64(i, val);
         } else if (typeof val === "number") {
-          if (Number.isInteger(val) && Math.abs(val) < Number.MAX_SAFE_INTEGER) {
-            w.writeF64(i, val);
+          if (Number.isSafeInteger(val)) {
+            w.writeI64(i, val);
           } else {
             w.writeF64(i, val);
           }
