@@ -298,7 +298,7 @@ def build_columnar_nxb(n)
   schema = [keys.length].pack('v')
   sigils.each { |sg| schema << sg.chr }
   keys.each   { |k|  schema << k.b << "\x00".b }
-  schema << "\x00".b until schema.bytesize % 8 == 0
+  schema << "\x00".b until (schema.bytesize % 8).zero?
 
   # DictHash via MurmurHash3-64
   h = 0x93681D6255313A99
@@ -307,11 +307,17 @@ def build_columnar_nxb(n)
   while i < ln
     k = 0
     8.times { |b| k |= schema.getbyte(i + b) << (b * 8) if i + b < ln }
-    k = (k * c1) & mask64; k ^= k >> 33
-    h ^= k; h = (h * c2) & mask64; h ^= h >> 33
+    k = (k * c1) & mask64
+    k ^= k >> 33
+    h ^= k
+    h = (h * c2) & mask64
+    h ^= h >> 33
     i += 8
   end
-  h ^= ln; h ^= h >> 33; h = (h * c1) & mask64; h ^= h >> 33
+  h ^= ln
+  h ^= h >> 33
+  h = (h * c1) & mask64
+  h ^= h >> 33
   dict_hash_le = [h & 0xFFFFFFFF, (h >> 32) & 0xFFFFFFFF].pack('VV')
 
   # Dense null bitmap: all n bits set, padded to 8-byte boundary
@@ -359,7 +365,7 @@ def build_columnar_nxb(n)
   out << [version, flags].pack('vv')
   out << dict_hash_le
   out << [tail_index_off & 0xFFFFFFFF, (tail_index_off >> 32) & 0xFFFFFFFF].pack('VV')
-  out << "\x00".b * 8  # reserved
+  out << ("\x00".b * 8) # reserved
   out << schema << col_data << tail
 end
 
