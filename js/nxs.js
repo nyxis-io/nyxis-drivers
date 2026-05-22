@@ -432,7 +432,7 @@ export class NxsReader {
     if (poff + 24 > this.bytes.length) return null;
     if (this.view.getUint32(poff, true) !== MAGIC_PAGE) return null;
     const fieldCount = this.view.getUint16(poff + 20, true);
-    if (slot < 0 || slot >= fieldCount) return null;
+    if (slot < 0 || slot >= fieldCount || fieldCount > this.keySigils.length) return null;
     const rc = this._pageRecCount[pageIndex];
     let body = poff + 24;
     for (let fi = 0; fi < slot; fi++) {
@@ -1170,7 +1170,7 @@ export class NxsPaxStreamReader {
     if (poff + 24 > this.bytes.length) return null;
     if (rdU32(this.bytes, poff) !== MAGIC_PAGE) return null;
     const fieldCount = this.view.getUint16(poff + 20, true);
-    if (slot < 0 || slot >= fieldCount) return null;
+    if (slot < 0 || slot >= fieldCount || fieldCount > this.keySigils.length) return null;
     const rc = this._pageRecCount[pageIndex];
     let body = poff + 24;
     for (let fi = 0; fi < slot; fi++) {
@@ -1489,6 +1489,15 @@ export class NxsObject {
     this._stage = 0; // 0 = untouched, 1 = offset-table located, 2 = rank cached
   }
 
+  /** Top-level columnar/PAX record vs nested NYXO blob inside a columnar file. */
+  _usesColumnarFieldAccess() {
+    const r = this.reader;
+    if (r._layout !== "columnar" && r._layout !== "pax") return false;
+    if (this.recordIndex == null) return false;
+    if (this.offset + 4 > r.bytes.length) return false;
+    return rdU32(r.bytes, this.offset) !== MAGIC_OBJ;
+  }
+
   /**
    * Stage 1: walk LEB128 bitmask only far enough to locate the offset table
    * start. No allocations. This is enough for single-field access.
@@ -1675,8 +1684,8 @@ export class NxsObject {
   getI64BySlot(slot) {
     if (slot === undefined) return undefined;
     const r = this.reader;
-    if (r._layout === "columnar" || r._layout === "pax") {
-      const ri = this.recordIndex ?? this.offset;
+    if (this._usesColumnarFieldAccess()) {
+      const ri = this.recordIndex;
       const cell = r._colNumericBytes(ri, slot);
       if (!cell) return undefined;
       return rdI64Safe(cell, 0);
@@ -1689,8 +1698,8 @@ export class NxsObject {
   getF64BySlot(slot) {
     if (slot === undefined) return undefined;
     const r = this.reader;
-    if (r._layout === "columnar" || r._layout === "pax") {
-      const ri = this.recordIndex ?? this.offset;
+    if (this._usesColumnarFieldAccess()) {
+      const ri = this.recordIndex;
       const cell = r._colNumericBytes(ri, slot);
       if (!cell) return undefined;
       return rdF64(cell, 0);
@@ -1703,8 +1712,8 @@ export class NxsObject {
   getBoolBySlot(slot) {
     if (slot === undefined) return undefined;
     const r = this.reader;
-    if (r._layout === "columnar" || r._layout === "pax") {
-      const ri = this.recordIndex ?? this.offset;
+    if (this._usesColumnarFieldAccess()) {
+      const ri = this.recordIndex;
       const cell = r._colNumericBytes(ri, slot);
       if (!cell) return undefined;
       return cell[0] !== 0;
@@ -1717,9 +1726,8 @@ export class NxsObject {
   getStrBySlot(slot) {
     if (slot === undefined) return undefined;
     const r = this.reader;
-    if (r._layout === "columnar" || r._layout === "pax") {
-      const ri = this.recordIndex ?? this.offset;
-      return r.colGetStr(r.keys[slot], ri);
+    if (this._usesColumnarFieldAccess()) {
+      return r.colGetStr(r.keys[slot], this.recordIndex);
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
@@ -1730,9 +1738,8 @@ export class NxsObject {
   getBinaryBySlot(slot) {
     if (slot === undefined) return undefined;
     const r = this.reader;
-    if (r._layout === "columnar" || r._layout === "pax") {
-      const ri = this.recordIndex ?? this.offset;
-      return r.colGetBinary(r.keys[slot], ri);
+    if (this._usesColumnarFieldAccess()) {
+      return r.colGetBinary(r.keys[slot], this.recordIndex);
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;

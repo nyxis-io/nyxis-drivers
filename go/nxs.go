@@ -337,6 +337,16 @@ func (o *Object) resolveSlot(slot int) int {
 
 // ── Typed accessors ──────────────────────────────────────────────────────────
 
+func (o *Object) usesColumnarFieldAccess() bool {
+	if o.reader.layout == LayoutRow {
+		return false
+	}
+	if o.offset+4 > len(o.reader.data) {
+		return false
+	}
+	return binary.LittleEndian.Uint32(o.reader.data[o.offset:]) != magicObj
+}
+
 func (o *Object) GetI64(key string) (int64, bool) {
 	slot, ok := o.reader.keyIndex[key]
 	if !ok {
@@ -370,7 +380,7 @@ func (o *Object) GetStr(key string) (string, bool) {
 }
 
 func (o *Object) GetI64BySlot(slot int) (int64, bool) {
-	if o.reader.layout != LayoutRow {
+	if o.usesColumnarFieldAccess() {
 		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
 		if !ok {
 			return 0, false
@@ -385,7 +395,7 @@ func (o *Object) GetI64BySlot(slot int) (int64, bool) {
 }
 
 func (o *Object) GetF64BySlot(slot int) (float64, bool) {
-	if o.reader.layout != LayoutRow {
+	if o.usesColumnarFieldAccess() {
 		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
 		if !ok {
 			return 0, false
@@ -400,7 +410,7 @@ func (o *Object) GetF64BySlot(slot int) (float64, bool) {
 }
 
 func (o *Object) GetBoolBySlot(slot int) (bool, bool) {
-	if o.reader.layout != LayoutRow {
+	if o.usesColumnarFieldAccess() {
 		cell, ok := o.reader.colNumericBytes(o.recordIndex, slot)
 		if !ok {
 			return false, false
@@ -415,7 +425,7 @@ func (o *Object) GetBoolBySlot(slot int) (bool, bool) {
 }
 
 func (o *Object) GetStrBySlot(slot int) (string, bool) {
-	if o.reader.layout != LayoutRow {
+	if o.usesColumnarFieldAccess() {
 		if slot < 0 || slot >= len(o.reader.KeySigils) || o.reader.KeySigils[slot] != '"' {
 			return "", false
 		}
