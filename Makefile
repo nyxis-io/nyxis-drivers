@@ -78,7 +78,7 @@ test-ruby:
 
 test-ruby-ci: test-ruby
 	bash ruby/ext/build.sh
-	ruby ruby/bench_c.rb $(abspath $(FIXTURE_OUT))
+	ruby ruby/test_c_ext.rb $(abspath $(FIXTURE_OUT))
 
 lint-php:
 	@command -v composer >/dev/null 2>&1 || { echo "Install Composer: https://getcomposer.org/" >&2; exit 1; }

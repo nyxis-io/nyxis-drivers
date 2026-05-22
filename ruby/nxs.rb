@@ -255,6 +255,8 @@ module Nxs
       t_idx = 0
 
       loop do
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'bitmask overrun on corrupt input') if p >= data.bytesize
+
         b    = data.getbyte(p)
         p   += 1
         bits = b & 0x7F
