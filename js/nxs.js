@@ -1093,15 +1093,27 @@ export class NxsReader {
 
 // ── PAX streaming reader (OLAP.md §4.5) ────────────────────────────────────
 
-/** Returns 8-byte-aligned page length when NXSP page at `off` is complete, else 0. */
-export function paxCompletePageAt(bytes, off, fieldCount) {
+/**
+ * Returns 8-byte-aligned page length when NXSP page at `off` is complete, else 0.
+ * @param {Uint8Array} bytes
+ * @param {number} off - byte offset of the page start
+ * @param {number} fieldCount - number of columns
+ * @param {ArrayLike<number>} sigils - per-field sigil bytes (length >= fieldCount)
+ */
+export function paxCompletePageAt(bytes, off, fieldCount, sigils) {
   if (off + 28 > bytes.length || fieldCount === 0) return 0;
   if (rdU32(bytes, off) !== MAGIC_PAGE) return 0;
   const rc = rdU32(bytes, off + 16);
-  const rawBm = (rc + 7) >> 3;
-  const alignedBm = (rawBm + 7) & ~7;
-  const fieldStride = alignedBm + rc * 8;
-  const pageLen = 24 + fieldCount * fieldStride + 4;
+  // Walk each field sector to compute the true page body length.
+  let body = off + 24;
+  for (let fi = 0; fi < fieldCount; fi++) {
+    const sig = (sigils && fi < sigils.length) ? sigils[fi] : SIGIL_INT;
+    const flen = fieldSectorLen(bytes, body, rc, sig);
+    if (flen < 0) return 0;
+    body += flen;
+  }
+  // body now points to the 4-byte page-length trailer.
+  const pageLen = body - off + 4;
   const aligned = (pageLen + 7) & ~7;
   if (off + pageLen > bytes.length) return 0;
   if (rdU32(bytes, off + pageLen - 4) !== pageLen) return 0;
@@ -1156,7 +1168,7 @@ export class NxsPaxStreamReader {
 
   completePageAt(off) {
     if (!this._headerParsed) return 0;
-    return paxCompletePageAt(this.bytes, off, this.keys.length);
+    return paxCompletePageAt(this.bytes, off, this.keys.length, this.keySigils);
   }
 
   colSumF64(key) {
@@ -1223,18 +1235,16 @@ export class NxsPaxStreamReader {
     const fc = this.keys.length;
     while (this._scanCursor + 28 <= this.bytes.length) {
       if (rdU32(this.bytes, this._scanCursor) !== MAGIC_PAGE) break;
-      const plen = paxCompletePageAt(this.bytes, this._scanCursor, fc);
+      const plen = paxCompletePageAt(this.bytes, this._scanCursor, fc, this.keySigils);
       if (plen === 0) break;
       const pidx = rdU32(this.bytes, this._scanCursor + 4);
       const rstart = Number(this.view.getBigUint64(this._scanCursor + 8, true));
       const rc = rdU32(this.bytes, this._scanCursor + 16);
-      const fieldStride = this._nullBitmapBytes(rc) + rc * 8;
-      const pageLen = 24 + fc * fieldStride + 4;
       this._pageIndex.push(pidx);
       this._pageRecStart.push(rstart);
       this._pageRecCount.push(rc);
       this._pageOffset.push(this._scanCursor);
-      this._pageLength.push(pageLen);
+      this._pageLength.push(plen);
       this.pageCount++;
       this.recordsAvailable += rc;
       this.onPage?.(this.pageCount - 1, rc);

@@ -464,7 +464,8 @@ test("PAX stream — first complete page before seal", () => {
     dataStart++;
   }
   dataStart = (dataStart + 7) & ~7;
-  const plen = paxCompletePageAt(full, dataStart, kc);
+  const sigils = full.subarray(34, 34 + kc);
+  const plen = paxCompletePageAt(full, dataStart, kc, sigils);
   if (!plen) throw new Error("first page not complete in conformance vector");
   const partial = full.slice(0, dataStart + plen);
   new DataView(partial.buffer, partial.byteOffset, partial.byteLength).setBigUint64(16, 0n, true);
