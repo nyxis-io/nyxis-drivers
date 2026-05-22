@@ -62,8 +62,11 @@ static int pax_page_sizes(uint32_t rc, uint16_t field_count,
                             size_t *body_out, size_t *page_len_out) {
     if (field_count == 0 || field_count > NXS_MAX_KEYS) return 1;
     size_t bl = null_bitmap_bytes(rc);
+    size_t cells;
     size_t field_stride;
-    if (size_add_overflow(bl, (size_t)rc * 8u, &field_stride)) return 1;
+    if (size_mul_overflow((size_t)rc, 8u, &cells) ||
+        size_add_overflow(bl, cells, &field_stride))
+        return 1;
     size_t fields;
     if (size_mul_overflow(field_stride, (size_t)field_count, &fields)) return 1;
     size_t body;
@@ -444,14 +447,19 @@ static nxs_err_t pax_page_field_parts_at(const uint8_t *data, size_t size,
     if (slot < 0 || slot >= (int)fc) return NXS_ERR_OUT_OF_BOUNDS;
     if (fc > (uint16_t)NXS_MAX_KEYS) return NXS_ERR_OUT_OF_BOUNDS;
     size_t bl = null_bitmap_bytes(rc);
+    size_t cells;
     size_t field_stride;
-    if (size_add_overflow(bl, (size_t)rc * 8u, &field_stride)) return NXS_ERR_OUT_OF_BOUNDS;
+    if (size_mul_overflow((size_t)rc, 8u, &cells) ||
+        size_add_overflow(bl, cells, &field_stride))
+        return NXS_ERR_OUT_OF_BOUNDS;
     size_t skip;
     if (size_mul_overflow(field_stride, (size_t)slot, &skip)) return NXS_ERR_OUT_OF_BOUNDS;
     size_t body;
     if (size_add_overflow(poff + 24, skip, &body)) return NXS_ERR_OUT_OF_BOUNDS;
+    size_t val_bytes;
     size_t end;
-    if (size_add_overflow(body + bl, (size_t)rc * 8u, &end) || end > size)
+    if (size_mul_overflow((size_t)rc, 8u, &val_bytes) ||
+        size_add_overflow(body + bl, val_bytes, &end) || end > size)
         return NXS_ERR_OUT_OF_BOUNDS;
     *bm = data + body;
     *bm_len = bl;

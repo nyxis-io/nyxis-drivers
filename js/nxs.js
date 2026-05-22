@@ -1072,7 +1072,12 @@ export class NxsPaxStreamReader {
         this.bytes.length - tailOff < FOOTER_PAX_BYTES) {
       return false;
     }
-    this._loadSealedTail(tailOff);
+    try {
+      this._loadSealedTail(tailOff);
+    } catch (err) {
+      this.onError?.(err);
+      return false;
+    }
     this.sealed = true;
     this.onSealed?.();
     return true;
@@ -1089,14 +1094,15 @@ export class NxsPaxStreamReader {
     this._pageLength = [];
     for (let i = 0; i < this.pageCount; i++) {
       const e = tailOff + i * 28;
-      if (e + 28 > this.bytes.length) break;
+      if (e + 28 > this.bytes.length) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", "PAX tail entry incomplete");
+      }
       this._pageIndex.push(rdU32(this.bytes, e));
       this._pageRecStart.push(Number(this.view.getBigUint64(e + 4, true)));
       this._pageRecCount.push(rdU32(this.bytes, e + 12));
       this._pageOffset.push(Number(this.view.getBigUint64(e + 16, true)));
       this._pageLength.push(rdU32(this.bytes, e + 24));
     }
-    this.pageCount = this._pageIndex.length;
     this._scanCursor = this.bytes.length;
   }
 

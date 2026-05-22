@@ -8,6 +8,73 @@ import (
 
 const magicPage uint32 = 0x4E585350 // NXSP
 
+func addU64(a, b uint64) (uint64, bool) {
+	if a > math.MaxUint64-b {
+		return 0, false
+	}
+	return a + b, true
+}
+
+func mulU64(a, b uint64) (uint64, bool) {
+	if a != 0 && b > math.MaxUint64/a {
+		return 0, false
+	}
+	return a * b, true
+}
+
+func nullBitmapBytesU64(n uint32) uint64 {
+	raw := (uint64(n) + 7) / 8
+	return (raw + 7) &^ 7
+}
+
+// paxPageLenAligned returns wire page length and 8-byte-aligned span, or ok=false.
+func paxPageLenAligned(data []byte, off int, fieldCount uint16) (pageLen, aligned uint64, ok bool) {
+	if off < 0 || fieldCount == 0 || off+28 > len(data) {
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint32(data[off:]) != magicPage {
+		return 0, 0, false
+	}
+	rc := binary.LittleEndian.Uint32(data[off+16 : off+20])
+	bl := nullBitmapBytesU64(rc)
+	cells, ok := mulU64(uint64(rc), 8)
+	if !ok {
+		return 0, 0, false
+	}
+	stride, ok := addU64(bl, cells)
+	if !ok {
+		return 0, 0, false
+	}
+	fields, ok := mulU64(stride, uint64(fieldCount))
+	if !ok {
+		return 0, 0, false
+	}
+	body, ok := addU64(24, fields)
+	if !ok {
+		return 0, 0, false
+	}
+	pageLen, ok = addU64(body, 4)
+	if !ok {
+		return 0, 0, false
+	}
+	aligned = (pageLen + 7) &^ 7
+	if pageLen > uint64(len(data)) || aligned > uint64(len(data)) {
+		return 0, 0, false
+	}
+	if pageLen > uint64(math.MaxInt) || aligned > uint64(math.MaxInt) {
+		return 0, 0, false
+	}
+	plen := int(pageLen)
+	aln := int(aligned)
+	if off+plen > len(data) || off+aln > len(data) {
+		return 0, 0, false
+	}
+	if binary.LittleEndian.Uint32(data[off+plen-4:off+plen]) != uint32(pageLen) {
+		return 0, 0, false
+	}
+	return pageLen, aligned, true
+}
+
 // PaxStreamReader reads unsealed PAX streams (preamble TailPtr=0) by polling for
 // complete NXSP pages before the file footer is present (OLAP.md §4.5).
 type PaxStreamReader struct {
@@ -34,27 +101,11 @@ type PaxStreamReader struct {
 // PaxCompletePageAt returns the 8-byte-aligned length of a complete NXSP page at off,
 // or 0 if the page is not yet fully present. fieldCount must match the schema.
 func PaxCompletePageAt(data []byte, off int, fieldCount uint16) int {
-	if off+28 > len(data) || fieldCount == 0 {
+	_, aligned, ok := paxPageLenAligned(data, off, fieldCount)
+	if !ok {
 		return 0
 	}
-	if binary.LittleEndian.Uint32(data[off:]) != magicPage {
-		return 0
-	}
-	rc := binary.LittleEndian.Uint32(data[off+16 : off+20])
-	fieldStride := nullBitmapBytes(rc) + int(rc)*8
-	body := 24 + int(fieldCount)*fieldStride
-	pageLen := body + 4
-	aligned := (pageLen + 7) &^ 7
-	if off+pageLen > len(data) {
-		return 0
-	}
-	if binary.LittleEndian.Uint32(data[off+pageLen-4:off+pageLen]) != uint32(pageLen) {
-		return 0
-	}
-	if off+aligned > len(data) {
-		return 0
-	}
-	return aligned
+	return int(aligned)
 }
 
 // OpenPaxStream opens FLAG_PAX with preamble TailPtr=0 (growing / unsealed file).
@@ -134,7 +185,8 @@ func paxStreamDetectSealed(data []byte) (uint64, bool) {
 		return 0, false
 	}
 	tp := binary.LittleEndian.Uint64(data[len(data)-footerPaxBytes : len(data)-footerPaxBytes+8])
-	if tp == 0 || int(tp) >= len(data) || len(data)-int(tp) < footerPaxBytes {
+	dlen := uint64(len(data))
+	if tp == 0 || tp >= dlen || dlen-tp < uint64(footerPaxBytes) || tp > uint64(math.MaxInt) {
 		return 0, false
 	}
 	return tp, true
@@ -160,16 +212,18 @@ func (sr *PaxStreamReader) loadSealedTail(tailOff uint64) error {
 	sr.pageRecCount = make([]uint32, pc)
 	sr.pageOffset = make([]uint64, pc)
 	sr.pageLength = make([]uint32, pc)
+	dlen := uint64(len(sr.data))
 	for i := uint32(0); i < pc; i++ {
-		e := int(tailOff) + int(i)*paxTailEntryBytes
-		if e+paxTailEntryBytes > len(sr.data) {
+		e := tailOff + uint64(i)*uint64(paxTailEntryBytes)
+		if e > dlen || e+uint64(paxTailEntryBytes) > dlen || e > uint64(math.MaxInt) {
 			return fmt.Errorf("ERR_OUT_OF_BOUNDS: PAX tail entry")
 		}
-		sr.pageIndex[i] = binary.LittleEndian.Uint32(sr.data[e:])
-		sr.pageRecStart[i] = binary.LittleEndian.Uint64(sr.data[e+4 : e+12])
-		sr.pageRecCount[i] = binary.LittleEndian.Uint32(sr.data[e+12 : e+16])
-		sr.pageOffset[i] = binary.LittleEndian.Uint64(sr.data[e+16 : e+24])
-		sr.pageLength[i] = binary.LittleEndian.Uint32(sr.data[e+24 : e+28])
+		ee := int(e)
+		sr.pageIndex[i] = binary.LittleEndian.Uint32(sr.data[ee:])
+		sr.pageRecStart[i] = binary.LittleEndian.Uint64(sr.data[ee+4 : ee+12])
+		sr.pageRecCount[i] = binary.LittleEndian.Uint32(sr.data[ee+12 : ee+16])
+		sr.pageOffset[i] = binary.LittleEndian.Uint64(sr.data[ee+16 : ee+24])
+		sr.pageLength[i] = binary.LittleEndian.Uint32(sr.data[ee+24 : ee+28])
 		sr.recordsAvailable += uint64(sr.pageRecCount[i])
 	}
 	sr.pageCount = pc
@@ -200,13 +254,15 @@ func (sr *PaxStreamReader) Poll() uint32 {
 		pidx := binary.LittleEndian.Uint32(sr.data[sr.scanCursor+4:])
 		rstart := binary.LittleEndian.Uint64(sr.data[sr.scanCursor+8:])
 		rc := binary.LittleEndian.Uint32(sr.data[sr.scanCursor+16:])
-		fieldStride := nullBitmapBytes(rc) + int(rc)*8
-		pageLen := uint32(24 + int(fc)*fieldStride + 4)
+		pageLen, _, ok := paxPageLenAligned(sr.data, sr.scanCursor, fc)
+		if !ok {
+			break
+		}
 		sr.pageIndex = append(sr.pageIndex, pidx)
 		sr.pageRecStart = append(sr.pageRecStart, rstart)
 		sr.pageRecCount = append(sr.pageRecCount, rc)
 		sr.pageOffset = append(sr.pageOffset, uint64(sr.scanCursor))
-		sr.pageLength = append(sr.pageLength, pageLen)
+		sr.pageLength = append(sr.pageLength, uint32(pageLen))
 		sr.pageCount++
 		sr.recordsAvailable += uint64(rc)
 		sr.scanCursor += plen
@@ -246,20 +302,46 @@ func (sr *PaxStreamReader) ColSumF64(key string) float64 {
 }
 
 func (sr *PaxStreamReader) streamPageFieldParts(pi uint32, slot int) ([]byte, []byte, bool) {
-	poff := int(sr.pageOffset[pi])
-	if poff+24 > len(sr.data) || binary.LittleEndian.Uint32(sr.data[poff:]) != magicPage {
+	poff64 := sr.pageOffset[pi]
+	dlen := uint64(len(sr.data))
+	if poff64 > dlen || poff64+24 > dlen || poff64 > uint64(math.MaxInt) {
+		return nil, nil, false
+	}
+	poff := int(poff64)
+	if binary.LittleEndian.Uint32(sr.data[poff:]) != magicPage {
 		return nil, nil, false
 	}
 	fc := int(binary.LittleEndian.Uint16(sr.data[poff+20 : poff+22]))
 	if slot < 0 || slot >= fc {
 		return nil, nil, false
 	}
-	rc := int(sr.pageRecCount[pi])
-	bmLen := nullBitmapBytes(sr.pageRecCount[pi])
-	fieldStride := bmLen + rc*8
-	body := poff + 24 + slot*fieldStride
-	if body+bmLen+rc*8 > len(sr.data) {
+	rc := sr.pageRecCount[pi]
+	bl := nullBitmapBytesU64(rc)
+	cells, ok := mulU64(uint64(rc), 8)
+	if !ok {
 		return nil, nil, false
 	}
-	return sr.data[body : body+bmLen], sr.data[body+bmLen : body+bmLen+rc*8], true
+	stride, ok := addU64(bl, cells)
+	if !ok {
+		return nil, nil, false
+	}
+	skip, ok := mulU64(stride, uint64(slot))
+	if !ok {
+		return nil, nil, false
+	}
+	body, ok := addU64(uint64(poff)+24, skip)
+	if !ok {
+		return nil, nil, false
+	}
+	mid, ok := addU64(body, bl)
+	if !ok {
+		return nil, nil, false
+	}
+	end, ok := addU64(mid, cells)
+	if !ok || end > dlen || end > uint64(math.MaxInt) {
+		return nil, nil, false
+	}
+	bodyI := int(body)
+	endI := int(end)
+	return sr.data[bodyI : bodyI+int(bl)], sr.data[bodyI+int(bl) : endI], true
 }

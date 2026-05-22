@@ -244,7 +244,8 @@ func TestPAXStreamIncremental(t *testing.T) {
 	// Truncate after first complete page (256 records, page_size=256).
 	dataStart := paxDataStart(t, data)
 	off := dataStart
-	plen := PaxCompletePageAt(data, off, 4)
+	fieldCount := binary.LittleEndian.Uint16(data[32:34])
+	plen := PaxCompletePageAt(data, off, fieldCount)
 	if plen == 0 {
 		t.Fatal("first page not complete in sealed vector")
 	}
