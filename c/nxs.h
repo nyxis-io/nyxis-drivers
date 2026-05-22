@@ -215,6 +215,16 @@ int64_t nxs_col_sum_i64(const nxs_reader_t *r, const char *field);
 const void*   nxs_col_buffer(const nxs_reader_t *r, const char *field, size_t *out_len);
 const uint8_t* nxs_col_null_bitmap(const nxs_reader_t *r, const char *field, size_t *out_len);
 
+/**
+ * Zero-copy string (`"`) or binary (`<`) column in columnar/PAX layout.
+ * `bitmap`: null bitmap; `offsets`: (N+1)×4 u32 LE; `values`: concatenated payload.
+ * Returns NXS_ERR_LAYOUT on row layout, NXS_ERR_UNSUPPORTED_TYPE on numeric fields.
+ */
+nxs_err_t nxs_col_var_buffer(const nxs_reader_t *r, const char *field,
+                             const uint8_t **bitmap, size_t *bitmap_len,
+                             const uint8_t **offsets, size_t *offsets_len,
+                             const uint8_t **values, size_t *values_len);
+
 typedef struct nxs_page nxs_page_t;
 struct nxs_page {
     const nxs_reader_t *reader;

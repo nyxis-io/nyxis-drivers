@@ -951,6 +951,7 @@ int64_t nxs_col_sum_i64(const nxs_reader_t *r, const char *field) {
 const void* nxs_col_buffer(const nxs_reader_t *r, const char *field, size_t *out_len) {
     int slot = nxs_slot(r, field);
     if (slot < 0 || r->layout == NXS_LAYOUT_ROW) { *out_len = 0; return NULL; }
+    if (col_is_var_sigil(r->key_sigils[slot])) { *out_len = 0; return NULL; }
     const uint8_t *bm, *vals;
     size_t bm_len, val_len;
     if (col_field_parts(r, slot, &bm, &bm_len, &vals, &val_len) != NXS_OK) {
@@ -971,6 +972,23 @@ const uint8_t* nxs_col_null_bitmap(const nxs_reader_t *r, const char *field, siz
     (void)vals;
     *out_len = bm_len;
     return bm;
+}
+
+nxs_err_t nxs_col_var_buffer(const nxs_reader_t *r, const char *field,
+                             const uint8_t **bitmap, size_t *bitmap_len,
+                             const uint8_t **offsets, size_t *offsets_len,
+                             const uint8_t **values, size_t *values_len) {
+    if (!bitmap || !bitmap_len || !offsets || !offsets_len || !values || !values_len)
+        return NXS_ERR_OUT_OF_BOUNDS;
+    *bitmap = NULL; *bitmap_len = 0;
+    *offsets = NULL; *offsets_len = 0;
+    *values = NULL; *values_len = 0;
+    if (!r || r->layout == NXS_LAYOUT_ROW) return NXS_ERR_UNSUPPORTED;
+    if (r->layout == NXS_LAYOUT_PAX) return NXS_ERR_UNSUPPORTED;
+    int slot = nxs_slot(r, field);
+    if (slot < 0) return NXS_ERR_KEY_NOT_FOUND;
+    if (!col_is_var_sigil(r->key_sigils[slot])) return NXS_ERR_UNSUPPORTED_TYPE;
+    return col_var_parts(r, slot, bitmap, bitmap_len, offsets, offsets_len, values, values_len);
 }
 
 nxs_page_t* nxs_page_first(const nxs_reader_t *r) {

@@ -487,6 +487,11 @@ test("columnar layout — colGetStr strings (conformance vector)", () => {
   assertEq(r.colGetStr("name", 0), "user_0", "name record 0");
   assertEq(r.colGetStr("name", 42), "user_42", "name record 42");
   assertEq(r.record(42).getStr("name"), "user_42", "Record.getStr name 42");
+  const vb = r.colVarBuffer("name");
+  assertEq(vb.count, 100, "colVarBuffer count");
+  assertEq(vb.offsets.length, 101 * 4, "colVarBuffer offsets");
+  const s0 = new TextDecoder().decode(vb.values.subarray(0, 6));
+  assertEq(s0, "user_0", "colVarBuffer values slice");
 });
 
 test("PAX layout — colGetStr strings across pages (conformance vector)", () => {

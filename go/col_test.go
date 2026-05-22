@@ -331,6 +331,20 @@ func TestColumnarStringsConformance(t *testing.T) {
 	if !ok || got != "user_42" {
 		t.Fatalf("Record(42).GetStr(name): %q ok=%v", got, ok)
 	}
+	cv, err := r.ColVarBuffer("name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cv.Count != 100 {
+		t.Fatalf("ColVarBuffer count: %d", cv.Count)
+	}
+	if len(cv.Offsets) != 101*4 {
+		t.Fatalf("offsets len: %d", len(cv.Offsets))
+	}
+	v0, vok := VarStrAt(cv.Offsets, cv.Values, 0)
+	if !vok || v0 != "user_0" {
+		t.Fatalf("VarStrAt(0): %q ok=%v", v0, vok)
+	}
 }
 
 func TestPAXStringsConformance(t *testing.T) {
