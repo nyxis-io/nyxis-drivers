@@ -77,14 +77,26 @@ private struct Frame {
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
+// ── Sigil constants ────────────────────────────────────────────────────────────
+
+private let SIGIL_STR:    UInt8 = 0x22 // '"' — string / var-length
+private let SIGIL_I64:    UInt8 = 0x69 // 'i'
+private let SIGIL_F64:    UInt8 = 0x64 // 'd'
+private let SIGIL_BOOL:   UInt8 = 0x62 // 'b'
+private let SIGIL_NULL:   UInt8 = 0x6E // 'n'
+private let SIGIL_BINARY: UInt8 = 0x42 // 'B'
+
 public final class NXSWriter {
     private let schema: NXSSchema
     private var buf: [UInt8] = []
     private var frames: [Frame] = []
     private var recordOffsets: [Int] = []
+    // Sigil per slot: default str/var-length; updated on each typed write
+    private var slotSigils: [UInt8]
 
     public init(schema: NXSSchema) {
         self.schema = schema
+        self.slotSigils = [UInt8](repeating: SIGIL_STR, count: schema.count)
         buf.reserveCapacity(4096)
     }
 
@@ -165,31 +177,37 @@ public final class NXSWriter {
     // ── Typed write methods ────────────────────────────────────────────────────
 
     public func writeI64(slot: Int, value: Int64) {
+        slotSigils[slot] = SIGIL_I64
         markSlot(slot)
         appendI64(value)
     }
 
     public func writeF64(slot: Int, value: Double) {
+        slotSigils[slot] = SIGIL_F64
         markSlot(slot)
         appendF64(value)
     }
 
     public func writeBool(slot: Int, value: Bool) {
+        slotSigils[slot] = SIGIL_BOOL
         markSlot(slot)
         buf.append(value ? 0x01 : 0x00)
         buf.append(contentsOf: [UInt8](repeating: 0, count: 7))
     }
 
     public func writeTime(slot: Int, unixNs: Int64) {
+        slotSigils[slot] = SIGIL_I64
         writeI64(slot: slot, value: unixNs)
     }
 
     public func writeNull(slot: Int) {
+        slotSigils[slot] = SIGIL_NULL
         markSlot(slot)
         buf.append(contentsOf: [UInt8](repeating: 0, count: 8))
     }
 
     public func writeStr(slot: Int, value: String) {
+        slotSigils[slot] = SIGIL_STR
         markSlot(slot)
         let bytes = Array(value.utf8)
         appendU32(UInt32(bytes.count))
@@ -199,6 +217,7 @@ public final class NXSWriter {
     }
 
     public func writeBytes(slot: Int, value: [UInt8]) {
+        slotSigils[slot] = SIGIL_BINARY
         markSlot(slot)
         appendU32(UInt32(value.count))
         buf.append(contentsOf: value)
@@ -207,7 +226,7 @@ public final class NXSWriter {
     }
 
     public func writeListI64(slot: Int, values: [Int64]) {
-        markSlot(slot)
+        markSlot(slot) // list is var-length — keep SIGIL_STR default
         let total = 16 + values.count * 8
         appendU32(0x4E59584C)                  // NYXL
         appendU32(UInt32(total))
@@ -316,7 +335,7 @@ public final class NXSWriter {
         var p = 0
         b[p] = UInt8(n & 0xFF); p += 1
         b[p] = UInt8((n >> 8) & 0xFF); p += 1
-        for _ in 0..<n { b[p] = 0x22; p += 1 }
+        for i in 0..<n { b[p] = slotSigils[i]; p += 1 }
         for e in utf8 {
             for byte in e { b[p] = byte; p += 1 }
             b[p] = 0; p += 1

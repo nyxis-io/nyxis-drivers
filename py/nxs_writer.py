@@ -97,6 +97,16 @@ class _Frame:
 
 # ── Writer ────────────────────────────────────────────────────────────────────
 
+# ── Sigil constants ───────────────────────────────────────────────────────────
+
+SIGIL_STR    = 0x22  # '"' — string / var-length
+SIGIL_I64    = 0x69  # 'i'
+SIGIL_F64    = 0x64  # 'd'
+SIGIL_BOOL   = 0x62  # 'b'
+SIGIL_NULL   = 0x6E  # 'n'
+SIGIL_BINARY = 0x42  # 'B'
+
+
 class NxsWriter:
     """Slot-based .nxb emitter.
 
@@ -104,13 +114,15 @@ class NxsWriter:
     record; call ``finish()`` to get the complete file bytes.
     """
 
-    __slots__ = ("schema", "_buf", "_frames", "_record_offsets")
+    __slots__ = ("schema", "_buf", "_frames", "_record_offsets", "_slot_sigils")
 
     def __init__(self, schema: NxsSchema) -> None:
         self.schema = schema
         self._buf = bytearray()
         self._frames: List[_Frame] = []
         self._record_offsets: List[int] = []
+        # Sigil per slot: default str/var-length; updated on each typed write
+        self._slot_sigils: List[int] = [SIGIL_STR] * len(schema)
 
     # ── Object lifetime ──────────────────────────────────────────────────────
 
@@ -184,7 +196,7 @@ class NxsWriter:
         if self._frames:
             raise RuntimeError("unclosed objects")
 
-        schema_bytes = _build_schema(self.schema.keys)
+        schema_bytes = _build_schema(self.schema.keys, self._slot_sigils)
         dict_hash    = _murmur3_64(schema_bytes)
         data_start_abs = 32 + len(schema_bytes)
 
@@ -212,27 +224,33 @@ class NxsWriter:
     # ── Typed write methods ──────────────────────────────────────────────────
 
     def write_i64(self, slot: int, v: int) -> None:
+        self._slot_sigils[slot] = SIGIL_I64
         self._mark_slot(slot)
         self._buf += _I64.pack(v)
 
     def write_f64(self, slot: int, v: float) -> None:
+        self._slot_sigils[slot] = SIGIL_F64
         self._mark_slot(slot)
         self._buf += _F64.pack(v)
 
     def write_bool(self, slot: int, v: bool) -> None:
+        self._slot_sigils[slot] = SIGIL_BOOL
         self._mark_slot(slot)
         self._buf += bytes([0x01 if v else 0x00])
         self._buf += bytes(7)  # 7 padding bytes
 
     def write_time(self, slot: int, unix_ns: int) -> None:
+        self._slot_sigils[slot] = SIGIL_I64
         self._mark_slot(slot)
         self._buf += _I64.pack(unix_ns)
 
     def write_null(self, slot: int) -> None:
+        self._slot_sigils[slot] = SIGIL_NULL
         self._mark_slot(slot)
         self._buf += bytes(8)
 
     def write_str(self, slot: int, v: str) -> None:
+        self._slot_sigils[slot] = SIGIL_STR
         self._mark_slot(slot)
         b = v.encode("utf-8")
         self._buf += _U32.pack(len(b))
@@ -243,6 +261,7 @@ class NxsWriter:
             self._buf += bytes(8 - used)
 
     def write_bytes(self, slot: int, data: bytes) -> None:
+        self._slot_sigils[slot] = SIGIL_BINARY
         self._mark_slot(slot)
         self._buf += _U32.pack(len(data))
         self._buf += data
@@ -325,7 +344,7 @@ class NxsWriter:
 
 # ── Module-level helpers ──────────────────────────────────────────────────────
 
-def _build_schema(keys: List[str]) -> bytes:
+def _build_schema(keys: List[str], sigils: List[int]) -> bytes:
     """Build the binary Schema Header bytes (padded to 8-byte boundary)."""
     encoded = [k.encode("utf-8") for k in keys]
     n = len(keys)
@@ -337,8 +356,8 @@ def _build_schema(keys: List[str]) -> bytes:
     buf = bytearray(padded)
     p = 0
     _U16.pack_into(buf, p, n); p += 2
-    for _ in keys:
-        buf[p] = 0x22; p += 1  # '"' sigil
+    for i in range(n):
+        buf[p] = sigils[i]; p += 1
     for e in encoded:
         buf[p:p + len(e)] = e; p += len(e)
         buf[p] = 0x00;         p += 1

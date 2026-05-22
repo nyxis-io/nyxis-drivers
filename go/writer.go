@@ -62,6 +62,17 @@ type slotOff struct {
 	bufOff int
 }
 
+// ── Sigil constants ───────────────────────────────────────────────────────────
+
+const (
+	sigilStr    = 0x22 // '"' — string / var-length
+	sigilI64    = 0x69 // 'i'
+	sigilF64    = 0x64 // 'd'
+	sigilBool   = 0x62 // 'b'
+	sigilNull   = 0x6E // 'n'
+	sigilBinary = 0x42 // 'B'
+)
+
 // ── Writer ───────────────────────────────────────────────────────────────────
 
 // Writer emits .nxb binary data for a fixed Schema.
@@ -72,25 +83,36 @@ type Writer struct {
 	buf           []byte
 	frames        []frame
 	recordOffsets []int
+	slotSigils    []byte // sigil per schema slot, updated on first write
 }
 
 // NewWriter allocates a Writer backed by the given Schema.
 func NewWriter(schema *Schema) *Writer {
+	sigils := make([]byte, schema.Len())
+	for i := range sigils {
+		sigils[i] = sigilStr // default; overwritten on first typed write per slot
+	}
 	return &Writer{
 		schema:        schema,
 		buf:           make([]byte, 0, 4096),
 		frames:        make([]frame, 0, 4),
 		recordOffsets: make([]int, 0),
+		slotSigils:    sigils,
 	}
 }
 
 // NewWriterWithCapacity is like NewWriter but pre-allocates buf capacity.
 func NewWriterWithCapacity(schema *Schema, cap int) *Writer {
+	sigils := make([]byte, schema.Len())
+	for i := range sigils {
+		sigils[i] = sigilStr
+	}
 	return &Writer{
 		schema:        schema,
 		buf:           make([]byte, 0, cap),
 		frames:        make([]frame, 0, 4),
 		recordOffsets: make([]int, 0, 1024),
+		slotSigils:    sigils,
 	}
 }
 
@@ -102,6 +124,9 @@ func (w *Writer) Reset() {
 	w.buf = w.buf[:0]
 	w.frames = w.frames[:0]
 	w.recordOffsets = w.recordOffsets[:0]
+	for i := range w.slotSigils {
+		w.slotSigils[i] = sigilStr
+	}
 }
 
 // BeginObject opens a new object.  Must be balanced with EndObject.
@@ -192,7 +217,7 @@ func (w *Writer) Finish() []byte {
 		panic("nxs: Finish with unclosed objects")
 	}
 
-	schemaBytes := buildSchemaBytes(w.schema.Keys)
+	schemaBytes := buildSchemaBytes(w.schema.Keys, w.slotSigils)
 	dictHash := murmur3_64(schemaBytes)
 	dataStartAbs := uint64(32 + len(schemaBytes))
 
@@ -243,7 +268,14 @@ type StreamWriter struct {
 
 // NewStreamWriter creates a streaming writer and writes the v1.1 preamble plus schema.
 func NewStreamWriter(out io.Writer, schema *Schema) (*StreamWriter, error) {
-	schemaBytes := buildSchemaBytes(schema.Keys)
+	// StreamWriter builds schema bytes at construction time before any records are
+	// written, so it uses default sigils (all sigilStr). The sigils are updated in
+	// the inner Writer and flushed per-record, but the stream header is written once.
+	defaultSigils := make([]byte, schema.Len())
+	for i := range defaultSigils {
+		defaultSigils[i] = sigilStr
+	}
+	schemaBytes := buildSchemaBytes(schema.Keys, defaultSigils)
 	header := make([]byte, 32+len(schemaBytes))
 	p := 0
 	binary.LittleEndian.PutUint32(header[p:], magicFile)
@@ -350,17 +382,17 @@ func (sw *StreamWriter) Close() error {
 // ── Typed write methods ───────────────────────────────────────────────────────
 
 func (w *Writer) WriteI64(slot int, v int64) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilI64)
 	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
 }
 
 func (w *Writer) WriteF64(slot int, v float64) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilF64)
 	w.buf = binary.LittleEndian.AppendUint64(w.buf, math.Float64bits(v))
 }
 
 func (w *Writer) WriteBool(slot int, v bool) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilBool)
 	if v {
 		w.buf = append(w.buf, 0x01)
 	} else {
@@ -374,12 +406,12 @@ func (w *Writer) WriteTime(slot int, unixNs int64) {
 }
 
 func (w *Writer) WriteNull(slot int) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilNull)
 	w.buf = append(w.buf, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
 func (w *Writer) WriteStr(slot int, v string) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilStr)
 	b := []byte(v)
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(len(b)))
 	w.buf = append(w.buf, b...)
@@ -390,7 +422,7 @@ func (w *Writer) WriteStr(slot int, v string) {
 }
 
 func (w *Writer) WriteBytes(slot int, data []byte) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilBinary)
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(len(data)))
 	w.buf = append(w.buf, data...)
 	used := (4 + len(data)) % 8
@@ -400,7 +432,7 @@ func (w *Writer) WriteBytes(slot int, data []byte) {
 }
 
 func (w *Writer) WriteListI64(slot int, values []int64) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilStr) // list is var-length in the manifest
 	total := 16 + len(values)*8
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, magicList)
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(total))
@@ -413,7 +445,7 @@ func (w *Writer) WriteListI64(slot int, values []int64) {
 }
 
 func (w *Writer) WriteListF64(slot int, values []float64) {
-	w.markSlot(slot)
+	w.markSlot(slot, sigilStr) // list is var-length in the manifest
 	total := 16 + len(values)*8
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, magicList)
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(total))
@@ -467,7 +499,7 @@ func FromRecords(keys []string, records []map[string]interface{}) []byte {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-func (w *Writer) markSlot(slot int) {
+func (w *Writer) markSlot(slot int, sigil byte) {
 	if len(w.frames) == 0 {
 		panic("nxs: write outside BeginObject/EndObject")
 	}
@@ -476,6 +508,9 @@ func (w *Writer) markSlot(slot int) {
 	byteIdx := slot / 7
 	bitIdx := uint(slot % 7)
 	f.bitmask[byteIdx] |= 1 << bitIdx
+
+	// Record the sigil for this slot (last write wins, consistent within a schema)
+	w.slotSigils[slot] = sigil
 
 	rel := len(w.buf) - f.start
 
@@ -492,7 +527,7 @@ func (w *Writer) appendU32(v uint32) {
 	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
 }
 
-func buildSchemaBytes(keys []string) []byte {
+func buildSchemaBytes(keys []string, sigils []byte) []byte {
 	n := len(keys)
 	// Compute size: KeyCount(2) + TypeManifest(n) + null-terminated strings
 	size := 2 + n
@@ -508,9 +543,9 @@ func buildSchemaBytes(keys []string) []byte {
 	p := 0
 	binary.LittleEndian.PutUint16(buf[p:], uint16(n))
 	p += 2
-	for range keys {
-		buf[p] = 0x22
-		p++ // '"' sigil
+	for i := range keys {
+		buf[p] = sigils[i]
+		p++
 	}
 	for _, k := range keys {
 		copy(buf[p:], k)
