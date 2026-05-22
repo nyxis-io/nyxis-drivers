@@ -83,62 +83,10 @@ static PyTypeObject ReaderType;
 static PyTypeObject ObjectType;
 
 static int
-Reader_parse_schema_and_tail(ReaderObject *self)
-{
-    const uint8_t *data = self->data;
-    Py_ssize_t size = self->size;
-    Py_ssize_t p = 32;
-
-    if (self->schema_embedded) {
-        if (p + 2 > size) {
-            PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: schema header");
-            return -1;
-        }
-        uint16_t key_count = rd_u16(data + p);
-        p += 2;
-        p += key_count; /* skip TypeManifest */
-
-        self->keys = PyList_New(key_count);
-        self->key_index = PyDict_New();
-        if (!self->keys || !self->key_index) return -1;
-
-        for (uint16_t i = 0; i < key_count; i++) {
-            Py_ssize_t start = p;
-            while (p < size && data[p] != 0) p++;
-            if (p >= size) {
-                PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: string pool");
-                return -1;
-            }
-            PyObject *s = PyUnicode_DecodeUTF8((const char *)(data + start),
-                                                p - start, "strict");
-            if (!s) return -1;
-            PyList_SET_ITEM(self->keys, i, s); /* steals ref */
-
-            PyObject *idx = PyLong_FromLong(i);
-            if (!idx) return -1;
-            if (PyDict_SetItem(self->key_index, s, idx) < 0) {
-                Py_DECREF(idx);
-                return -1;
-            }
-            Py_DECREF(idx);
-            p++; /* skip null terminator */
-        }
-    }
-
-    /* Tail-index */
-    if ((Py_ssize_t)self->tail_ptr + 4 > size) {
-        PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: tail index");
-        return -1;
-    }
-    self->record_count = rd_u32(data + self->tail_ptr);
-    self->tail_start = self->tail_ptr + 4;
-    return 0;
-}
-
-static int
 Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
 {
     PyObject *buf_obj;
+    (void)kwds;
     if (!PyArg_ParseTuple(args, "O", &buf_obj)) return -1;
 
     if (PyObject_GetBuffer(buf_obj, &self->view, PyBUF_SIMPLE) < 0) return -1;
@@ -408,7 +356,7 @@ Object_get_str(ObjectView *self, PyObject *key)
         PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str len"); return NULL;
     }
     uint32_t n = rd_u32(self->reader->data + off);
-    if (off + 4 + n > (uint64_t)self->reader->size) {
+    if ((size_t)off + 4u + (size_t)n > (size_t)self->reader->size) {
         PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: str bytes"); return NULL;
     }
     return PyUnicode_DecodeUTF8((const char *)(self->reader->data + off + 4),
@@ -729,6 +677,7 @@ Reader_col_sum_f64(ReaderObject *self, PyObject *key)
 static PyObject *
 Reader_get_layout(ReaderObject *self, void *closure)
 {
+    (void)closure;
     const char *name = "row";
     if (self->has_nxs) {
         switch (self->nxs.layout) {
@@ -839,12 +788,14 @@ Reader_sum_i64(ReaderObject *self, PyObject *key)
 static PyObject *
 Reader_get_record_count(ReaderObject *self, void *closure)
 {
+    (void)closure;
     return PyLong_FromUnsignedLong(self->record_count);
 }
 
 static PyObject *
 Reader_get_keys(ReaderObject *self, void *closure)
 {
+    (void)closure;
     Py_INCREF(self->keys);
     return self->keys;
 }
@@ -869,7 +820,7 @@ static PyGetSetDef Reader_getset[] = {
     {"record_count", (getter)Reader_get_record_count, NULL, "Total top-level records.", NULL},
     {"keys",         (getter)Reader_get_keys,         NULL, "Schema keys.", NULL},
     {"layout",       (getter)Reader_get_layout,       NULL, "row | columnar | pax", NULL},
-    {NULL}
+    {NULL, NULL, NULL, NULL, NULL}
 };
 
 static PyTypeObject ReaderType = {
@@ -965,7 +916,7 @@ Schema_get_keys(SchemaObject *self, void *closure)
 
 static PyGetSetDef Schema_getset[] = {
     {"keys", (getter)Schema_get_keys, NULL, "Schema key list.", NULL},
-    {NULL}
+    {NULL, NULL, NULL, NULL, NULL}
 };
 
 static PyTypeObject SchemaType = {
