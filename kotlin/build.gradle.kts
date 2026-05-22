@@ -34,7 +34,7 @@ tasks.register<JavaExec>("conformance") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("nxs.ConformanceKt")
     val conformanceDir =
-        project.findProperty("conformanceDir") as String? ?: "../conformance/"
+        project.findProperty("conformanceDir") as String? ?: "../../nyxis/conformance/"
     args(conformanceDir)
 }
 

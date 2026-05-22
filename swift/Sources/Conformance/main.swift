@@ -213,20 +213,8 @@ func runNegative(dir: String, name: String, expectedCode: String) throws {
         _ = try NXSReader(data)
         throw ConformanceError.mismatch("expected error \(expectedCode) but reader succeeded")
     } catch let e as NXSError {
-        // Map NXSError to string error code
-        let code: String
-        // NXSError.badMagic is used for both bad magic AND dict mismatch in this impl
-        // We inspect the associated string to distinguish
-        let desc = "\(e)"
-        if desc.contains("DICT_MISMATCH") || desc.contains("hash mismatch") {
-            code = "ERR_DICT_MISMATCH"
-        } else if desc.contains("badMagic") || desc.contains("BAD_MAGIC") || desc.contains("preamble") || desc.contains("footer") || desc.contains("magic") {
-            code = "ERR_BAD_MAGIC"
-        } else {
-            code = "ERR_OUT_OF_BOUNDS"
-        }
-        guard code == expectedCode else {
-            throw ConformanceError.mismatch("expected error \(expectedCode), got \(code) (raw: \(e))")
+        guard e.code == expectedCode else {
+            throw ConformanceError.mismatch("expected error \(expectedCode), got \(e.code) (raw: \(e))")
         }
     }
 }
@@ -256,11 +244,6 @@ func runConformance() -> Int32 {
     var passed = 0, failed = 0
 
     for name in entries {
-        if name.hasPrefix("columnar_") || name.hasPrefix("pax_") {
-            print("  SKIP  \(name) (columnar/PAX not implemented)")
-            passed += 1
-            continue
-        }
         let jsonPath = "\(conformanceDir)/\(name).expected.json"
         guard let jsonData = fm.contents(atPath: jsonPath),
               let expected = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]

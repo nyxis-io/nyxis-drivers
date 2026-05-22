@@ -16,6 +16,24 @@ public enum NXSError: Error {
     case outOfBounds(String)
     case keyNotFound(String)
     case fieldAbsent(String)
+    case invalidFlags(String)
+    case incompatibleFlags(String)
+    case invalidPageMagic(String)
+
+    /// Conformance error code string (matches nyxis/conformance expected.json).
+    public var code: String {
+        switch self {
+        case .badMagic(let msg):
+            if msg.contains("DICT_MISMATCH") { return "ERR_DICT_MISMATCH" }
+            return "ERR_BAD_MAGIC"
+        case .outOfBounds: return "ERR_OUT_OF_BOUNDS"
+        case .keyNotFound: return "ERR_KEY_NOT_FOUND"
+        case .fieldAbsent: return "ERR_FIELD_ABSENT"
+        case .invalidFlags: return "ERR_INVALID_FLAGS"
+        case .incompatibleFlags: return "ERR_INCOMPATIBLE_FLAGS"
+        case .invalidPageMagic: return "ERR_INVALID_PAGE_MAGIC"
+        }
+    }
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -28,26 +46,27 @@ private let flagSchema: UInt16 = 0x0002
 
 // ── Little-endian helpers ─────────────────────────────────────────────────────
 
-private func rdU16(_ data: Data, _ off: Int) -> UInt16 {
+func rdU16(_ data: Data, _ off: Int) -> UInt16 {
     data[off..<(off+2)].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self) }.littleEndian
 }
-private func rdU32(_ data: Data, _ off: Int) -> UInt32 {
+func rdU32(_ data: Data, _ off: Int) -> UInt32 {
     data[off..<(off+4)].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian
 }
-private func rdU64(_ data: Data, _ off: Int) -> UInt64 {
+func rdU64(_ data: Data, _ off: Int) -> UInt64 {
     data[off..<(off+8)].withUnsafeBytes { $0.loadUnaligned(as: UInt64.self) }.littleEndian
 }
-private func rdI64(_ data: Data, _ off: Int) -> Int64 {
+func rdI64(_ data: Data, _ off: Int) -> Int64 {
     Int64(bitPattern: rdU64(data, off))
 }
-private func rdF64(_ data: Data, _ off: Int) -> Double {
+func rdF64(_ data: Data, _ off: Int) -> Double {
     Double(bitPattern: rdU64(data, off))
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
 public final class NXSReader {
-    private let data: Data
+    let data: Data
+    var col: ColLayoutState = ColLayoutState()
 
     public let version: UInt16
     public let flags: UInt16
@@ -55,9 +74,9 @@ public final class NXSReader {
     public let tailPtr: UInt64
     public let keys: [String]
     public let keySigils: [UInt8]
-    private let keyIndex: [String: Int]
-    public  let recordCount: Int
-    private let tailStart: Int
+    let keyIndex: [String: Int]
+    public var recordCount: Int { col.recordCount }
+    public var tailStart: Int { col.tailStart }
 
     public init(_ data: Data) throws {
         self.data = data
@@ -73,7 +92,7 @@ public final class NXSReader {
         if preambleTailPtr == 0 && size < 44 {
             throw NXSError.outOfBounds("stream footer")
         }
-        tailPtr  = preambleTailPtr != 0 ? preambleTailPtr : rdU64(data, size - 12)
+        var resolvedTailPtr = preambleTailPtr != 0 ? preambleTailPtr : rdU64(data, size - 12)
 
         var ks: [String] = []
         var kSigils: [UInt8] = []
@@ -107,10 +126,13 @@ public final class NXSReader {
         keySigils = kSigils
         keyIndex  = kIndex
 
-        let tp = Int(tailPtr)
-        guard tp + 4 <= size else { throw NXSError.outOfBounds("tail index") }
-        recordCount = Int(rdU32(data, tp))
-        tailStart   = tp + 4
+        col = try Self.parseLayoutTail(data: data, flags: flags, preambleTailPtr: preambleTailPtr, keyCount: ks.count)
+        if col.layout == .columnar {
+            resolvedTailPtr = rdU64(data, size - 20)
+        } else if col.layout == .pax {
+            resolvedTailPtr = rdU64(data, size - 28)
+        }
+        tailPtr = resolvedTailPtr
     }
 
     public func slot(_ key: String) throws -> Int {
@@ -122,14 +144,18 @@ public final class NXSReader {
         guard i >= 0 && i < recordCount else {
             throw NXSError.outOfBounds("record \(i) out of [0, \(recordCount))")
         }
+        if col.layout != .row {
+            return NYXObject(reader: self, offset: i, recordIndex: UInt32(i))
+        }
         let entryOff = tailStart + i * 10 + 2
         let absOff = Int(rdU64(data, entryOff))
-        return NYXObject(reader: self, offset: absOff)
+        return NYXObject(reader: self, offset: absOff, recordIndex: 0)
     }
 
     // ── Bulk reducers — operate on a raw pointer to avoid Data subscript overhead
 
     public func sumF64(_ key: String) throws -> Double {
+        if col.layout != .row { return try colSumF64(key: key) }
         let s = try slot(key)
         return data.withUnsafeBytes { ptr in
             let base = ptr.baseAddress!.assumingMemoryBound(to: UInt8.self)
@@ -292,13 +318,21 @@ private func nxsMurmur3_64(_ data: Data, _ off: Int, _ len: Int) -> UInt64 {
 public final class NYXObject {
     private let reader: NXSReader
     private let offset: Int
+    private let recordIndex: UInt32
     private var staged = false
     private var bitmaskStart      = 0
     private var offsetTableStart  = 0
 
-    init(reader: NXSReader, offset: Int) {
+    init(reader: NXSReader, offset: Int, recordIndex: UInt32) {
         self.reader = reader
         self.offset = offset
+        self.recordIndex = recordIndex
+    }
+
+    private func usesColumnarFieldAccess() -> Bool {
+        if reader.col.layout == .row { return false }
+        if offset + 4 > reader.data.count { return false }
+        return rdU32(reader.data, offset) != magicObj
     }
 
     private func locateBitmask() throws {
@@ -362,18 +396,45 @@ public final class NYXObject {
     }
 
     public func getI64BySlot(_ slot: Int) throws -> Int64 {
+        if usesColumnarFieldAccess() {
+            guard let cell = reader.colNumericBytes(rec: recordIndex, slot: slot) else {
+                throw NXSError.fieldAbsent("slot \(slot)")
+            }
+            return cell.withUnsafeBytes { $0.load(as: Int64.self).littleEndian }
+        }
         guard let off = try resolveSlot(slot) else { throw NXSError.fieldAbsent("slot \(slot)") }
         return rdI64(reader.rawData(), off)
     }
     public func getF64BySlot(_ slot: Int) throws -> Double {
+        if usesColumnarFieldAccess() {
+            guard let cell = reader.colNumericBytes(rec: recordIndex, slot: slot) else {
+                throw NXSError.fieldAbsent("slot \(slot)")
+            }
+            return cell.withUnsafeBytes { Double(bitPattern: $0.load(as: UInt64.self).littleEndian) }
+        }
         guard let off = try resolveSlot(slot) else { throw NXSError.fieldAbsent("slot \(slot)") }
         return rdF64(reader.rawData(), off)
     }
     public func getBoolBySlot(_ slot: Int) throws -> Bool {
+        if usesColumnarFieldAccess() {
+            guard let cell = reader.colNumericBytes(rec: recordIndex, slot: slot) else {
+                throw NXSError.fieldAbsent("slot \(slot)")
+            }
+            return cell[cell.startIndex] != 0
+        }
         guard let off = try resolveSlot(slot) else { throw NXSError.fieldAbsent("slot \(slot)") }
         return reader.rawData()[off] != 0
     }
     public func getStrBySlot(_ slot: Int) throws -> String {
+        if usesColumnarFieldAccess() {
+            let sigils = reader.kSigils()
+            guard slot >= 0 && slot < sigils.count && sigils[slot] == 0x22 else {
+                throw NXSError.fieldAbsent("slot \(slot)")
+            }
+            let (s, ok) = reader.colGetStr(key: reader.keys[slot], recordIndex: recordIndex)
+            guard ok else { throw NXSError.fieldAbsent("slot \(slot)") }
+            return s
+        }
         guard let off = try resolveSlot(slot) else { throw NXSError.fieldAbsent("slot \(slot)") }
         let data = reader.rawData()
         let len  = Int(rdU32(data, off))
