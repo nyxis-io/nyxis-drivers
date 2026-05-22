@@ -281,23 +281,21 @@ puts
 
 # Build a minimal dense columnar .nxb with fields: id (i64), score (f64), active (bool).
 def build_columnar_nxb(n)
-  require 'zlib' rescue nil  # not used, just defensive
-
-  magic_file   = 0x4E595842
+  magic_file = 0x4E595842
   magic_footer = 0x2153584E
-  flag_schema  = 0x0002
-  flag_col     = 0x0001
-  version      = 0x0101
-  mask64       = 0xFFFFFFFFFFFFFFFF
-  c1           = 0xFF51AFD7ED558CCD
-  c2           = 0xC4CEB9FE1A85EC53
+  flag_schema = 0x0002
+  flag_col = 0x0001
+  version = 0x0101
+  mask64 = 0xFFFFFFFFFFFFFFFF
+  c1 = 0xFF51AFD7ED558CCD
+  c2 = 0xC4CEB9FE1A85EC53
 
   # Schema: 3 keys with sigils '=' (i64), '~' (f64), '?' (bool)
-  keys   = %w[id score active]
+  keys = %w[id score active]
   sigils = [0x3D, 0x7E, 0x3F]
   schema = [keys.length].pack('v')
   sigils.each { |sg| schema << sg.chr }
-  keys.each   { |k|  schema << k.b << "\x00".b }
+  keys.each { |k| schema << k.b << "\x00".b }
   schema << "\x00".b until (schema.bytesize % 8).zero?
 
   # DictHash via MurmurHash3-64
@@ -334,11 +332,11 @@ def build_columnar_nxb(n)
 
   # active column: bm + n * 8-byte bool (even → true)
   ac_vals = (0...n).map { |idx| (idx.even? ? "\x01" : "\x00").b + "\x00".b * 7 }.join
-  ac_col  = bm + ac_vals
+  ac_col = bm + ac_vals
 
-  cols      = [id_col, sc_col, ac_col]
+  cols = [id_col, sc_col, ac_col]
   data_base = 32 + schema.bytesize
-  col_data  = String.new(encoding: 'BINARY')
+  col_data = String.new(encoding: 'BINARY')
   tail_entries = []
   cols.each do |col|
     tail_entries << [data_base + col_data.bytesize, col.bytesize]
