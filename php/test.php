@@ -211,6 +211,22 @@ $manyOk = true;
 foreach ($keys as $i => $k) { if ($rtm->record(0)->getI64($k) !== $i * 100) { $manyOk = false; break; } }
 check('writer many fields (multi-byte bitmask)', $manyOk);
 
+// null field read-back returns null
+$wnr = new Nxs\Writer(new Nxs\Schema(['x', 'y']));
+$wnr->beginObject(); $wnr->writeI64(0, 7); $wnr->writeNull(1); $wnr->endObject();
+$rtnr = new Nxs\Reader($wnr->finish());
+check('writer null field: null slot getI64 returns null', $rtnr->record(0)->getI64('y') === null);
+check('writer null field: null slot getStr returns null',  $rtnr->record(0)->getStr('y') === null);
+
+// f64 null round-trip
+$wfn = new Nxs\Writer(new Nxs\Schema(['val', 'tag']));
+$wfn->beginObject(); $wfn->writeF64(0, 3.14); $wfn->writeNull(1); $wfn->endObject();
+$wfn->beginObject(); $wfn->writeNull(0); $wfn->writeStr(1, 'hi'); $wfn->endObject();
+$rtfn = new Nxs\Reader($wfn->finish());
+check('writer f64 null: record(0).getF64 ≈ 3.14', abs((float)$rtfn->record(0)->getF64('val') - 3.14) < 1e-9);
+check('writer f64 null: record(1).getF64 returns null', $rtfn->record(1)->getF64('val') === null);
+check('writer f64 null: record(1).getStr("tag") == "hi"', $rtfn->record(1)->getStr('tag') === 'hi');
+
 // ── Security tests ───────────────────────────────────────────────────────────
 
 $badMagic = $nxbBytes;
