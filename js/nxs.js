@@ -723,6 +723,9 @@ export class NxsReader {
    * Attach a loaded WASM module to accelerate reducers. The reader copies its
    * bytes into WASM memory once; subsequent sumF64/minF64/maxF64 calls run
    * in WASM. If not called, those methods use the pure-JS implementation.
+   *
+   * The WASM module is loaded via `loadWasm()` from `./wasm.js`.
+   * See `./wasm/README.md` for build source, toolchain, and rebuild instructions.
    */
   useWasm(wasm) {
     this._wasm = wasm;
