@@ -12,8 +12,14 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-latest
+    env:
+      FIXTURE_OUT: ${{ github.workspace }}/nyxis/bench/fixtures
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-core
+        with:
+          token: ${{ secrets.NYXIS_CI_AUTOMATION_TOKEN }}
 
       - uses: actions/setup-go@v5
         with:
