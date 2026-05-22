@@ -34,7 +34,7 @@ jobs:
 
       - name: Publish
         working-directory: js
-        run: npm publish --access public
+        run: npm publish
 
       - name: Smoke test (install from registry)
         # Wait out npm's index propagation (can lag ~30-60s after publish).
