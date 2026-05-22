@@ -195,8 +195,9 @@ func VarStrAt(offsets []byte, values []byte, recordIndex uint32) (string, bool) 
 	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
 		return "", false
 	}
-	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
-	end := int(binary.LittleEndian.Uint32(offsets[recordIndex*4+4 : recordIndex*4+8]))
+	off := uint64(recordIndex) * 4
+	start := int(binary.LittleEndian.Uint32(offsets[off : off+4]))
+	end := int(binary.LittleEndian.Uint32(offsets[off+4 : off+8]))
 	if end < start || end > len(values) {
 		return "", false
 	}
@@ -207,8 +208,9 @@ func varBinaryAt(offsets []byte, values []byte, recordIndex uint32) ([]byte, boo
 	if uint64(len(offsets)) < (uint64(recordIndex)+2)*4 {
 		return nil, false
 	}
-	start := int(binary.LittleEndian.Uint32(offsets[recordIndex*4 : recordIndex*4+4]))
-	end := int(binary.LittleEndian.Uint32(offsets[recordIndex*4+4 : recordIndex*4+8]))
+	off := uint64(recordIndex) * 4
+	start := int(binary.LittleEndian.Uint32(offsets[off : off+4]))
+	end := int(binary.LittleEndian.Uint32(offsets[off+4 : off+8]))
 	if end < start || end > len(values) {
 		return nil, false
 	}
@@ -454,7 +456,7 @@ func (r *Reader) pageFieldSector(pi uint32, slot int) ([]byte, bool) {
 		return nil, false
 	}
 	fc := int(binary.LittleEndian.Uint16(r.data[poff+20 : poff+22]))
-	if slot < 0 || slot >= fc {
+	if slot < 0 || slot >= fc || fc > len(r.KeySigils) {
 		return nil, false
 	}
 	rc := r.pageRecCount[pi]

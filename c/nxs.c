@@ -138,6 +138,19 @@ static int col_is_var_sigil(uint8_t sig) {
     return sig == 0x22 || sig == 0x3c;
 }
 
+/* Top-level columnar/PAX records use logical indices; nested NYXO blobs use row paths. */
+static int obj_at_nyxo(const nxs_object_t *obj) {
+    const nxs_reader_t *r = obj->reader;
+    if (obj->offset + 4 > r->size) return 0;
+    return rd_u32(r->data + obj->offset) == MAGIC_OBJ;
+}
+
+static int obj_uses_columnar_field_access(const nxs_object_t *obj) {
+    const nxs_reader_t *r = obj->reader;
+    if (r->layout != NXS_LAYOUT_COLUMNAR && r->layout != NXS_LAYOUT_PAX) return 0;
+    return !obj_at_nyxo(obj);
+}
+
 static nxs_err_t col_var_parts(const nxs_reader_t *r, int slot,
                                const uint8_t **bitmap, size_t *bm_len,
                                const uint8_t **offsets, size_t *off_len,
@@ -739,7 +752,7 @@ static nxs_err_t col_get_numeric(const nxs_object_t *obj, int slot, int is_f64,
 }
 
 nxs_err_t nxs_get_i64_slot(nxs_object_t *obj, int slot, int64_t *out) {
-    if (obj->reader->layout != NXS_LAYOUT_ROW)
+    if (obj_uses_columnar_field_access(obj))
         return col_get_numeric(obj, slot, 0, out, NULL);
     int64_t off = nxs_resolve_slot(obj, slot);
     if (off < 0) return NXS_ERR_FIELD_ABSENT;
@@ -749,7 +762,7 @@ nxs_err_t nxs_get_i64_slot(nxs_object_t *obj, int slot, int64_t *out) {
 }
 
 nxs_err_t nxs_get_f64_slot(nxs_object_t *obj, int slot, double *out) {
-    if (obj->reader->layout != NXS_LAYOUT_ROW)
+    if (obj_uses_columnar_field_access(obj))
         return col_get_numeric(obj, slot, 1, NULL, out);
     int64_t off = nxs_resolve_slot(obj, slot);
     if (off < 0) return NXS_ERR_FIELD_ABSENT;
@@ -759,7 +772,7 @@ nxs_err_t nxs_get_f64_slot(nxs_object_t *obj, int slot, double *out) {
 }
 
 nxs_err_t nxs_get_bool_slot(nxs_object_t *obj, int slot, int *out) {
-    if (obj->reader->layout != NXS_LAYOUT_ROW) {
+    if (obj_uses_columnar_field_access(obj)) {
         int64_t v;
         nxs_err_t e = col_get_numeric(obj, slot, 0, &v, NULL);
         if (e != NXS_OK) return e;
@@ -776,10 +789,11 @@ nxs_err_t nxs_get_bool_slot(nxs_object_t *obj, int slot, int *out) {
 nxs_err_t nxs_get_str_slot(nxs_object_t *obj, int slot, char *buf, size_t buf_len) {
     if (slot < 0 || slot >= obj->reader->key_count) return NXS_ERR_KEY_NOT_FOUND;
     if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
-    if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
-        return col_get_str_columnar(obj, slot, buf, buf_len);
-    if (obj->reader->layout == NXS_LAYOUT_PAX)
+    if (obj_uses_columnar_field_access(obj)) {
+        if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
+            return col_get_str_columnar(obj, slot, buf, buf_len);
         return col_get_str_pax(obj, slot, buf, buf_len);
+    }
     int64_t off = nxs_resolve_slot(obj, slot);
     if (off < 0) return NXS_ERR_FIELD_ABSENT;
     const uint8_t *data = obj->reader->data;
@@ -810,10 +824,11 @@ nxs_err_t nxs_get_binary_slot(nxs_object_t *obj, int slot, uint8_t *buf, size_t 
                               size_t *out_len) {
     if (slot < 0 || slot >= obj->reader->key_count) return NXS_ERR_KEY_NOT_FOUND;
     if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
-    if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
-        return col_get_binary_columnar(obj, slot, buf, buf_len, out_len);
-    if (obj->reader->layout == NXS_LAYOUT_PAX)
+    if (obj_uses_columnar_field_access(obj)) {
+        if (obj->reader->layout == NXS_LAYOUT_COLUMNAR)
+            return col_get_binary_columnar(obj, slot, buf, buf_len, out_len);
         return col_get_binary_pax(obj, slot, buf, buf_len, out_len);
+    }
     int64_t off = nxs_resolve_slot(obj, slot);
     if (off < 0) return NXS_ERR_FIELD_ABSENT;
     const uint8_t *data = obj->reader->data;
