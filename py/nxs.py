@@ -174,6 +174,10 @@ class PageCache:
             if entry is not None:
                 entry["pinned"] = True
 
+    def unpin_all(self) -> None:
+        for entry in self.pages.values():
+            entry["pinned"] = False
+
     def stats(self) -> dict[str, int]:
         memory_used = sum(len(e["data"]) for e in self.pages.values())
         return {
@@ -392,6 +396,7 @@ class NxsReader:
             }
             if not missing:
                 self._page_cache.pin_pages(indices)
+                self._page_cache.unpin_all()
                 return
             ranges = _clamp_page_ranges(
                 coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
@@ -400,6 +405,7 @@ class NxsReader:
             for r in ranges:
                 self._fetch_coalesced_range(r)
             self._page_cache.pin_pages(indices)
+            self._page_cache.unpin_all()
 
     async def prefetch_viewport_async(self, start_index: int, end_index: int) -> None:
         """Async variant: parallel coalesced range fetches when fetch_range is async."""
@@ -420,15 +426,18 @@ class NxsReader:
             }
             if not missing:
                 self._page_cache.pin_pages(indices)
+                self._page_cache.unpin_all()
                 return
             ranges = _clamp_page_ranges(
                 coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
                 len(self.mv),
             )
-            await asyncio.gather(
-                *(self._fetch_coalesced_range_async(r) for r in ranges),
-            )
+        await asyncio.gather(
+            *(self._fetch_coalesced_range_async(r) for r in ranges),
+        )
+        with self._prefetch_lock:
             self._page_cache.pin_pages(indices)
+            self._page_cache.unpin_all()
 
     def _fetch_coalesced_range(self, page_range: dict[str, int]) -> None:
         blob = self._fetch_range_bytes(page_range["byte_start"], page_range["byte_length"])

@@ -55,7 +55,7 @@ func TestPrefetchViewportCoalesce(t *testing.T) {
 		WithCoalesceGapPages(1),
 		WithFetchRange(func(off, length int64) ([]byte, error) {
 			ranges = append(ranges, [2]int64{off, length})
-			return buf[off : off+length], nil
+			return sliceInt64(buf, off, length)
 		}),
 	)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestDedup(t *testing.T) {
 		WithFetchRange(func(off, length int64) ([]byte, error) {
 			calls.Add(1)
 			time.Sleep(5 * time.Millisecond)
-			return buf[off : off+length], nil
+			return sliceInt64(buf, off, length)
 		}),
 	)
 	if err != nil {

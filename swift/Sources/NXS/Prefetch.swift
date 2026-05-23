@@ -189,6 +189,14 @@ final class PageCache {
         }
     }
 
+    func unpinAll() {
+        for (idx, e) in pages {
+            var entry = e
+            entry.pinned = false
+            pages[idx] = entry
+        }
+    }
+
     func stats() -> (pagesCached: Int, memoryUsed: Int) {
         var memory = 0
         for e in pages.values { memory += e.data.count }
@@ -315,6 +323,7 @@ extension NXSReader {
         }
         if missingSet.isEmpty {
             prefetch.cache.pinPages(indices)
+            prefetch.cache.unpinAll()
             return
         }
 
@@ -327,6 +336,7 @@ extension NXSReader {
             try fetchCoalescedRange(pr)
         }
         prefetch.cache.pinPages(indices)
+        prefetch.cache.unpinAll()
     }
 
     private func fetchCoalescedRange(_ pr: PageRange) throws {

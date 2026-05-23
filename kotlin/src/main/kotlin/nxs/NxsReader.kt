@@ -59,7 +59,7 @@ class NxsReader
         private val fetchRange: (Long, Long) -> ByteArray =
             options.fetchRange ?: { off, len ->
                 val end = off + len
-                if (off < 0 || end > data.size) {
+                if (off < 0 || end > data.size.toLong()) {
                     throw NxsError("ERR_OUT_OF_BOUNDS", "fetch range [$off, $end)")
                 }
                 data.copyOfRange(off.toInt(), end.toInt())
@@ -152,6 +152,7 @@ class NxsReader
                     }
                 }
                 pageCache.pinPages(indices)
+                pageCache.unpinAll()
             }
         }
 
@@ -177,7 +178,7 @@ class NxsReader
                 if (pageCache.has(p)) continue
                 val pageOff = p * pageSize - pr.byteStart
                 var pageLen = pageSize
-                if (pageOff + pageLen > blob.size) pageLen = blob.size - pageOff
+                if (pageOff + pageLen > blob.size.toLong()) pageLen = blob.size.toLong() - pageOff
                 if (pageLen <= 0) continue
                 pageCache.set(p, blob.copyOfRange(pageOff.toInt(), (pageOff + pageLen).toInt()))
             }

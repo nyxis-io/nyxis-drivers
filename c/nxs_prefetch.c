@@ -58,7 +58,7 @@ static void cache_free_entry(nxs_cached_page_t *e) {
     free(e);
 }
 
-static void cache_evict_one(nxs_prefetch_state_t *pf) {
+static int cache_evict_one(nxs_prefetch_state_t *pf) {
     nxs_cached_page_t *victim = NULL;
     nxs_cached_page_t *prev_victim = NULL;
     uint64_t oldest = UINT64_MAX;
@@ -71,12 +71,17 @@ static void cache_evict_one(nxs_prefetch_state_t *pf) {
             prev_victim = prev;
         }
     }
-    if (!victim) return;
+    if (!victim) return 0;
 
     if (prev_victim) prev_victim->next = victim->next;
     else pf->cache = victim->next;
     pf->cache_count--;
     cache_free_entry(victim);
+    return 1;
+}
+
+static void cache_unpin_all(nxs_prefetch_state_t *pf) {
+    for (nxs_cached_page_t *e = pf->cache; e; e = e->next) e->pinned = 0;
 }
 
 static nxs_err_t cache_insert(nxs_prefetch_state_t *pf, uint32_t page_index,
@@ -85,7 +90,9 @@ static nxs_err_t cache_insert(nxs_prefetch_state_t *pf, uint32_t page_index,
         free(data);
         return NXS_OK;
     }
-    while (pf->cache_count >= pf->max_pages) cache_evict_one(pf);
+    while (pf->cache_count >= pf->max_pages) {
+        if (!cache_evict_one(pf)) break;
+    }
 
     nxs_cached_page_t *e = calloc(1, sizeof(*e));
     if (!e) {
@@ -324,6 +331,7 @@ nxs_err_t nxs_prefetch_viewport(nxs_reader_t *r, uint32_t start_index, uint32_t 
     }
 
     cache_pin_pages(pf, indices, n_pages);
+    cache_unpin_all(pf);
 
     if (indices != stack_indices) free(indices);
     if (missing != missing_stack) free(missing);

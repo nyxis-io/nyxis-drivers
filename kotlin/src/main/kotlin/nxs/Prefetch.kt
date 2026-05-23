@@ -158,6 +158,12 @@ internal class PageCache(
         }
     }
 
+    fun unpinAll() {
+        for (e in pages.values) {
+            e.pinned = false
+        }
+    }
+
     fun stats(): Pair<Int, Int> {
         var bytes = 0
         for (e in pages.values) bytes += e.data.size

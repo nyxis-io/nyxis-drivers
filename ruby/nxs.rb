@@ -140,6 +140,10 @@ module Nxs
       end
     end
 
+    def unpin_all
+      @pages.each_value { |entry| entry[:pinned] = false }
+    end
+
     def stats
       bytes = @pages.values.sum { |e| e[:data].bytesize }
       {
@@ -526,6 +530,7 @@ module Nxs
         missing = indices.uniq.select { |p| !@page_cache.has?(p) && !@in_flight.has?(p) }
         if missing.empty?
           @page_cache.pin_pages(indices)
+          @page_cache.unpin_all
           return self
         end
 
@@ -535,6 +540,7 @@ module Nxs
         )
         ranges.each { |r| fetch_coalesced_range!(r) }
         @page_cache.pin_pages(indices)
+        @page_cache.unpin_all
       end
       self
     end

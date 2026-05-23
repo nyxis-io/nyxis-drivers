@@ -210,8 +210,9 @@ public sealed class NxsReader
                 long end = off + length;
                 if (off < 0 || end > backing.Length)
                     throw new NxsException("ERR_OUT_OF_BOUNDS", $"fetch range [{off}, {end})");
-                var outBuf = new byte[length];
-                Buffer.BlockCopy(backing, (int)off, outBuf, 0, (int)length);
+                int len = ToByteCount(length);
+                var outBuf = new byte[len];
+                Buffer.BlockCopy(backing, (int)off, outBuf, 0, len);
                 return Task.FromResult(outBuf);
             };
         }
@@ -249,6 +250,7 @@ public sealed class NxsReader
             if (missing.Count == 0)
             {
                 _pageCache.PinPages(indices);
+                _pageCache.UnpinAll();
                 return;
             }
 
@@ -262,6 +264,7 @@ public sealed class NxsReader
                 await FetchCoalescedRangeAsync(pr, cancellationToken).ConfigureAwait(false);
             }
             _pageCache.PinPages(indices);
+            _pageCache.UnpinAll();
         }
         finally
         {
@@ -282,8 +285,10 @@ public sealed class NxsReader
             if (pageOff + pageLen > blob.Length)
                 pageLen = blob.Length - pageOff;
             if (pageLen <= 0) continue;
-            var pageData = new byte[pageLen];
-            Buffer.BlockCopy(blob, (int)pageOff, pageData, 0, (int)pageLen);
+            int pageLenInt = ToByteCount(pageLen);
+            int pageOffInt = checked((int)pageOff);
+            var pageData = new byte[pageLenInt];
+            Buffer.BlockCopy(blob, pageOffInt, pageData, 0, pageLenInt);
             _pageCache.Set(p, pageData);
         }
     }
@@ -293,6 +298,13 @@ public sealed class NxsReader
     {
         Interlocked.Increment(ref _fetchesIssued);
         return await _fetchRange(byteStart, byteLength, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static int ToByteCount(long length)
+    {
+        if (length < 0 || length > int.MaxValue)
+            throw new NxsException("ERR_OUT_OF_BOUNDS", $"length {length}");
+        return (int)length;
     }
 
     /// <summary>Diagnostic cache and prefetch counters.</summary>

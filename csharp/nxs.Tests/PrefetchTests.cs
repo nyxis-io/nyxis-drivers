@@ -127,8 +127,9 @@ public sealed class PrefetchTests
 
     private static byte[] CopyRange(byte[] buf, long off, long len)
     {
-        var outBuf = new byte[len];
-        Buffer.BlockCopy(buf, (int)off, outBuf, 0, (int)len);
+        int lenInt = checked((int)len);
+        var outBuf = new byte[lenInt];
+        Buffer.BlockCopy(buf, (int)off, outBuf, 0, lenInt);
         return outBuf;
     }
 }

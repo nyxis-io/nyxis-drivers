@@ -422,7 +422,18 @@ export class NxsReader {
     }
 
     const job = this._doCoalescedRangeFetch(range);
-    for (const p of pages) inFlight.set(p, job);
+    for (const p of pages) {
+      inFlight.set(
+        p,
+        job.then(() => {
+          const data = cache.get(p);
+          if (!data) {
+            throw new NxsError("ERR_OUT_OF_BOUNDS", `prefetch page ${p} missing after coalesced fetch`);
+          }
+          return data;
+        }),
+      );
+    }
     return job;
   }
 
@@ -452,7 +463,11 @@ export class NxsReader {
     const hit = cache.get(pageIndex);
     if (hit) return hit;
     const pending = inFlight.get(pageIndex);
-    if (pending) return pending;
+    if (pending) {
+      await pending;
+      const data = cache.get(pageIndex);
+      if (data) return data;
+    }
 
     const job = (async () => {
       const byteStart = pageIndex * pageSize;

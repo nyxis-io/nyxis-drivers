@@ -1,6 +1,7 @@
 package nxs
 
 import (
+	"fmt"
 	"sort"
 	"sync"
 )
@@ -43,7 +44,27 @@ type PageRange struct {
 	ByteLength int64
 }
 
-// CoalescePageIndices merges sorted unique page indices when the gap between
+// sliceInt64 returns data[off:off+length] with bounds checks (Go slice indices are int).
+func sliceInt64(data []byte, off, length int64) ([]byte, error) {
+	if off < 0 || length < 0 || off > int64(len(data)) {
+		return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: fetch range [%d, %d)", off, off+length)
+	}
+	end := off + length
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	if end <= off {
+		return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: empty fetch range")
+	}
+	return data[int(off):int(end)], nil
+}
+
+func intFromInt64(n int64) (int, error) {
+	if n < 0 || n > int64(int(^uint(0)>>1)) {
+		return 0, fmt.Errorf("ERR_OUT_OF_BOUNDS: length %d", n)
+	}
+	return int(n), nil
+}
 // consecutive indices is at most gapPages (Adaptive-prefetch-spec §7.2).
 func CoalescePageIndices(indices []int, gapPages, pageSize int) []PageRange {
 	if len(indices) == 0 {
@@ -193,6 +214,12 @@ func (c *PageCache) pinPages(pageIndices []int) {
 		if e, ok := c.pages[p]; ok {
 			e.pinned = true
 		}
+	}
+}
+
+func (c *PageCache) unpinAll() {
+	for _, e := range c.pages {
+		e.pinned = false
 	}
 }
 

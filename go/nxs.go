@@ -127,13 +127,7 @@ func (r *Reader) initPrefetch(cfg readerConfig) {
 	} else {
 		data := r.data
 		r.fetchRange = func(off, length int64) ([]byte, error) {
-			end := off + length
-			if off < 0 || end > int64(len(data)) {
-				return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: fetch range [%d, %d)", off, end)
-			}
-			out := make([]byte, length)
-			copy(out, data[off:end])
-			return out, nil
+			return sliceInt64(data, off, length)
 		}
 	}
 }
@@ -212,6 +206,7 @@ func (r *Reader) PrefetchViewport(ctx context.Context, startIndex, endIndex int)
 	}
 	if len(missingSet) == 0 {
 		r.pageCache.pinPages(indices)
+		r.pageCache.unpinAll()
 		return nil
 	}
 	missing := make([]int, 0, len(missingSet))
@@ -232,6 +227,7 @@ func (r *Reader) PrefetchViewport(ctx context.Context, startIndex, endIndex int)
 		}
 	}
 	r.pageCache.pinPages(indices)
+	r.pageCache.unpinAll()
 	return nil
 }
 
@@ -253,8 +249,12 @@ func (r *Reader) fetchCoalescedRange(ctx context.Context, pr PageRange) error {
 		if pageLen <= 0 {
 			continue
 		}
-		pageData := make([]byte, pageLen)
-		copy(pageData, blob[pageOff:pageOff+pageLen])
+		n, err := intFromInt64(pageLen)
+		if err != nil {
+			return err
+		}
+		pageData := make([]byte, n)
+		copy(pageData, blob[int(pageOff):int(pageOff+pageLen)])
 		r.pageCache.set(p, pageData, false)
 	}
 	return nil

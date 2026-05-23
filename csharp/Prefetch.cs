@@ -190,6 +190,12 @@ internal sealed class PageCache
         }
     }
 
+    public void UnpinAll()
+    {
+        foreach (var e in _pages.Values)
+            e.Pinned = false;
+    }
+
     public (int PagesCached, int MemoryUsed) Stats()
     {
         int bytes = 0;
