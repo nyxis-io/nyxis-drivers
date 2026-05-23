@@ -37,20 +37,46 @@ bash js/build_compile_wasm.sh
 ## Read a file
 
 ```js
-import { NxsReader } from "./nxs.js";
+import { NxsReader, HINT_SEQUENTIAL } from "./nxs.js";
 
 // Node.js
 import { readFileSync } from "node:fs";
 const reader = new NxsReader(readFileSync("data.nxb"));
 
-// Browser
+// Browser — full buffer
 const reader = new NxsReader(new Uint8Array(await fetch("data.nxb").then(r => r.arrayBuffer())));
+
+// Browser — open helper (fetches full file; pass hint for future adaptive prefetch)
+const reader2 = await NxsReader.open("/data.nxb", { hint: HINT_SEQUENTIAL });
 
 console.log(reader.recordCount);       // instant — read from tail-index, no parse pass
 const obj = reader.record(42);         // O(1) seek
 console.log(obj.getStr("username"));
 console.log(obj.getF64("score"));
 console.log(obj.getBool("active"));
+```
+
+## Viewport prefetch (row layout)
+
+Warm pages for a record range before random access — coalesced range fetches via the tail-index:
+
+```js
+import { NxsReader } from "./nxs.js";
+
+const reader = new NxsReader(buffer, {
+  maxPages: 64,           // LRU page cache size (default 64)
+  pageSize: 65536,        // virtual page size (default 65536)
+  coalesceGapPages: 4,    // merge nearby pages into one fetch (default 4 in browser)
+  hint: 0,                // stored for future adaptive strategy; no effect in phase 1
+});
+
+await reader.prefetch_viewport(0, 49);   // prefetch pages for records 0–49
+for (let i = 0; i <= 49; i++) {
+  console.log(reader.record(i).getStr("username"));
+}
+
+const stats = reader.cache_stats();
+console.log(stats.fetches_issued, stats.pages_cached, stats.strategy); // "lazy"
 ```
 
 ## Columnar scan
@@ -182,6 +208,7 @@ const bytes2 = NxsWriter.fromRecords(
 
 ```bash
 node test.js
+node test/prefetch.test.js
 ```
 
 ## Files
@@ -189,6 +216,7 @@ node test.js
 | File | Purpose |
 | :--- | :--- |
 | `nxs.js` | Pure-JS reader (Node + browser) |
+| `prefetch.js` | Page cache, range coalescing, in-flight dedup |
 | `nxs_writer.js` | Pure-JS writer (Node + browser) |
 | `wasm.js` | WASM loader and zero-copy Node helper |
 | `nxs_worker.js` | Web Worker that runs reducers on a shared buffer |
