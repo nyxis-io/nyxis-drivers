@@ -21,6 +21,20 @@ The **spec, Rust compiler, conformance vectors, demos, and bench UI** live in [`
 
 Each language folder has its own README with install snippets and API examples.
 
+## Adaptive prefetch (phase 2)
+
+Row-layout readers support optional viewport prefetch via open options:
+
+- **`hint`** — advisory only (`unknown`, `sequential`, `random`, `full`, `partial`); runtime pattern detection may override.
+- **Strategies** — `lazy` (>50 MB files), `adaptive` (default for mid-size), `eager` (`full` hint + file ≤10 MB, or after 100 sequential accesses).
+- **`prefetch_viewport(start, end)`** — coalesced page fetch for a record range.
+- **`warmup()`** — wait for in-flight eager background load (where supported).
+- **`cache_stats()`** — returns `strategy`, `pattern`, cache hits/misses, and fetch counts.
+
+PHP eager load is synchronous-only (no background thread); see [`php/README.md`](./php/README.md).
+
+Cross-driver conformance vectors live in [`nyxis/conformance/prefetch/`](https://github.com/nyxis-io/nyxis/tree/main/conformance/prefetch). Run `make conformance-prefetch PREFETCH=1` from the core repo.
+
 ## Quick start
 
 Clone **nyxis** as a sibling (or set `CORE` to your checkout):
