@@ -2,18 +2,23 @@ CC      = cc
 CFLAGS  = -std=c99 -O2 -Wall -Wextra
 LDFLAGS = -lm
 
-.PHONY: all clean test bench profile-selective
+.PHONY: all clean test test-prefetch bench profile-selective
 
 all: test bench
 
-test: test.c nxs.c nxs.h nxs_writer.c nxs_writer.h
-	$(CC) $(CFLAGS) -o test test.c nxs.c nxs_writer.c $(LDFLAGS)
+test: test.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h nxs_writer.c nxs_writer.h
+	$(CC) $(CFLAGS) -o test test.c nxs.c nxs_prefetch.c nxs_writer.c $(LDFLAGS)
+	./test ../js/fixtures
 
-bench: bench.c nxs.c nxs.h
-	$(CC) $(CFLAGS) -o bench bench.c nxs.c $(LDFLAGS)
+test-prefetch: test_prefetch.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h nxs_writer.c nxs_writer.h
+	$(CC) $(CFLAGS) -o test_prefetch test_prefetch.c nxs.c nxs_prefetch.c nxs_writer.c $(LDFLAGS)
+	./test_prefetch
 
-profile-selective: profile_selective.c nxs.c nxs.h
-	$(CC) $(CFLAGS) -O3 -o profile-selective profile_selective.c nxs.c $(LDFLAGS)
+bench: bench.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h
+	$(CC) $(CFLAGS) -o bench bench.c nxs.c nxs_prefetch.c $(LDFLAGS)
+
+profile-selective: profile_selective.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h
+	$(CC) $(CFLAGS) -O3 -o profile-selective profile_selective.c nxs.c nxs_prefetch.c $(LDFLAGS)
 
 clean:
-	rm -f test bench profile-selective
+	rm -f test test_prefetch bench profile-selective
