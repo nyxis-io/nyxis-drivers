@@ -26,6 +26,26 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
     return buf;
 }
 
+static uint8_t *build_compact_records(size_t n, size_t *out_size) {
+    const char *keys[] = {"id", "tag"};
+    nxs_writer_t w;
+    nxs_writer_init(&w, keys, 2, 65536);
+    for (size_t i = 0; i < n; i++) {
+        char tag[16];
+        snprintf(tag, sizeof(tag), "r%zu", i);
+        nxs_writer_begin_object(&w);
+        nxs_write_i64(&w, 0, (int64_t)i);
+        nxs_write_str(&w, 1, tag, (uint32_t)strlen(tag));
+        nxs_writer_end_object(&w);
+    }
+    nxs_writer_finish(&w);
+    *out_size = w.out_size;
+    uint8_t *buf = malloc(w.out_size);
+    if (buf) memcpy(buf, w.out, w.out_size);
+    nxs_writer_free(&w);
+    return buf;
+}
+
 static uint8_t *build_records(size_t n, size_t *out_size) {
     const char *keys[] = {"id", "username", "score", "active"};
     nxs_writer_t w;
@@ -126,6 +146,61 @@ int main(int argc, char **argv) {
         CHECK("open_options default max_pages", opts.max_pages == 128);
         CHECK("open_options default page_size", opts.page_size == 65536);
         CHECK("open_options default coalesce_gap", opts.coalesce_gap_pages == 1);
+        CHECK("open_options default prefetch_depth", opts.prefetch_depth == 4);
+    }
+
+    {
+        nxs_access_pattern_detector_t d;
+        nxs_pattern_detector_init(&d);
+        for (uint32_t i = 0; i < 8; i++)
+            nxs_pattern_detector_observe(&d, i);
+        CHECK("pattern unknown until 9th obs",
+              nxs_pattern_detector_pattern(&d) == NXS_PATTERN_UNKNOWN);
+        for (uint32_t i = 8; i < 20; i++)
+            nxs_pattern_detector_observe(&d, i);
+        CHECK("pattern sequential after small deltas",
+              nxs_pattern_detector_pattern(&d) == NXS_PATTERN_SEQUENTIAL);
+        uint32_t next[8];
+        size_t nn = nxs_pattern_detector_predict_next(&d, 4, 100, next, 8);
+        CHECK("predict_next returns 4 indices", nn == 4);
+        CHECK("predict_next starts at 20", nn > 0 && next[0] == 20);
+    }
+
+    {
+        size_t sz = 0;
+        uint8_t *buf = build_compact_records(200, &sz);
+        nxs_reader_t r;
+        CHECK("sequential upgrade: open_ex", nxs_open_ex(&r, buf, sz, NULL) == NXS_OK);
+        nxs_object_t obj;
+        for (uint32_t i = 0; i < 150; i++)
+            nxs_record(&r, i, &obj);
+        nxs_warmup(&r);
+        nxs_cache_stats_t stats;
+        nxs_cache_stats(&r, &stats);
+        CHECK("sequential upgrade: strategy eager",
+              stats.strategy && strcmp(stats.strategy, "eager") == 0);
+        CHECK("sequential upgrade: pattern sequential",
+              stats.pattern && strcmp(stats.pattern, "sequential") == 0);
+        nxs_close(&r);
+        free(buf);
+    }
+
+    {
+        size_t sz = 0;
+        uint8_t *buf = build_compact_records(200, &sz);
+        CHECK("hint full: file under 10MB", sz <= 10u * 1024u * 1024u);
+        nxs_open_options_t opts;
+        nxs_open_options_init(&opts);
+        opts.hint = NXS_HINT_FULL;
+        nxs_reader_t r;
+        CHECK("hint full: open_ex", nxs_open_ex(&r, buf, sz, &opts) == NXS_OK);
+        nxs_warmup(&r);
+        nxs_cache_stats_t stats;
+        nxs_cache_stats(&r, &stats);
+        CHECK("hint full: strategy eager at open",
+              stats.strategy && strcmp(stats.strategy, "eager") == 0);
+        nxs_close(&r);
+        free(buf);
     }
 
     /* cache_stats on fixture file */
@@ -141,7 +216,8 @@ int main(int argc, char **argv) {
             nxs_prefetch_viewport(&r, 0, 49);
             nxs_cache_stats_t stats;
             nxs_cache_stats(&r, &stats);
-            CHECK("cache_stats strategy is lazy", stats.strategy && strcmp(stats.strategy, "lazy") == 0);
+            CHECK("cache_stats pattern unknown before access",
+                  stats.pattern && strcmp(stats.pattern, "unknown") == 0);
             CHECK("cache_stats pages_max is 128", stats.pages_max == 128);
             CHECK("cache_stats memory_used_bytes > 0", stats.memory_used_bytes > 0);
             nxs_close(&r);

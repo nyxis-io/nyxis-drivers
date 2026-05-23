@@ -578,6 +578,8 @@ nxs_err_t nxs_record(const nxs_reader_t *r, uint32_t i, nxs_object_t *obj) {
     } else {
         obj->offset = (size_t)i;
     }
+    if (r->prefetch)
+        nxs_prefetch_on_access((nxs_reader_t *)r, i);
     return NXS_OK;
 }
 
