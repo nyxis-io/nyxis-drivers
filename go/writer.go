@@ -19,6 +19,7 @@ package nxs
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 	"sort"
@@ -86,6 +87,7 @@ type Writer struct {
 	frames        []frame
 	recordOffsets []int
 	slotSigils    []byte // sigil per schema slot, updated on first write
+	slotSeen      []bool // whether the current writer has observed a value for the slot
 }
 
 // NewWriter allocates a Writer backed by the given Schema.
@@ -100,6 +102,7 @@ func NewWriter(schema *Schema) *Writer {
 		frames:        make([]frame, 0, 4),
 		recordOffsets: make([]int, 0),
 		slotSigils:    sigils,
+		slotSeen:      make([]bool, schema.Len()),
 	}
 }
 
@@ -115,6 +118,7 @@ func NewWriterWithCapacity(schema *Schema, cap int) *Writer {
 		frames:        make([]frame, 0, 4),
 		recordOffsets: make([]int, 0, 1024),
 		slotSigils:    sigils,
+		slotSeen:      make([]bool, schema.Len()),
 	}
 }
 
@@ -128,6 +132,9 @@ func (w *Writer) Reset() {
 	w.recordOffsets = w.recordOffsets[:0]
 	for i := range w.slotSigils {
 		w.slotSigils[i] = sigilStr
+	}
+	for i := range w.slotSeen {
+		w.slotSeen[i] = false
 	}
 }
 
@@ -267,6 +274,7 @@ type StreamWriter struct {
 	inObject      bool
 	closed        bool
 	headerWritten bool
+	headerSigils  []byte
 }
 
 // NewStreamWriter creates a streaming writer. The preamble and schema header are
@@ -311,6 +319,25 @@ func (sw *StreamWriter) writeHeader(sigils []byte) error {
 	sw.dataStartAbs = sw.bytesWritten + uint64(len(header))
 	sw.bytesWritten += uint64(len(header))
 	sw.headerWritten = true
+	sw.headerSigils = append(sw.headerSigils[:0], sigils...)
+	return nil
+}
+
+func (sw *StreamWriter) validateRecordSigils() error {
+	if !sw.headerWritten {
+		return nil
+	}
+	for slot, seen := range sw.writer.slotSeen {
+		if !seen {
+			continue
+		}
+		if slot >= len(sw.headerSigils) {
+			return io.ErrShortWrite
+		}
+		if got, want := sw.writer.slotSigils[slot], sw.headerSigils[slot]; got != want {
+			return fmt.Errorf("nxs: stream slot %d wrote sigil 0x%02x after header declared 0x%02x", slot, got, want)
+		}
+	}
 	return nil
 }
 
@@ -337,6 +364,9 @@ func (sw *StreamWriter) EndObject() error {
 		if err := sw.writeHeader(sigils); err != nil {
 			return err
 		}
+	}
+	if err := sw.validateRecordSigils(); err != nil {
+		return err
 	}
 	record := sw.writer.buf
 	sw.recordOffsets = append(sw.recordOffsets, int(sw.bytesWritten-sw.dataStartAbs))
@@ -529,6 +559,7 @@ func (w *Writer) markSlot(slot int, sigil byte) {
 
 	// Record the sigil for this slot (last write wins, consistent within a schema)
 	w.slotSigils[slot] = sigil
+	w.slotSeen[slot] = true
 
 	rel := len(w.buf) - f.start
 

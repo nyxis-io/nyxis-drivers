@@ -77,6 +77,28 @@ func TestStreamWriterTypeManifestSigils(t *testing.T) {
 	}
 }
 
+func TestStreamWriterRejectsLateTypedSlotAfterHeader(t *testing.T) {
+	schema := NewSchema([]string{"id", "score"})
+	var buf bytes.Buffer
+	sw, err := NewStreamWriter(&buf, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sw.BeginObject()
+	sw.WriteI64(0, 1)
+	if err := sw.EndObject(); err != nil {
+		t.Fatal(err)
+	}
+
+	sw.BeginObject()
+	sw.WriteI64(0, 2)
+	sw.WriteF64(1, 9.5)
+	if err := sw.EndObject(); err == nil {
+		t.Fatal("expected late non-string slot type to be rejected")
+	}
+}
+
 func minimalProducerNxb(t *testing.T) []byte {
 	t.Helper()
 	schema := NewSchema([]string{"id", "name", "active"})
