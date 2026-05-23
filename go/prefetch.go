@@ -552,9 +552,6 @@ func (e *prefetchEngine) startEagerBackground() {
 			CoalescePageIndices(indices, e.options.CoalesceGapPages, pageSize),
 			int64(len(e.data)),
 		)
-		e.cacheMu.Lock()
-		e.fetchesIssued++
-		e.cacheMu.Unlock()
 		for _, pr := range ranges {
 			if ctx.Err() != nil {
 				return

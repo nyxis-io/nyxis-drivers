@@ -401,10 +401,6 @@ static void *eager_worker(void *arg) {
     free(indices);
     n_ranges = clamp_page_ranges(ranges, n_ranges, r->size);
 
-    pthread_mutex_lock(&pf->mu);
-    pf->fetches_issued++;
-    pthread_mutex_unlock(&pf->mu);
-
     for (size_t ri = 0; ri < n_ranges; ri++) {
         pthread_mutex_lock(&pf->mu);
         int cancelled = pf->eager_cancel;
@@ -432,7 +428,7 @@ static int start_eager_background(nxs_reader_t *r, struct nxs_prefetch_state *pf
     row_data_sector(r->tail_start, r->size, &sector_start, &sector_len);
     if (sector_len == 0) {
         pf->eager_complete = 1;
-        pf->eager_started = 1;
+        pf->eager_joined = 1;
         pthread_mutex_unlock(&pf->mu);
         return 1;
     }

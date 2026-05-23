@@ -412,7 +412,6 @@ export class NxsReader {
       this.bytes.length,
     );
     for (const range of ranges) {
-      pf.fetchesIssued++;
       void this._startCoalescedRangeFetch(range);
     }
   }
@@ -446,7 +445,6 @@ export class NxsReader {
       coalescePageIndices(missing, pf.coalesceGapPages, pageSize),
       this.bytes.length,
     );
-    pf.fetchesIssued++;
     for (const range of ranges) {
       if (pf.eagerCancelled) return;
       await this._doCoalescedRangeFetch(range);

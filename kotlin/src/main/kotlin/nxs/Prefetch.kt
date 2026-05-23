@@ -370,9 +370,6 @@ internal class PrefetchEngine(
                         ),
                         fileSize.toLong(),
                     )
-                synchronized(cacheLock) {
-                    fetchesIssued++
-                }
                 for (pr in ranges) {
                     if (eagerCancel) return@thread
                     synchronized(cacheLock) {

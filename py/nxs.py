@@ -417,7 +417,6 @@ class PrefetchEngine:
                     ),
                     len(self._mv),
                 )
-                self._fetches_issued += 1
                 for pr in ranges:
                     if cancel.is_set():
                         return

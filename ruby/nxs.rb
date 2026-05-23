@@ -716,7 +716,6 @@ module Nxs
         Nxs.coalesce_page_indices(missing, @coalesce_gap_pages, page_size),
         @data.bytesize
       )
-      @cache_mu.synchronize { @fetches_issued += 1 } unless ranges.empty?
       ranges.each do |r|
         break if @prefetch_mu.synchronize { @eager_cancel }
 

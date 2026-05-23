@@ -327,6 +327,47 @@ final class PrefetchState {
         stateLock.lock(); defer { stateLock.unlock() }
         if strategy == .eager { startEagerBackgroundLocked() }
     }
+    func prefetchViewport(startIndex: Int, endIndex: Int, recordCount n: Int, fileSize: Int64) throws {
+        guard startIndex >= 0, endIndex >= startIndex, endIndex < n else {
+            throw NXSError.outOfBounds(
+                "prefetch_viewport [\(startIndex), \(endIndex)] out of [0, \(n))"
+            )
+        }
+
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        let indices = pageIndicesForViewport(
+            startIndex: startIndex,
+            endIndex: endIndex,
+            pageSize: pageSize,
+            recordOffset: recordOffset
+        )
+
+        var missingSet = Set<Int>()
+        for p in indices {
+            if !cache.has(p) && !inFlight.has(p) {
+                missingSet.insert(p)
+            }
+        }
+        if missingSet.isEmpty {
+            cache.pinPages(indices)
+            cache.unpinAll()
+            return
+        }
+
+        let missing = Array(missingSet)
+        let ranges = clampPageRanges(
+            coalescePageIndices(missing, gapPages: coalesceGapPages, pageSize: pageSize),
+            fileSize: fileSize
+        )
+        for pr in ranges {
+            try fetchCoalescedRangeLocked(pr)
+        }
+        cache.pinPages(indices)
+        cache.unpinAll()
+    }
+
     func onAccess(_ index: Int) {
         guard recordCount() > 0 else { return }
         stateLock.lock()
@@ -361,23 +402,39 @@ final class PrefetchState {
     }
     private func runEagerBackground() {
         let s = rowDataSector(tailStart: tailStart, fileSize: fileSize)
-        guard s.length > 0 else { eagerComplete = true; return }
-        var end = s.start + s.length; if end > fileSize { end = fileSize }
-        guard s.start < end else { if !eagerCancelled { eagerComplete = true }; return }
+        if s.length <= 0 {
+            stateLock.lock()
+            eagerComplete = true
+            stateLock.unlock()
+            return
+        }
+        var end = s.start + s.length
+        if end > fileSize { end = fileSize }
+        guard s.start < end else {
+            stateLock.lock()
+            if !eagerCancelled { eagerComplete = true }
+            stateLock.unlock()
+            return
+        }
         let ps = pageSize
-        var idx: [Int] = []; for p in (s.start/ps)...((end-1)/ps) { idx.append(p) }
-        cacheLock.lock(); defer { cacheLock.unlock() }
-        if eagerCancelled { return }
-        fetchesIssued += 1
+        var idx: [Int] = []
+        for p in (s.start / ps)...((end - 1) / ps) { idx.append(p) }
         let eagerRanges = clampPageRanges(
             coalescePageIndices(idx, gapPages: coalesceGapPages, pageSize: ps),
             fileSize: Int64(fileSize)
         )
         for pr in eagerRanges {
-            if eagerCancelled { return }
+            stateLock.lock()
+            let cancelled = eagerCancelled
+            stateLock.unlock()
+            if cancelled { return }
+            cacheLock.lock()
             try? fetchCoalescedRangeLocked(pr)
+            cacheLock.unlock()
         }
+        stateLock.lock()
         if !eagerCancelled { eagerComplete = true }
+        stateLock.unlock()
     }
     private func speculativePrefetch() {
         let pred = detector.predictNext(depth: prefetchDepth, recordCount: recordCount())
@@ -397,8 +454,15 @@ final class PrefetchState {
         )
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            self.cacheLock.lock(); defer { self.cacheLock.unlock() }
-            for pr in ranges { if self.closed { return }; try? self.fetchCoalescedRangeLocked(pr) }
+            for pr in ranges {
+                self.stateLock.lock()
+                let closed = self.closed
+                self.stateLock.unlock()
+                if closed { return }
+                self.cacheLock.lock()
+                try? self.fetchCoalescedRangeLocked(pr)
+                self.cacheLock.unlock()
+            }
         }
     }
     func fetchCoalescedRangeLocked(_ pr: PageRange) throws {

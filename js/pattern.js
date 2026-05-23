@@ -27,7 +27,7 @@ export class AccessPatternDetector {
     return this._sequentialRuns;
   }
 
-  lastIndex() {
+  getLastIndex() {
     return this.lastIndex;
   }
 

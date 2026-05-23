@@ -212,7 +212,6 @@ internal sealed class PrefetchEngine
         await _cacheLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            Interlocked.Increment(ref _fetchesIssued);
             foreach (var pr in PrefetchCoalesce.ClampPageRanges(
                 PrefetchCoalesce.CoalescePageIndices(indices, _options.CoalesceGapPages, pageSize),
                 _fileSize))

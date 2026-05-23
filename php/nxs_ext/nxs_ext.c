@@ -35,6 +35,11 @@
 #define NXS_DEFAULT_MAX_PAGES         32
 #define NXS_DEFAULT_COALESCE_GAP_PAGES 1
 
+#define NXS_HINT_FULL 3
+#define NXS_EAGER_THRESHOLD_MB 10
+#define NXS_LAZY_THRESHOLD_MB 50
+#define NXS_UPGRADE_SEQUENTIAL_THRESHOLD 100
+
 typedef struct {
     zend_string *data;
     int          last_used;
@@ -105,6 +110,20 @@ static void nxs_page_entry_dtor(zval *zv)
     }
 }
 
+static const char *nxs_initial_prefetch_strategy(int hint, size_t file_size)
+{
+    size_t mb = file_size / (1024 * 1024);
+    if (hint == NXS_HINT_FULL && mb <= NXS_EAGER_THRESHOLD_MB) return "eager";
+    if (mb > NXS_LAZY_THRESHOLD_MB) return "lazy";
+    return "adaptive";
+}
+
+static void nxs_set_prefetch_strategy(nxs_reader_t *r, const char *strategy)
+{
+    if (r->prefetch_strategy) efree(r->prefetch_strategy);
+    r->prefetch_strategy = estrdup(strategy);
+}
+
 static void reader_init_prefetch(nxs_reader_t *r, HashTable *options)
 {
     r->max_pages = NXS_DEFAULT_MAX_PAGES;
@@ -126,7 +145,12 @@ static void reader_init_prefetch(nxs_reader_t *r, HashTable *options)
         if ((zv = zend_hash_str_find(options, "coalesce_gap_pages", sizeof("coalesce_gap_pages") - 1)) != NULL) {
             r->coalesce_gap = (int)zval_get_long(zv);
         }
+        if ((zv = zend_hash_str_find(options, "hint", sizeof("hint") - 1)) != NULL) {
+            r->prefetch_hint = (int)zval_get_long(zv);
+        }
     }
+
+    nxs_set_prefetch_strategy(r, nxs_initial_prefetch_strategy(r->prefetch_hint, r->size));
 
     ALLOC_HASHTABLE(r->page_cache);
     zend_hash_init(r->page_cache, r->max_pages, NULL, nxs_page_entry_dtor, 0);
@@ -552,6 +576,14 @@ PHP_METHOD(NxsReader, record)
             if (r->sequential_runs > r->random_jumps * 3) {
                 if (r->prefetch_pattern) efree(r->prefetch_pattern);
                 r->prefetch_pattern = estrdup("sequential");
+                if (r->sequential_runs >= NXS_UPGRADE_SEQUENTIAL_THRESHOLD
+                    && r->prefetch_strategy
+                    && strcmp(r->prefetch_strategy, "adaptive") == 0) {
+                    size_t mb = r->size / (1024 * 1024);
+                    if (mb <= NXS_EAGER_THRESHOLD_MB) {
+                        nxs_set_prefetch_strategy(r, "eager");
+                    }
+                }
             } else if (r->random_jumps > r->sequential_runs) {
                 if (r->prefetch_pattern) efree(r->prefetch_pattern);
                 r->prefetch_pattern = estrdup("random");
