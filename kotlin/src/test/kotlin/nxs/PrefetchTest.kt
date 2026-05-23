@@ -4,6 +4,7 @@ import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class PrefetchTest {
@@ -19,6 +20,49 @@ class PrefetchTest {
             w.endObject()
         }
         return w.finish()
+    }
+
+    private fun buildCompactRecords(n: Int): ByteArray {
+        val schema = NxsSchema(listOf("id", "tag"))
+        val w = NxsWriter(schema)
+        for (i in 0 until n) {
+            w.beginObject()
+            w.writeI64(0, i.toLong())
+            w.writeStr(1, "r$i")
+            w.endObject()
+        }
+        return w.finish()
+    }
+
+    @Test
+    fun patternUnknownUntilMinObservations() {
+        val d = AccessPatternDetector()
+        for (i in 0 until 8) d.observe(i)
+        assertEquals(AccessPattern.UNKNOWN, d.pattern())
+        d.observe(8)
+        assertNotEquals(AccessPattern.UNKNOWN, d.pattern())
+    }
+
+    @Test
+    fun patternSequential_smallDeltas() {
+        val d = AccessPatternDetector()
+        for (i in 0 until 20) d.observe(i)
+        assertEquals(AccessPattern.SEQUENTIAL, d.pattern())
+    }
+
+    @Test
+    fun patternRandom_largeJumps() {
+        val d = AccessPatternDetector()
+        for (i in 0 until 8) d.observe(i)
+        for (k in 0 until 12) d.observe(k * 200)
+        assertEquals(AccessPattern.RANDOM, d.pattern())
+    }
+
+    @Test
+    fun predictNext_sequential() {
+        val d = AccessPatternDetector()
+        for (i in 0 until 10) d.observe(i)
+        assertTrue(d.predictNext(4, 100).contentEquals(intArrayOf(10, 11, 12, 13)))
     }
 
     @Test
@@ -136,7 +180,33 @@ class PrefetchTest {
         val reader = NxsReader(buf)
         val stats = reader.cacheStats()
         assertEquals(DEFAULT_MAX_PAGES, stats.pagesMax)
-        assertEquals("lazy", stats.strategy)
+        assertEquals("adaptive", stats.strategy)
         assertEquals("unknown", stats.pattern)
+    }
+
+    @Test
+    fun sequentialUpgrade_toEagerAfter150Records() {
+        val buf = buildCompactRecords(200)
+        val reader = NxsReader(buf)
+        try {
+            for (i in 0 until 150) reader.record(i)
+            reader.warmup()
+            assertEquals("eager", reader.cacheStats().strategy)
+            assertEquals("sequential", reader.cacheStats().pattern)
+        } finally {
+            reader.close()
+        }
+    }
+
+    @Test
+    fun hintFull_eagerAtOpen() {
+        val buf = buildCompactRecords(200)
+        val reader = NxsReader(buf, OpenOptions(hint = AccessHint.FULL))
+        try {
+            reader.warmup()
+            assertEquals("eager", reader.cacheStats().strategy)
+        } finally {
+            reader.close()
+        }
     }
 }
