@@ -14,6 +14,7 @@
 //
 // Adaptive prefetch (optional): prefetch_viewport, cache_stats — see prefetch.js.
 
+import { AccessPatternDetector, PATTERN_SEQUENTIAL } from "./pattern.js";
 import {
   HINT_UNKNOWN,
   PageCache,
@@ -21,9 +22,15 @@ import {
   coalescePageIndices,
   clampRanges,
   pageIndicesForViewport,
+  initialStrategy,
+  rowDataSector,
+  rowRecordOffset,
   DEFAULT_MAX_PAGES,
   DEFAULT_PAGE_SIZE,
   DEFAULT_COALESCE_GAP_PAGES,
+  DEFAULT_PREFETCH_DEPTH,
+  UPGRADE_SEQUENTIAL_THRESHOLD,
+  EAGER_THRESHOLD_MB,
 } from "./prefetch.js";
 
 export {
@@ -325,22 +332,138 @@ export class NxsReader {
     }
 
     this._initPrefetch(options);
+    if (this._layout === "row" && this._prefetch.strategy === "eager") {
+      this._startEagerBackground();
+    }
   }
 
   _initPrefetch(options) {
     const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
     const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    const hint = options.hint ?? HINT_UNKNOWN;
     this._prefetch = {
-      hint: options.hint ?? HINT_UNKNOWN,
+      hint,
       pageSize,
       coalesceGapPages: options.coalesceGapPages ?? DEFAULT_COALESCE_GAP_PAGES,
+      prefetchDepth: options.prefetchDepth ?? DEFAULT_PREFETCH_DEPTH,
       cache: new PageCache(maxPages, pageSize),
       inFlight: new InFlightMap(),
       fetchesIssued: 0,
       fetchRange: options.fetchRange ?? null,
-      strategy: "lazy",
-      pattern: "unknown",
+      strategy: initialStrategy(hint, this.bytes.length),
+      detector: new AccessPatternDetector(),
+      eagerStarted: false,
+      eagerComplete: false,
+      eagerCancelled: false,
+      eagerPromise: null,
     };
+  }
+
+  _isEagerReady() {
+    const pf = this._prefetch;
+    return pf.strategy === "eager" && pf.eagerComplete;
+  }
+
+  _onAccess(index) {
+    if (this._layout !== "row" || !this._prefetch) return;
+    if (this.recordCount === 0) return;
+    const pf = this._prefetch;
+    pf.detector.observe(index);
+    this._maybeUpgradeToEager();
+    if (this._isEagerReady() || pf.strategy === "eager") return;
+    const off = rowRecordOffset(this.bytes, this._tailStart, index);
+    if (off != null) {
+      this._touchPage(Math.floor(off / pf.pageSize));
+    }
+    if (pf.strategy === "adaptive" && pf.detector.pattern() === PATTERN_SEQUENTIAL) {
+      this._speculativePrefetch();
+    }
+  }
+
+  _maybeUpgradeToEager() {
+    const pf = this._prefetch;
+    if (pf.strategy !== "adaptive") return;
+    const det = pf.detector;
+    if (det.pattern() !== PATTERN_SEQUENTIAL) return;
+    if (det.sequentialRuns() < UPGRADE_SEQUENTIAL_THRESHOLD) return;
+    const fileSizeMb = Math.floor(this.bytes.length / (1024 * 1024));
+    if (fileSizeMb > EAGER_THRESHOLD_MB) return;
+    pf.strategy = "eager";
+    this._startEagerBackground();
+  }
+
+  _touchPage(pageIndex) {
+    if (this._isEagerReady()) return;
+    this._prefetch.cache.get(pageIndex);
+  }
+
+  _speculativePrefetch() {
+    const pf = this._prefetch;
+    const predicted = pf.detector.predictNext(pf.prefetchDepth, this.recordCount);
+    const pageSet = new Set();
+    for (const idx of predicted) {
+      const off = rowRecordOffset(this.bytes, this._tailStart, idx);
+      if (off != null) pageSet.add(Math.floor(off / pf.pageSize));
+    }
+    const missing = [...pageSet].filter((p) => !pf.cache.has(p) && !pf.inFlight.has(p));
+    if (!missing.length) return;
+    const ranges = clampRanges(
+      coalescePageIndices(missing, pf.coalesceGapPages, pf.pageSize),
+      this.bytes.length,
+    );
+    for (const range of ranges) {
+      pf.fetchesIssued++;
+      void this._startCoalescedRangeFetch(range);
+    }
+  }
+
+  _startEagerBackground() {
+    const pf = this._prefetch;
+    if (pf.eagerStarted) return;
+    pf.eagerStarted = true;
+    pf.eagerPromise = this._runEagerBackground();
+  }
+
+  async _runEagerBackground() {
+    const pf = this._prefetch;
+    const { byteStart, byteLength } = rowDataSector(this._tailStart, this.bytes.length);
+    if (byteLength === 0) {
+      pf.eagerComplete = true;
+      return;
+    }
+    const end = Math.min(byteStart + byteLength, this.bytes.length);
+    const pageSize = pf.pageSize;
+    const firstPage = Math.floor(byteStart / pageSize);
+    const lastPage = Math.floor((end - 1) / pageSize);
+    const indices = [];
+    for (let p = firstPage; p <= lastPage; p++) indices.push(p);
+    const missing = indices.filter((p) => !pf.cache.has(p) && !pf.inFlight.has(p));
+    if (!missing.length) {
+      pf.eagerComplete = true;
+      return;
+    }
+    const ranges = clampRanges(
+      coalescePageIndices(missing, pf.coalesceGapPages, pageSize),
+      this.bytes.length,
+    );
+    pf.fetchesIssued++;
+    for (const range of ranges) {
+      if (pf.eagerCancelled) return;
+      await this._doCoalescedRangeFetch(range);
+    }
+    if (!pf.eagerCancelled) pf.eagerComplete = true;
+  }
+
+  /** Wait for in-progress eager / background prefetch (§8). */
+  async warmup() {
+    const p = this._prefetch?.eagerPromise;
+    if (p) await p;
+  }
+
+  /** Cancel background eager prefetch (mirrors Rust Drop). */
+  close() {
+    if (!this._prefetch) return;
+    this._prefetch.eagerCancelled = true;
   }
 
   /** Absolute data-sector offset for row-layout record `i`. */
@@ -487,7 +610,7 @@ export class NxsReader {
       ...s,
       fetches_issued: this._prefetch.fetchesIssued,
       strategy: this._prefetch.strategy,
-      pattern: this._prefetch.pattern,
+      pattern: this._prefetch.detector.pattern(),
     };
   }
 
@@ -878,6 +1001,7 @@ export class NxsReader {
     if (this._layout === "columnar" || this._layout === "pax") {
       return new NxsObject(this, i, i);
     }
+    this._onAccess(i);
     // Each tail-index entry: u16 keyId + u64 offset = 10 bytes
     const absOffset = rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
     return new NxsObject(this, absOffset);
