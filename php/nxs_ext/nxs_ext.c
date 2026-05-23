@@ -85,6 +85,12 @@ typedef struct _nxs_reader_t {
     int            cache_hits;
     int            cache_misses;
     int            cache_clock;
+    int            prefetch_hint;
+    char          *prefetch_strategy; /* lazy | adaptive | eager */
+    char          *prefetch_pattern;
+    int            sequential_runs;
+    int            random_jumps;
+    int            last_access_index;
     HashTable     *page_cache;    /* zend_long page → nxs_page_entry_t* */
     HashTable     *in_flight;     /* zend_long page → bool */
     zend_object    std;
@@ -305,6 +311,9 @@ static zend_object *nxs_reader_create(zend_class_entry *ce)
     object_properties_init(&r->std, ce);
     r->std.handlers = &nxs_reader_handlers;
     ZVAL_UNDEF(&r->keys_zv);
+    r->last_access_index = -1;
+    r->prefetch_strategy = estrdup("lazy");
+    r->prefetch_pattern = estrdup("unknown");
     return &r->std;
 }
 
@@ -328,6 +337,8 @@ static void nxs_reader_free(zend_object *obj)
         r->in_flight = NULL;
     }
     zval_ptr_dtor(&r->keys_zv);
+    if (r->prefetch_strategy) { efree(r->prefetch_strategy); r->prefetch_strategy = NULL; }
+    if (r->prefetch_pattern) { efree(r->prefetch_pattern); r->prefetch_pattern = NULL; }
     zend_object_std_dtor(obj);
 }
 
@@ -525,6 +536,28 @@ PHP_METHOD(NxsReader, record)
             (long)idx, r->record_count);
         return;
     }
+    if (r->last_access_index >= 0) {
+        int delta = (int)idx - r->last_access_index;
+        if (delta < 0) delta = -delta;
+        if (delta <= 10) {
+            if (r->sequential_runs < INT_MAX) r->sequential_runs++;
+        } else if (delta > 100) {
+            if (r->random_jumps < INT_MAX) r->random_jumps++;
+        }
+    }
+    r->last_access_index = (int)idx;
+    {
+        int total = r->sequential_runs + r->random_jumps;
+        if (total >= 8) {
+            if (r->sequential_runs > r->random_jumps * 3) {
+                if (r->prefetch_pattern) efree(r->prefetch_pattern);
+                r->prefetch_pattern = estrdup("sequential");
+            } else if (r->random_jumps > r->sequential_runs) {
+                if (r->prefetch_pattern) efree(r->prefetch_pattern);
+                r->prefetch_pattern = estrdup("random");
+            }
+        }
+    }
     size_t entry = r->tail_start + (size_t)idx * 10;
     uint64_t abs = rd_u64(r->data + entry + 2);
 
@@ -641,8 +674,10 @@ PHP_METHOD(NxsReader, cache_stats)
     add_assoc_long(return_value, "cache_hits", r->cache_hits);
     add_assoc_long(return_value, "cache_misses", r->cache_misses);
     add_assoc_long(return_value, "fetches_issued", r->fetches_issued);
-    add_assoc_string(return_value, "strategy", "lazy");
-    add_assoc_string(return_value, "pattern", "unknown");
+    add_assoc_string(return_value, "strategy",
+        r->prefetch_strategy ? r->prefetch_strategy : "lazy");
+    add_assoc_string(return_value, "pattern",
+        r->prefetch_pattern ? r->prefetch_pattern : "unknown");
 }
 
 /* ── NxsObject: lazy bitmask parse ────────────────────────────────────────── */
