@@ -125,6 +125,62 @@ public sealed class PrefetchTests
         Assert.Equal(AccessHint.Full, reader.AccessHint);
     }
 
+    [Fact]
+    public void Pattern_UnknownUntilMinObservations()
+    {
+        var d = new AccessPatternDetector();
+        for (int i = 0; i < 8; i++) d.Observe(i);
+        Assert.Equal(AccessPattern.Unknown, d.Pattern());
+        d.Observe(8);
+        Assert.NotEqual(AccessPattern.Unknown, d.Pattern());
+    }
+
+    [Fact]
+    public void Pattern_Sequential_SmallDeltas()
+    {
+        var d = new AccessPatternDetector();
+        for (int i = 0; i < 20; i++) d.Observe(i);
+        Assert.Equal(AccessPattern.Sequential, d.Pattern());
+    }
+
+    [Fact]
+    public void Pattern_Random_LargeJumps()
+    {
+        var d = new AccessPatternDetector();
+        for (int i = 0; i < 8; i++) d.Observe(i);
+        for (int k = 0; k < 12; k++) d.Observe(k * 200);
+        Assert.Equal(AccessPattern.Random, d.Pattern());
+    }
+
+    [Fact]
+    public void PredictNext_Sequential()
+    {
+        var d = new AccessPatternDetector();
+        for (int i = 0; i < 10; i++) d.Observe(i);
+        Assert.Equal(new[] { 10, 11, 12, 13 }, d.PredictNext(4, 100));
+    }
+
+    [Fact]
+    public async Task HintFull_SmallFile_EagerAtOpen()
+    {
+        byte[] buf = BuildRecords(200);
+        var reader = new NxsReader(buf, new NxsOpenOptions { Hint = AccessHint.Full });
+        await reader.WarmupAsync();
+        Assert.Equal("eager", reader.CacheStats().Strategy);
+    }
+
+    [Fact]
+    public async Task SequentialUpgrade_ToEager_After150Records()
+    {
+        byte[] buf = BuildRecords(200);
+        var reader = new NxsReader(buf);
+        for (int i = 0; i < 150; i++) _ = reader.Record(i);
+        await reader.WarmupAsync();
+        var stats = reader.CacheStats();
+        Assert.Equal("eager", stats.Strategy);
+        Assert.Equal("sequential", stats.Pattern);
+    }
+
     private static byte[] CopyRange(byte[] buf, long off, long len)
     {
         int lenInt = checked((int)len);
