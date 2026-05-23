@@ -18,8 +18,23 @@ lightweight view; ``.get_*()`` decodes a single field on demand.
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import struct
-from typing import Iterator, Optional, Union
+import threading
+from typing import Any, Callable, Iterator, Optional, Union
+
+
+# Adaptive prefetch constants (spec §6–§8.4; native coalesce_gap=1).
+HINT_UNKNOWN = 0
+HINT_SEQUENTIAL = 1
+HINT_RANDOM = 2
+HINT_FULL = 3
+HINT_PARTIAL = 4
+
+DEFAULT_PAGE_SIZE = 65536
+DEFAULT_MAX_PAGES = 64
+DEFAULT_COALESCE_GAP_PAGES = 1
 
 
 # Magic bytes (little-endian u32)
@@ -47,6 +62,175 @@ class NxsError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(f"{code}: {message}")
         self.code = code
+
+
+def coalesce_page_indices(
+    indices: list[int],
+    gap_pages: int,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> list[dict[str, int]]:
+    """Merge sorted unique page indices when gap <= gap_pages (inclusive)."""
+    if not indices:
+        return []
+    uniq = sorted(set(indices))
+    spans: list[tuple[int, int]] = []
+    start = end = uniq[0]
+    for p in uniq[1:]:
+        if p - end <= gap_pages:
+            end = p
+        else:
+            spans.append((start, end))
+            start = end = p
+    spans.append((start, end))
+    return [
+        {
+            "page_start": a,
+            "page_end": b,
+            "byte_start": a * page_size,
+            "byte_length": (b - a + 1) * page_size,
+        }
+        for a, b in spans
+    ]
+
+
+def _clamp_page_ranges(ranges: list[dict[str, int]], file_size: int) -> list[dict[str, int]]:
+    out: list[dict[str, int]] = []
+    for r in ranges:
+        length = r["byte_length"]
+        if r["byte_start"] + length > file_size:
+            length = file_size - r["byte_start"]
+        if length <= 0:
+            continue
+        out.append({**r, "byte_length": length})
+    return out
+
+
+def page_indices_for_viewport(
+    start_index: int,
+    end_index: int,
+    page_size: int,
+    record_offset: Callable[[int], int],
+) -> list[int]:
+    return [record_offset(i) // page_size for i in range(start_index, end_index + 1)]
+
+
+class PageCache:
+    """LRU page cache with optional pinning (Adaptive-prefetch-spec §6)."""
+
+    __slots__ = ("max_pages", "page_size", "pages", "_clock", "hits", "misses")
+
+    def __init__(self, max_pages: int = DEFAULT_MAX_PAGES,
+                 page_size: int = DEFAULT_PAGE_SIZE) -> None:
+        self.max_pages = max_pages
+        self.page_size = page_size
+        self.pages: dict[int, dict[str, Any]] = {}
+        self._clock = 0
+        self.hits = 0
+        self.misses = 0
+
+    def has(self, page_index: int) -> bool:
+        return page_index in self.pages
+
+    def get(self, page_index: int) -> Optional[bytes]:
+        entry = self.pages.get(page_index)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._clock += 1
+        entry["last_used"] = self._clock
+        self.hits += 1
+        return entry["data"]
+
+    def set(self, page_index: int, data: bytes, *, pinned: bool = False) -> None:
+        if self.max_pages <= 0:
+            return
+        while len(self.pages) >= self.max_pages:
+            if not self._evict_one():
+                break
+        self._clock += 1
+        self.pages[page_index] = {
+            "data": data,
+            "last_used": self._clock,
+            "pinned": pinned,
+        }
+
+    def _evict_one(self) -> bool:
+        victim = -1
+        oldest = float("inf")
+        for idx, entry in self.pages.items():
+            if entry["pinned"]:
+                continue
+            if entry["last_used"] < oldest:
+                oldest = entry["last_used"]
+                victim = idx
+        if victim < 0:
+            return False
+        del self.pages[victim]
+        return True
+
+    def pin_pages(self, page_indices: list[int]) -> None:
+        for p in page_indices:
+            entry = self.pages.get(p)
+            if entry is not None:
+                entry["pinned"] = True
+
+    def stats(self) -> dict[str, int]:
+        memory_used = sum(len(e["data"]) for e in self.pages.values())
+        return {
+            "pages_cached": len(self.pages),
+            "pages_max": self.max_pages,
+            "memory_used_bytes": memory_used,
+            "cache_hits": self.hits,
+            "cache_misses": self.misses,
+        }
+
+
+class _InFlightEntry:
+    __slots__ = ("event", "data", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.data: Optional[bytes] = None
+        self.error: Optional[BaseException] = None
+
+
+class InFlightMap:
+    """Deduplicates concurrent page fetches (spec §8.4)."""
+
+    __slots__ = ("_lock", "_map")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._map: dict[int, _InFlightEntry] = {}
+
+    def has(self, page_index: int) -> bool:
+        with self._lock:
+            return page_index in self._map
+
+    def wait(self, page_index: int) -> Optional[bytes]:
+        with self._lock:
+            entry = self._map.get(page_index)
+        if entry is None:
+            return None
+        entry.event.wait()
+        if entry.error is not None:
+            raise entry.error
+        return entry.data
+
+    def begin(self, page_index: int) -> tuple[_InFlightEntry, bool]:
+        with self._lock:
+            entry = self._map.get(page_index)
+            if entry is not None:
+                return entry, False
+            entry = _InFlightEntry()
+            self._map[page_index] = entry
+            return entry, True
+
+    def finish(self, page_index: int, entry: _InFlightEntry) -> None:
+        entry.event.set()
+        with self._lock:
+            if self._map.get(page_index) is entry:
+                del self._map[page_index]
 
 
 def _murmur3_64(data: memoryview) -> int:
@@ -87,9 +271,22 @@ class NxsReader:
         "keys", "key_sigils", "key_index",
         "record_count", "_tail_start",
         "_schema_end",
+        "_prefetch_lock",
+        "_prefetch_hint", "_prefetch_page_size", "_coalesce_gap_pages",
+        "_page_cache", "_in_flight", "_fetches_issued", "_fetch_range",
+        "_prefetch_strategy", "_prefetch_pattern",
     )
 
-    def __init__(self, buffer: Union[bytes, bytearray, memoryview]) -> None:
+    def __init__(
+        self,
+        buffer: Union[bytes, bytearray, memoryview],
+        *,
+        hint: int = HINT_UNKNOWN,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        coalesce_gap_pages: int = DEFAULT_COALESCE_GAP_PAGES,
+        fetch_range: Optional[Callable[..., Any]] = None,
+    ) -> None:
         if isinstance(buffer, memoryview):
             self.buf = buffer.tobytes() if not buffer.readonly else buffer
             self.mv = buffer
@@ -132,6 +329,161 @@ class NxsReader:
 
         # Tail-index
         self._read_tail_index()
+        self._init_prefetch(
+            hint=hint,
+            max_pages=max_pages,
+            page_size=page_size,
+            coalesce_gap_pages=coalesce_gap_pages,
+            fetch_range=fetch_range,
+        )
+
+    def _init_prefetch(
+        self,
+        *,
+        hint: int,
+        max_pages: int,
+        page_size: int,
+        coalesce_gap_pages: int,
+        fetch_range: Optional[Callable[..., Any]],
+    ) -> None:
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_hint = hint
+        self._prefetch_page_size = page_size
+        self._coalesce_gap_pages = coalesce_gap_pages
+        self._page_cache = PageCache(max_pages, page_size)
+        self._in_flight = InFlightMap()
+        self._fetches_issued = 0
+        self._prefetch_strategy = "lazy"
+        self._prefetch_pattern = "unknown"
+        if fetch_range is not None:
+            self._fetch_range = fetch_range
+        else:
+            mv = self.mv
+            def _default_fetch(byte_start: int, byte_length: int) -> bytes:
+                end = byte_start + byte_length
+                if byte_start < 0 or end > len(mv):
+                    raise NxsError(
+                        "ERR_OUT_OF_BOUNDS",
+                        f"fetch range [{byte_start}, {end})",
+                    )
+                return bytes(mv[byte_start:end])
+            self._fetch_range = _default_fetch
+
+    def _record_byte_offset(self, i: int) -> int:
+        entry = self._tail_start + i * 10
+        return _U64.unpack_from(self.mv, entry + 2)[0]
+
+    def prefetch_viewport(self, start_index: int, end_index: int) -> None:
+        """Load pages for records [start_index, end_index] into the page cache."""
+        if start_index < 0 or end_index < start_index or end_index >= self.record_count:
+            raise NxsError(
+                "ERR_OUT_OF_BOUNDS",
+                f"prefetch_viewport [{start_index}, {end_index}] "
+                f"out of [0, {self.record_count})",
+            )
+        with self._prefetch_lock:
+            page_size = self._prefetch_page_size
+            indices = page_indices_for_viewport(
+                start_index, end_index, page_size, self._record_byte_offset,
+            )
+            missing = {
+                p for p in set(indices)
+                if not self._page_cache.has(p) and not self._in_flight.has(p)
+            }
+            if not missing:
+                self._page_cache.pin_pages(indices)
+                return
+            ranges = _clamp_page_ranges(
+                coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
+                len(self.mv),
+            )
+            for r in ranges:
+                self._fetch_coalesced_range(r)
+            self._page_cache.pin_pages(indices)
+
+    async def prefetch_viewport_async(self, start_index: int, end_index: int) -> None:
+        """Async variant: parallel coalesced range fetches when fetch_range is async."""
+        if start_index < 0 or end_index < start_index or end_index >= self.record_count:
+            raise NxsError(
+                "ERR_OUT_OF_BOUNDS",
+                f"prefetch_viewport [{start_index}, {end_index}] "
+                f"out of [0, {self.record_count})",
+            )
+        with self._prefetch_lock:
+            page_size = self._prefetch_page_size
+            indices = page_indices_for_viewport(
+                start_index, end_index, page_size, self._record_byte_offset,
+            )
+            missing = {
+                p for p in set(indices)
+                if not self._page_cache.has(p) and not self._in_flight.has(p)
+            }
+            if not missing:
+                self._page_cache.pin_pages(indices)
+                return
+            ranges = _clamp_page_ranges(
+                coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
+                len(self.mv),
+            )
+            await asyncio.gather(
+                *(self._fetch_coalesced_range_async(r) for r in ranges),
+            )
+            self._page_cache.pin_pages(indices)
+
+    def _fetch_coalesced_range(self, page_range: dict[str, int]) -> None:
+        blob = self._fetch_range_bytes(page_range["byte_start"], page_range["byte_length"])
+        page_size = self._prefetch_page_size
+        cache = self._page_cache
+        for p in range(page_range["page_start"], page_range["page_end"] + 1):
+            if cache.has(p):
+                continue
+            page_off = p * page_size - page_range["byte_start"]
+            page_len = min(page_size, len(blob) - page_off)
+            if page_len <= 0:
+                continue
+            cache.set(p, blob[page_off:page_off + page_len])
+
+    async def _fetch_coalesced_range_async(self, page_range: dict[str, int]) -> None:
+        blob = await self._fetch_range_bytes_async(
+            page_range["byte_start"], page_range["byte_length"],
+        )
+        page_size = self._prefetch_page_size
+        cache = self._page_cache
+        for p in range(page_range["page_start"], page_range["page_end"] + 1):
+            if cache.has(p):
+                continue
+            page_off = p * page_size - page_range["byte_start"]
+            page_len = min(page_size, len(blob) - page_off)
+            if page_len <= 0:
+                continue
+            cache.set(p, blob[page_off:page_off + page_len])
+
+    def _fetch_range_bytes(self, byte_start: int, byte_length: int) -> bytes:
+        self._fetches_issued += 1
+        result = self._fetch_range(byte_start, byte_length)
+        if inspect.isawaitable(result):
+            raise TypeError(
+                "async fetch_range requires prefetch_viewport_async(); "
+                "use a synchronous fetch_range with prefetch_viewport()",
+            )
+        return result
+
+    async def _fetch_range_bytes_async(self, byte_start: int, byte_length: int) -> bytes:
+        self._fetches_issued += 1
+        result = self._fetch_range(byte_start, byte_length)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def cache_stats(self) -> dict[str, Any]:
+        """Diagnostic cache and prefetch counters."""
+        stats = self._page_cache.stats()
+        return {
+            **stats,
+            "fetches_issued": self._fetches_issued,
+            "strategy": self._prefetch_strategy,
+            "pattern": self._prefetch_pattern,
+        }
 
     def _read_schema(self, offset: int) -> None:
         mv = self.mv
