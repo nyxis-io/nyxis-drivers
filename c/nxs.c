@@ -1,5 +1,6 @@
 // NXS Reader implementation (C99)
 #include "nxs.h"
+#include "nxs_prefetch.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -536,8 +537,17 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
     return NXS_OK;
 }
 
+nxs_err_t nxs_open_ex(nxs_reader_t *r, const uint8_t *data, size_t size,
+                      const nxs_open_options_t *opts) {
+    nxs_err_t err = nxs_open(r, data, size);
+    if (err != NXS_OK) return err;
+    return nxs_prefetch_init(r, opts);
+}
+
 void nxs_close(nxs_reader_t *r) {
-    if (r) pax_free_pages(r);
+    if (!r) return;
+    nxs_prefetch_destroy(r);
+    pax_free_pages(r);
 }
 
 uint32_t nxs_record_count(const nxs_reader_t *r) { return r->record_count; }

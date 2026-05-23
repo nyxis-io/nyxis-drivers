@@ -11,6 +11,28 @@
 //
 // The reader does NOT materialize the whole file. Each call to `record()`
 // returns a lightweight view; `.get(key)` decodes a single field on demand.
+//
+// Adaptive prefetch (optional): prefetch_viewport, cache_stats — see prefetch.js.
+
+import {
+  HINT_UNKNOWN,
+  PageCache,
+  InFlightMap,
+  coalescePageIndices,
+  clampRanges,
+  pageIndicesForViewport,
+  DEFAULT_MAX_PAGES,
+  DEFAULT_PAGE_SIZE,
+  DEFAULT_COALESCE_GAP_PAGES,
+} from "./prefetch.js";
+
+export {
+  HINT_UNKNOWN,
+  HINT_SEQUENTIAL,
+  HINT_RANDOM,
+  HINT_FULL,
+  HINT_PARTIAL,
+} from "./prefetch.js";
 
 const MAGIC_FILE   = 0x4E595842; // NYXB
 const MAGIC_OBJ    = 0x4E59584F; // NYXO
@@ -234,8 +256,9 @@ function murmur3_64(bytes, offset, length) {
 export class NxsReader {
   /**
    * @param {ArrayBuffer | Uint8Array} buffer — raw .nxb bytes
+   * @param {object} [options] — prefetch: hint, maxPages, pageSize, coalesceGapPages, fetchRange
    */
-  constructor(buffer) {
+  constructor(buffer, options = {}) {
     this.bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
     this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
 
@@ -300,6 +323,172 @@ export class NxsReader {
       this._layout = "row";
       this._readTailIndex();
     }
+
+    this._initPrefetch(options);
+  }
+
+  _initPrefetch(options) {
+    const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+    const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
+    this._prefetch = {
+      hint: options.hint ?? HINT_UNKNOWN,
+      pageSize,
+      coalesceGapPages: options.coalesceGapPages ?? DEFAULT_COALESCE_GAP_PAGES,
+      cache: new PageCache(maxPages, pageSize),
+      inFlight: new InFlightMap(),
+      fetchesIssued: 0,
+      fetchRange: options.fetchRange ?? null,
+      strategy: "lazy",
+      pattern: "unknown",
+    };
+  }
+
+  /** Absolute data-sector offset for row-layout record `i`. */
+  _recordByteOffset(i) {
+    return rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
+  }
+
+  /**
+   * Open a `.nxb` from a URL (fetches the full file; use fetchRange option for tests).
+   * @param {string} url
+   * @param {object} [options] — hint, maxPages, fetch, signal, fetchRange
+   */
+  static async open(url, options = {}) {
+    const fetchImpl = options.fetch ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") {
+      throw new TypeError("NxsReader.open requires fetch (browser/Node 18+) or options.fetch");
+    }
+    const res = await fetchImpl(url, { signal: options.signal });
+    if (!res.ok) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `fetch failed: ${res.status}`);
+    }
+    const buf = await res.arrayBuffer();
+    return new NxsReader(buf, options);
+  }
+
+  /**
+   * Prefetch pages for records [startIndex, endIndex] (row layout). Resolves when cached.
+   */
+  async prefetch_viewport(startIndex, endIndex) {
+    if (this._layout !== "row") return;
+    if (startIndex < 0 || endIndex < startIndex || endIndex >= this.recordCount) {
+      throw new NxsError(
+        "ERR_OUT_OF_BOUNDS",
+        `prefetch_viewport [${startIndex}, ${endIndex}] out of [0, ${this.recordCount})`,
+      );
+    }
+    const { pageSize, cache, inFlight, coalesceGapPages } = this._prefetch;
+    const indices = pageIndicesForViewport(
+      startIndex,
+      endIndex,
+      pageSize,
+      (i) => this._recordByteOffset(i),
+    );
+    const uniquePages = [...new Set(indices)];
+    const missing = uniquePages.filter((p) => !cache.has(p) && !inFlight.has(p));
+
+    if (missing.length) {
+      const ranges = clampRanges(
+        coalescePageIndices(missing, coalesceGapPages, pageSize),
+        this.bytes.length,
+      );
+      const jobs = ranges.map((r) => this._startCoalescedRangeFetch(r));
+      await Promise.all(jobs);
+    }
+
+    const pending = uniquePages
+      .filter((p) => inFlight.has(p))
+      .map((p) => inFlight.get(p));
+    if (pending.length) await Promise.all(pending);
+
+    cache.pinPages(uniquePages);
+    cache.unpinAll();
+  }
+
+  /** Register in-flight page promises synchronously, then fetch the coalesced range. */
+  _startCoalescedRangeFetch(range) {
+    const { cache, inFlight } = this._prefetch;
+    const pages = [];
+    for (let p = range.pageStart; p <= range.pageEnd; p++) {
+      if (!cache.has(p) && !inFlight.has(p)) pages.push(p);
+    }
+    if (!pages.length) {
+      const waits = [];
+      for (let p = range.pageStart; p <= range.pageEnd; p++) {
+        const pending = inFlight.get(p);
+        if (pending) waits.push(pending);
+      }
+      return Promise.all(waits);
+    }
+
+    const job = this._doCoalescedRangeFetch(range);
+    for (const p of pages) {
+      inFlight.set(
+        p,
+        job.then(() => {
+          const data = cache.get(p);
+          if (!data) {
+            throw new NxsError("ERR_OUT_OF_BOUNDS", `prefetch page ${p} missing after coalesced fetch`);
+          }
+          return data;
+        }),
+      );
+    }
+    return job;
+  }
+
+  async _doCoalescedRangeFetch(range) {
+    const { pageSize, cache } = this._prefetch;
+    const blob = await this._fetchRangeBytes(range.byteStart, range.byteLength);
+    for (let p = range.pageStart; p <= range.pageEnd; p++) {
+      if (cache.has(p)) continue;
+      const pageOff = p * pageSize - range.byteStart;
+      const pageLen = Math.min(pageSize, blob.byteLength - pageOff);
+      if (pageLen <= 0) continue;
+      cache.set(p, blob.subarray(pageOff, pageOff + pageLen));
+    }
+  }
+
+  async _fetchRangeBytes(byteStart, byteLength) {
+    this._prefetch.fetchesIssued++;
+    const { fetchRange } = this._prefetch;
+    if (fetchRange) {
+      return await fetchRange(byteStart, byteLength);
+    }
+    return this.bytes.subarray(byteStart, byteStart + byteLength);
+  }
+
+  async _loadPage(pageIndex) {
+    const { cache, inFlight, pageSize } = this._prefetch;
+    const hit = cache.get(pageIndex);
+    if (hit) return hit;
+    const pending = inFlight.get(pageIndex);
+    if (pending) {
+      await pending;
+      const data = cache.get(pageIndex);
+      if (data) return data;
+    }
+
+    const job = (async () => {
+      const byteStart = pageIndex * pageSize;
+      const byteLength = Math.min(pageSize, this.bytes.length - byteStart);
+      const data = await this._fetchRangeBytes(byteStart, byteLength);
+      cache.set(pageIndex, data.slice());
+      return data;
+    })();
+    inFlight.set(pageIndex, job);
+    return job;
+  }
+
+  /** Diagnostic cache / prefetch counters. */
+  cache_stats() {
+    const s = this._prefetch.cache.stats();
+    return {
+      ...s,
+      fetches_issued: this._prefetch.fetchesIssued,
+      strategy: this._prefetch.strategy,
+      pattern: this._prefetch.pattern,
+    };
   }
 
   /** `row` | `columnar` | `pax` */

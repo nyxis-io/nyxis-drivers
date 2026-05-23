@@ -35,6 +35,198 @@ module Nxs
   COL_TAIL_ENTRY_BYTES = 20
   PAX_TAIL_ENTRY_BYTES = 28
 
+  # Adaptive prefetch (phase 1) — spec §6–§8.4
+  DEFAULT_PAGE_SIZE = 65_536
+  DEFAULT_MAX_PAGES = 64
+  DEFAULT_COALESCE_GAP_PAGES = 1
+
+  HINT_UNKNOWN = 0
+  HINT_SEQUENTIAL = 1
+  HINT_RANDOM = 2
+  HINT_FULL = 3
+  HINT_PARTIAL = 4
+
+  HINT_SYMBOLS = {
+    unknown: HINT_UNKNOWN,
+    sequential: HINT_SEQUENTIAL,
+    random: HINT_RANDOM,
+    full: HINT_FULL,
+    partial: HINT_PARTIAL
+  }.freeze
+
+  def self.normalize_hint(hint)
+    return hint if hint.is_a?(Integer)
+
+    HINT_SYMBOLS.fetch(hint) { HINT_UNKNOWN }
+  end
+
+  # Merge sorted unique page indices when gap <= gap_pages (inclusive).
+  def self.coalesce_page_indices(indices, gap_pages, page_size = DEFAULT_PAGE_SIZE)
+    return [] if indices.empty?
+
+    uniq = indices.uniq.sort
+    spans = []
+    start = uniq[0]
+    end_ = uniq[0]
+    uniq.each_cons(2) do |_a, b|
+      if b - end_ <= gap_pages
+        end_ = b
+      else
+        spans << [start, end_]
+        start = end_ = b
+      end
+    end
+    spans << [start, end_]
+    spans.map do |a, b|
+      { page_start: a, page_end: b, byte_start: a * page_size, byte_length: (b - a + 1) * page_size }
+    end
+  end
+
+  def self.clamp_page_ranges(ranges, file_size)
+    ranges.filter_map do |r|
+      len = r[:byte_length]
+      len = file_size - r[:byte_start] if r[:byte_start] + len > file_size
+      next nil if len <= 0
+
+      r.merge(byte_length: len)
+    end
+  end
+
+  def self.page_indices_for_viewport(start_index, end_index, page_size, &record_offset)
+    (start_index..end_index).map { |i| record_offset.call(i) / page_size }
+  end
+
+  # LRU page cache with optional pinning (spec §6).
+  class PageCache
+    attr_reader :max_pages, :page_size, :hits, :misses
+
+    def initialize(max_pages = DEFAULT_MAX_PAGES, page_size = DEFAULT_PAGE_SIZE)
+      @max_pages = max_pages
+      @page_size = page_size
+      @pages = {}
+      @clock = 0
+      @hits = 0
+      @misses = 0
+    end
+
+    def has?(page_index)
+      @pages.key?(page_index)
+    end
+
+    def get(page_index)
+      entry = @pages[page_index]
+      unless entry
+        @misses += 1
+        return nil
+      end
+      @clock += 1
+      entry[:last_used] = @clock
+      @hits += 1
+      entry[:data]
+    end
+
+    def set(page_index, data, pinned: false)
+      return if @max_pages <= 0
+
+      while @pages.size >= @max_pages && !evict_one?; end
+      @clock += 1
+      @pages[page_index] = { data: data, last_used: @clock, pinned: pinned }
+    end
+
+    def pin_pages(page_indices)
+      page_indices.each do |p|
+        entry = @pages[p]
+        entry[:pinned] = true if entry
+      end
+    end
+
+    def unpin_all
+      @pages.each_value { |entry| entry[:pinned] = false }
+    end
+
+    def stats
+      bytes = @pages.values.sum { |e| e[:data].bytesize }
+      {
+        pages_cached: @pages.size,
+        pages_max: @max_pages,
+        memory_used_bytes: bytes,
+        cache_hits: @hits,
+        cache_misses: @misses
+      }
+    end
+
+    private
+
+    def evict_one?
+      victim = nil
+      oldest = nil
+      @pages.each do |idx, entry|
+        next if entry[:pinned]
+
+        if oldest.nil? || entry[:last_used] < oldest
+          oldest = entry[:last_used]
+          victim = idx
+        end
+      end
+      return false unless victim
+
+      @pages.delete(victim)
+      true
+    end
+  end
+
+  # In-flight page fetch deduplication for concurrent prefetch_viewport calls.
+  class InFlightMap
+    Entry = Struct.new(:queue, :data, :error)
+
+    def initialize
+      @mu = Mutex.new
+      @map = {}
+    end
+
+    def has?(page_index)
+      @mu.synchronize { @map.key?(page_index) }
+    end
+
+    def wait(page_index)
+      entry = @mu.synchronize { @map[page_index] }
+      return nil unless entry
+
+      entry.queue.pop
+      raise entry.error if entry.error
+
+      entry.data
+    end
+
+    def with(page_index)
+      entry = nil
+      leader = @mu.synchronize do
+        existing = @map[page_index]
+        if existing
+          false
+        else
+          entry = Entry.new(Queue.new)
+          @map[page_index] = entry
+          true
+        end
+      end
+      return wait(page_index) unless leader
+
+      begin
+        data = yield
+        entry.data = data
+        entry.queue << true
+        data
+      rescue StandardError => e
+        entry.error = e
+        entry.queue << true
+        raise
+      ensure
+        @mu.synchronize { @map.delete(page_index) if @map[page_index] == entry }
+      end
+    end
+  end
+
   class NxsError < StandardError
     attr_reader :code
 
@@ -49,7 +241,12 @@ module Nxs
   class Reader
     attr_reader :keys, :record_count, :layout
 
-    def initialize(bytes)
+    def initialize(bytes, **options)
+      hint = options.fetch(:hint, HINT_UNKNOWN)
+      max_pages = options.fetch(:max_pages, DEFAULT_MAX_PAGES)
+      page_size = options.fetch(:page_size, DEFAULT_PAGE_SIZE)
+      coalesce_gap_pages = options.fetch(:coalesce_gap_pages, DEFAULT_COALESCE_GAP_PAGES)
+      fetch_range = options.fetch(:fetch_range, nil)
       @data = bytes.b # force binary encoding
       sz = @data.bytesize
       raise NxsError.new('ERR_OUT_OF_BOUNDS', 'file too small') if sz < 32
@@ -86,6 +283,13 @@ module Nxs
       @col_buf_off = []
       @col_buf_len = []
       parse_layout_tail!(preamble_tail)
+      init_prefetch!(
+        hint: hint,
+        max_pages: max_pages,
+        page_size: page_size,
+        coalesce_gap_pages: coalesce_gap_pages,
+        fetch_range: fetch_range
+      )
     end
 
     # O(1) record lookup — row tail-index or columnar/PAX record index.
@@ -282,7 +486,94 @@ module Nxs
       end
     end
 
+    def init_prefetch!(hint:, max_pages:, page_size:, coalesce_gap_pages:, fetch_range:)
+      @prefetch_mu = Mutex.new
+      @prefetch_hint = Nxs.normalize_hint(hint)
+      @prefetch_page_size = page_size
+      @coalesce_gap_pages = coalesce_gap_pages
+      @page_cache = PageCache.new(max_pages, page_size)
+      @in_flight = InFlightMap.new
+      @fetches_issued = 0
+      @prefetch_strategy = 'lazy'
+      @prefetch_pattern = 'unknown'
+      @fetch_range = fetch_range || lambda do |byte_start, byte_length|
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'fetch range out of bounds') if byte_start.negative?
+
+        end_ = byte_start + byte_length
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'fetch range out of bounds') if end_ > @data.bytesize
+
+        @data[byte_start, byte_length]
+      end
+    end
+
+    def record_byte_offset(i)
+      @data.unpack1("@#{@tail_start + i * 10 + 2}Q<")
+    end
+
+    # Prefetch pages for records [start_index, end_index] (row layout only).
+    def prefetch_viewport(start_index, end_index)
+      return self if @layout != :row
+
+      n = @record_count
+      unless start_index.between?(0, end_index) && end_index < n
+        raise NxsError.new(
+          'ERR_OUT_OF_BOUNDS',
+          "prefetch_viewport [#{start_index}, #{end_index}] out of [0, #{n})"
+        )
+      end
+
+      @prefetch_mu.synchronize do
+        page_size = @prefetch_page_size
+        indices = Nxs.page_indices_for_viewport(start_index, end_index, page_size) do |i|
+          record_byte_offset(i)
+        end
+        missing = indices.uniq.select { |p| !@page_cache.has?(p) && !@in_flight.has?(p) }
+        if missing.empty?
+          @page_cache.pin_pages(indices)
+          @page_cache.unpin_all
+          return self
+        end
+
+        ranges = Nxs.clamp_page_ranges(
+          Nxs.coalesce_page_indices(missing, @coalesce_gap_pages, page_size),
+          @data.bytesize
+        )
+        ranges.each { |r| fetch_coalesced_range!(r) }
+        @page_cache.pin_pages(indices)
+        @page_cache.unpin_all
+      end
+      self
+    end
+
+    def cache_stats
+      stats = @page_cache.stats
+      stats.merge(
+        fetches_issued: @fetches_issued,
+        strategy: @prefetch_strategy,
+        pattern: @prefetch_pattern
+      )
+    end
+
     private
+
+    def fetch_coalesced_range!(page_range)
+      blob = fetch_range_bytes!(page_range[:byte_start], page_range[:byte_length])
+      page_size = @prefetch_page_size
+      (page_range[:page_start]..page_range[:page_end]).each do |p|
+        next if @page_cache.has?(p)
+
+        page_off = p * page_size - page_range[:byte_start]
+        page_len = [page_size, blob.bytesize - page_off].min
+        next if page_len <= 0
+
+        @page_cache.set(p, blob[page_off, page_len])
+      end
+    end
+
+    def fetch_range_bytes!(byte_start, byte_length)
+      @fetches_issued += 1
+      @fetch_range.call(byte_start, byte_length)
+    end
 
     def parse_layout_tail!(preamble_tail)
       if (@flags & FLAG_COLUMNAR != 0) && (@flags & FLAG_PAX != 0)

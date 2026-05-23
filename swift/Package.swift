@@ -11,5 +11,6 @@ let package = Package(
         .executableTarget(name: "nxs-test", dependencies: ["NXS"], path: "Sources/Test"),
         .executableTarget(name: "nxs-bench", dependencies: ["NXS"], path: "Sources/Bench"),
         .executableTarget(name: "nxs-conformance", dependencies: ["NXS"], path: "Sources/Conformance"),
+        .testTarget(name: "NXSTests", dependencies: ["NXS"], path: "Tests/NXSTests"),
     ]
 )

@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <limits.h>
 
 /* ── Format constants ──────────────────────────────────────────────────────── */
 
@@ -29,6 +30,16 @@
 #define MAGIC_OBJ     0x4E59584Fu   /* NYXO */
 #define MAGIC_FOOTER  0x2153584Eu   /* NXS! */
 #define FLAG_SCHEMA_EMBEDDED 0x0002u
+
+#define NXS_DEFAULT_PAGE_SIZE         65536
+#define NXS_DEFAULT_MAX_PAGES         32
+#define NXS_DEFAULT_COALESCE_GAP_PAGES 1
+
+typedef struct {
+    zend_string *data;
+    int          last_used;
+    int          pinned;
+} nxs_page_entry_t;
 
 /* ── Unaligned LE readers ──────────────────────────────────────────────────── */
 
@@ -67,8 +78,200 @@ typedef struct _nxs_reader_t {
     HashTable     *key_index;     /* zend_string key → ZEND_LONG slot */
     zval           keys_zv;       /* PHP array of key names */
     int            schema_embedded;
+    int            max_pages;
+    int            page_size;
+    int            coalesce_gap;
+    int            fetches_issued;
+    int            cache_hits;
+    int            cache_misses;
+    int            cache_clock;
+    HashTable     *page_cache;    /* zend_long page → nxs_page_entry_t* */
+    HashTable     *in_flight;     /* zend_long page → bool */
     zend_object    std;
 } nxs_reader_t;
+
+static void nxs_page_entry_dtor(zval *zv)
+{
+    nxs_page_entry_t *e = Z_PTR_P(zv);
+    if (e) {
+        if (e->data) zend_string_release(e->data);
+        efree(e);
+    }
+}
+
+static void reader_init_prefetch(nxs_reader_t *r, HashTable *options)
+{
+    r->max_pages = NXS_DEFAULT_MAX_PAGES;
+    r->page_size = NXS_DEFAULT_PAGE_SIZE;
+    r->coalesce_gap = NXS_DEFAULT_COALESCE_GAP_PAGES;
+    r->fetches_issued = 0;
+    r->cache_hits = 0;
+    r->cache_misses = 0;
+    r->cache_clock = 0;
+
+    if (options) {
+        zval *zv;
+        if ((zv = zend_hash_str_find(options, "max_pages", sizeof("max_pages") - 1)) != NULL) {
+            r->max_pages = (int)zval_get_long(zv);
+        }
+        if ((zv = zend_hash_str_find(options, "page_size", sizeof("page_size") - 1)) != NULL) {
+            r->page_size = (int)zval_get_long(zv);
+        }
+        if ((zv = zend_hash_str_find(options, "coalesce_gap_pages", sizeof("coalesce_gap_pages") - 1)) != NULL) {
+            r->coalesce_gap = (int)zval_get_long(zv);
+        }
+    }
+
+    ALLOC_HASHTABLE(r->page_cache);
+    zend_hash_init(r->page_cache, r->max_pages, NULL, nxs_page_entry_dtor, 0);
+    ALLOC_HASHTABLE(r->in_flight);
+    zend_hash_init(r->in_flight, 8, NULL, NULL, 0);
+}
+
+static int reader_page_has(nxs_reader_t *r, zend_long page)
+{
+    return zend_hash_index_find(r->page_cache, page) != NULL;
+}
+
+static nxs_page_entry_t *reader_page_get(nxs_reader_t *r, zend_long page)
+{
+    zval *zv = zend_hash_index_find(r->page_cache, page);
+    if (!zv) {
+        r->cache_misses++;
+        return NULL;
+    }
+    nxs_page_entry_t *e = Z_PTR_P(zv);
+    e->last_used = ++r->cache_clock;
+    r->cache_hits++;
+    return e;
+}
+
+static int reader_page_evict_one(nxs_reader_t *r)
+{
+    zend_long victim = -1;
+    int oldest = INT_MAX;
+    zend_ulong idx;
+    zval *val;
+    ZEND_HASH_FOREACH_NUM_KEY_VAL(r->page_cache, idx, val) {
+        nxs_page_entry_t *ent = Z_PTR_P(val);
+        if (ent->pinned) continue;
+        if (ent->last_used < oldest) {
+            oldest = ent->last_used;
+            victim = (zend_long)idx;
+        }
+    } ZEND_HASH_FOREACH_END();
+    if (victim < 0) return 0;
+    zend_hash_index_del(r->page_cache, victim);
+    return 1;
+}
+
+static void reader_page_set(nxs_reader_t *r, zend_long page, zend_string *data, int pinned)
+{
+    if (r->max_pages <= 0) return;
+    while ((zend_long)zend_hash_num_elements(r->page_cache) >= r->max_pages) {
+        if (!reader_page_evict_one(r)) break;
+    }
+    nxs_page_entry_t *e = emalloc(sizeof(*e));
+    e->data = zend_string_copy(data);
+    e->last_used = ++r->cache_clock;
+    e->pinned = pinned;
+    zval zv;
+    ZVAL_PTR(&zv, e);
+    zend_hash_index_update(r->page_cache, page, &zv);
+}
+
+static uint64_t reader_record_offset(nxs_reader_t *r, int idx)
+{
+    size_t entry = r->tail_start + (size_t)idx * 10;
+    return rd_u64(r->data + entry + 2);
+}
+
+static int cmp_zend_long(const void *a, const void *b)
+{
+    zend_long aa = *(const zend_long *)a;
+    zend_long bb = *(const zend_long *)b;
+    return (aa > bb) - (aa < bb);
+}
+
+static void reader_fetch_coalesced(nxs_reader_t *r, int byte_start, int byte_len,
+    int page_start, int page_end)
+{
+    if (byte_start < 0 || byte_start + byte_len > (int)r->size) {
+        zend_throw_exception(zend_ce_exception, "ERR_OUT_OF_BOUNDS: fetch range", 0);
+        return;
+    }
+    r->fetches_issued++;
+    for (int p = page_start; p <= page_end; p++) {
+        if (reader_page_has(r, p)) continue;
+        int page_off = p * r->page_size - byte_start;
+        int page_len = r->page_size;
+        if (page_off + page_len > byte_len) page_len = byte_len - page_off;
+        if (page_len <= 0) continue;
+        zend_string *chunk = zend_string_init((char *)(r->data + byte_start + page_off),
+            page_len, 0);
+        reader_page_set(r, p, chunk, 0);
+        zend_string_release(chunk);
+    }
+}
+
+static void reader_prefetch_viewport(nxs_reader_t *r, int start, int end)
+{
+    if (start < 0 || end < start || end >= (int)r->record_count) {
+        zend_throw_exception_ex(zend_ce_exception, 0,
+            "ERR_OUT_OF_BOUNDS: prefetch_viewport [%d, %d] out of [0, %u)",
+            start, end, r->record_count);
+        return;
+    }
+
+    zend_long *pages = ecalloc((size_t)(end - start + 1), sizeof(zend_long));
+    int np = 0;
+    for (int i = start; i <= end; i++) {
+        uint64_t off = reader_record_offset(r, i);
+        pages[np++] = (zend_long)(off / (uint64_t)r->page_size);
+    }
+
+    /* unique */
+    qsort(pages, np, sizeof(zend_long), cmp_zend_long);
+    int nu = 0;
+    for (int i = 0; i < np; i++) {
+        if (i == 0 || pages[i] != pages[i - 1]) {
+            pages[nu++] = pages[i];
+        }
+    }
+
+    /* collect missing */
+    zend_long *missing = ecalloc((size_t)nu, sizeof(zend_long));
+    int nm = 0;
+    for (int i = 0; i < nu; i++) {
+        if (!reader_page_has(r, pages[i]) &&
+            !zend_hash_index_find(r->in_flight, pages[i])) {
+            missing[nm++] = pages[i];
+        }
+    }
+
+    if (nm > 0) {
+        qsort(missing, nm, sizeof(zend_long), cmp_zend_long);
+        int span_start = missing[0], span_end = missing[0];
+        for (int i = 1; i <= nm; i++) {
+            if (i < nm && missing[i] - span_end <= r->coalesce_gap) {
+                span_end = (int)missing[i];
+            } else {
+                int bs = span_start * r->page_size;
+                int bl = (span_end - span_start + 1) * r->page_size;
+                if (bs + bl > (int)r->size) bl = (int)r->size - bs;
+                if (bl > 0) {
+                    reader_fetch_coalesced(r, bs, bl, span_start, span_end);
+                }
+                if (i < nm) {
+                    span_start = span_end = (int)missing[i];
+                }
+            }
+        }
+    }
+
+    efree(missing);
+    efree(pages);
+}
 
 static inline nxs_reader_t *reader_from_obj(zend_object *obj) {
     return (nxs_reader_t *)((char *)obj - XtOffsetOf(nxs_reader_t, std));
@@ -113,6 +316,16 @@ static void nxs_reader_free(zend_object *obj)
         zend_hash_destroy(r->key_index);
         FREE_HASHTABLE(r->key_index);
         r->key_index = NULL;
+    }
+    if (r->page_cache) {
+        zend_hash_destroy(r->page_cache);
+        FREE_HASHTABLE(r->page_cache);
+        r->page_cache = NULL;
+    }
+    if (r->in_flight) {
+        zend_hash_destroy(r->in_flight);
+        FREE_HASHTABLE(r->in_flight);
+        r->in_flight = NULL;
     }
     zval_ptr_dtor(&r->keys_zv);
     zend_object_std_dtor(obj);
@@ -235,8 +448,11 @@ done:
 PHP_METHOD(NxsReader, __construct)
 {
     zend_string *arg;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    HashTable *options = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STR(arg)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(options)
     ZEND_PARSE_PARAMETERS_END();
 
     nxs_reader_t *r = Z_READER_P(ZEND_THIS);
@@ -269,7 +485,10 @@ PHP_METHOD(NxsReader, __construct)
         }
         r->tail_ptr = rd_u64(r->data + r->size - 12);
     }
-    reader_parse(r);
+    if (reader_parse(r) == FAILURE) {
+        return;
+    }
+    reader_init_prefetch(r, options);
 }
 
 PHP_METHOD(NxsReader, recordCount)
@@ -393,6 +612,39 @@ PHP_METHOD(NxsReader, sumI64)
     RETURN_LONG((zend_long)sum);
 }
 
+PHP_METHOD(NxsReader, prefetch_viewport)
+{
+    zend_long start, end;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_LONG(start)
+        Z_PARAM_LONG(end)
+    ZEND_PARSE_PARAMETERS_END();
+
+    reader_prefetch_viewport(Z_READER_P(ZEND_THIS), (int)start, (int)end);
+}
+
+PHP_METHOD(NxsReader, cache_stats)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    nxs_reader_t *r = Z_READER_P(ZEND_THIS);
+    int memory = 0;
+    zval *val;
+    ZEND_HASH_FOREACH_VAL(r->page_cache, val) {
+        nxs_page_entry_t *e = Z_PTR_P(val);
+        if (e->data) memory += (int)ZSTR_LEN(e->data);
+    } ZEND_HASH_FOREACH_END();
+
+    array_init(return_value);
+    add_assoc_long(return_value, "pages_cached", zend_hash_num_elements(r->page_cache));
+    add_assoc_long(return_value, "pages_max", r->max_pages);
+    add_assoc_long(return_value, "memory_used_bytes", memory);
+    add_assoc_long(return_value, "cache_hits", r->cache_hits);
+    add_assoc_long(return_value, "cache_misses", r->cache_misses);
+    add_assoc_long(return_value, "fetches_issued", r->fetches_issued);
+    add_assoc_string(return_value, "strategy", "lazy");
+    add_assoc_string(return_value, "pattern", "unknown");
+}
+
 /* ── NxsObject: lazy bitmask parse ────────────────────────────────────────── */
 
 static int nxsobj_parse(nxs_object_t *o)
@@ -513,9 +765,20 @@ PHP_METHOD(NxsObject, getBool)
 
 /* ── Arginfo ────────────────────────────────────────────────────────────────── */
 
-/* NxsReader::__construct(string $bytes): void */
+/* NxsReader::__construct(string $bytes, array $options = []): void */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_NxsReader_construct, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, bytes, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, options, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+/* NxsReader::prefetch_viewport(int $start, int $end): void */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_NxsReader_prefetch_viewport, 0, 2, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, start, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, end, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+/* NxsReader::cache_stats(): array */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_NxsReader_cache_stats, 0, 0, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
 /* NxsReader::recordCount(): int */
@@ -581,7 +844,9 @@ static const zend_function_entry nxs_reader_methods[] = {
     PHP_ME(NxsReader, sumF64,      arginfo_NxsReader_sumF64,      ZEND_ACC_PUBLIC)
     PHP_ME(NxsReader, minF64,      arginfo_NxsReader_minF64,      ZEND_ACC_PUBLIC)
     PHP_ME(NxsReader, maxF64,      arginfo_NxsReader_maxF64,      ZEND_ACC_PUBLIC)
-    PHP_ME(NxsReader, sumI64,      arginfo_NxsReader_sumI64,      ZEND_ACC_PUBLIC)
+    PHP_ME(NxsReader, sumI64,           arginfo_NxsReader_sumI64,           ZEND_ACC_PUBLIC)
+    PHP_ME(NxsReader, prefetch_viewport, arginfo_NxsReader_prefetch_viewport, ZEND_ACC_PUBLIC)
+    PHP_ME(NxsReader, cache_stats,      arginfo_NxsReader_cache_stats,      ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 

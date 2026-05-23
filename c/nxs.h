@@ -78,6 +78,9 @@ typedef struct {
 
     // scratch for key string copies
     char           _pool[NXS_MAX_KEYS * 64];
+
+    // adaptive prefetch (Phase 1); see nxs_prefetch.h
+    struct nxs_prefetch_state *prefetch;
 } nxs_reader_t;
 
 // Open a reader over a memory-mapped / pre-loaded buffer.

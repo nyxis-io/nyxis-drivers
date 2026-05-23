@@ -10,6 +10,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Nxs;
 
@@ -82,6 +84,19 @@ public sealed class NxsReader
     private ulong[] _pageOffset = Array.Empty<ulong>();
     private uint[] _pageLength = Array.Empty<uint>();
 
+    private readonly AccessHint _accessHint;
+    private readonly int _prefetchPageSize;
+    private readonly int _coalesceGapPages;
+    private readonly PageCache _pageCache;
+    private readonly SemaphoreSlim _prefetchLock = new(1, 1);
+    private readonly Func<long, long, CancellationToken, Task<byte[]>> _fetchRange;
+    private int _fetchesIssued;
+    private readonly string _prefetchStrategy = "lazy";
+    private readonly string _prefetchPattern = "unknown";
+
+    /// <summary>Advisory access hint from open options (stored only in phase 1).</summary>
+    public AccessHint AccessHint => _accessHint;
+
     public int RecordCount
     {
         get
@@ -92,7 +107,9 @@ public sealed class NxsReader
         }
     }
 
-    public NxsReader(byte[] data)
+    public NxsReader(byte[] data) : this(data, null) { }
+
+    public NxsReader(byte[] data, NxsOpenOptions? options)
     {
         _data = data;
         int size = data.Length;
@@ -175,6 +192,134 @@ public sealed class NxsReader
             _recordCount = RdU32(tp);
             _tailStart = tp + 4;
         }
+
+        var prefetchOptions = options ?? new NxsOpenOptions();
+        _accessHint = prefetchOptions.Hint;
+        _prefetchPageSize = prefetchOptions.PageSize;
+        _coalesceGapPages = prefetchOptions.CoalesceGapPages;
+        _pageCache = new PageCache(prefetchOptions.MaxPages, prefetchOptions.PageSize);
+        if (prefetchOptions.FetchRange != null)
+        {
+            _fetchRange = prefetchOptions.FetchRange;
+        }
+        else
+        {
+            byte[] backing = _data;
+            _fetchRange = (off, length, _) =>
+            {
+                long end = off + length;
+                if (off < 0 || end > backing.Length)
+                    throw new NxsException("ERR_OUT_OF_BOUNDS", $"fetch range [{off}, {end})");
+                int len = ToByteCount(length);
+                var outBuf = new byte[len];
+                Buffer.BlockCopy(backing, (int)off, outBuf, 0, len);
+                return Task.FromResult(outBuf);
+            };
+        }
+    }
+
+    private long RecordByteOffset(int i) => (long)RdU64(_tailStart + i * 10 + 2);
+
+    /// <summary>
+    /// Prefetch pages for records [startIndex, endIndex] into the LRU cache (row layout only).
+    /// </summary>
+    public async Task PrefetchViewportAsync(
+        int startIndex, int endIndex, CancellationToken cancellationToken = default)
+    {
+        if (LayoutKind != Layout.Row) return;
+        int n = RecordCount;
+        if (startIndex < 0 || endIndex < startIndex || endIndex >= n)
+            throw new NxsException(
+                "ERR_OUT_OF_BOUNDS",
+                $"prefetch_viewport [{startIndex}, {endIndex}] out of [0, {n})");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        await _prefetchLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            int pageSize = _prefetchPageSize;
+            var indices = PrefetchCoalesce.PageIndicesForViewport(
+                startIndex, endIndex, pageSize, RecordByteOffset);
+
+            var missing = new HashSet<int>();
+            foreach (int p in indices)
+            {
+                if (!_pageCache.Has(p))
+                    missing.Add(p);
+            }
+            if (missing.Count == 0)
+            {
+                _pageCache.PinPages(indices);
+                _pageCache.UnpinAll();
+                return;
+            }
+
+            var ranges = PrefetchCoalesce.ClampPageRanges(
+                PrefetchCoalesce.CoalescePageIndices(missing, _coalesceGapPages, pageSize),
+                _data.Length);
+
+            foreach (var pr in ranges)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                await FetchCoalescedRangeAsync(pr, cancellationToken).ConfigureAwait(false);
+            }
+            _pageCache.PinPages(indices);
+            _pageCache.UnpinAll();
+        }
+        finally
+        {
+            _prefetchLock.Release();
+        }
+    }
+
+    private async Task FetchCoalescedRangeAsync(PageRange pr, CancellationToken cancellationToken)
+    {
+        byte[] blob = await FetchRangeBytesAsync(pr.ByteStart, pr.ByteLength, cancellationToken)
+            .ConfigureAwait(false);
+        long pageSize = _prefetchPageSize;
+        for (int p = pr.PageStart; p <= pr.PageEnd; p++)
+        {
+            if (_pageCache.Has(p)) continue;
+            long pageOff = (long)p * pageSize - pr.ByteStart;
+            long pageLen = pageSize;
+            if (pageOff + pageLen > blob.Length)
+                pageLen = blob.Length - pageOff;
+            if (pageLen <= 0) continue;
+            int pageLenInt = ToByteCount(pageLen);
+            int pageOffInt = checked((int)pageOff);
+            var pageData = new byte[pageLenInt];
+            Buffer.BlockCopy(blob, pageOffInt, pageData, 0, pageLenInt);
+            _pageCache.Set(p, pageData);
+        }
+    }
+
+    private async Task<byte[]> FetchRangeBytesAsync(
+        long byteStart, long byteLength, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref _fetchesIssued);
+        return await _fetchRange(byteStart, byteLength, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static int ToByteCount(long length)
+    {
+        if (length < 0 || length > int.MaxValue)
+            throw new NxsException("ERR_OUT_OF_BOUNDS", $"length {length}");
+        return (int)length;
+    }
+
+    /// <summary>Diagnostic cache and prefetch counters.</summary>
+    public CacheStats CacheStats()
+    {
+        var (pagesCached, memoryUsed) = _pageCache.Stats();
+        return new CacheStats(
+            pagesCached,
+            _pageCache.MaxPages,
+            memoryUsed,
+            _pageCache.Hits,
+            _pageCache.Misses,
+            _fetchesIssued,
+            _prefetchStrategy,
+            _prefetchPattern);
     }
 
     private void ParseColumnarFooter(int size)

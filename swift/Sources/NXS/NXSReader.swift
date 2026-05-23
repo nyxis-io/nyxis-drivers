@@ -78,8 +78,12 @@ public final class NXSReader {
     public var recordCount: Int { col.recordCount }
     public var tailStart: Int { col.tailStart }
 
-    public init(_ data: Data) throws {
+    let prefetchLock = NSLock()
+    let prefetch: PrefetchState
+
+    public init(_ data: Data, options: NXSOpenOptions = NXSOpenOptions()) throws {
         self.data = data
+        self.prefetch = PrefetchState(options: options, data: data)
         let size = data.count
         guard size >= 32 else { throw NXSError.outOfBounds("file too small") }
         guard rdU32(data, 0) == magicFile else { throw NXSError.badMagic("preamble") }

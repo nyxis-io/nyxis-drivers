@@ -7,7 +7,7 @@ option(NXS_BUILD_BENCH "Build the NXS benchmark executable" ON)
 option(NXS_INSTALL     "Install NXS headers and library" ON)
 
 # ── Library ───────────────────────────────────────────────────────────────────
-add_library(nxs STATIC nxs.c)
+add_library(nxs STATIC nxs.c nxs_prefetch.c)
 target_include_directories(nxs PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
