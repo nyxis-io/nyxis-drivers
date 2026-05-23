@@ -78,8 +78,8 @@ public final class NXSReader {
     public var recordCount: Int { col.recordCount }
     public var tailStart: Int { col.tailStart }
 
-    fileprivate let prefetchLock = NSLock()
-    fileprivate let prefetch: PrefetchState
+    let prefetchLock = NSLock()
+    let prefetch: PrefetchState
 
     public init(_ data: Data, options: NXSOpenOptions = NXSOpenOptions()) throws {
         self.data = data
