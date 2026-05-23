@@ -83,7 +83,6 @@ public final class NXSReader {
 
     public init(_ data: Data, options: NXSOpenOptions = NXSOpenOptions()) throws {
         self.data = data
-        self.prefetch = PrefetchState(options: options, data: data)
         let size = data.count
         guard size >= 32 else { throw NXSError.outOfBounds("file too small") }
         guard rdU32(data, 0) == magicFile else { throw NXSError.badMagic("preamble") }
@@ -103,27 +102,7 @@ public final class NXSReader {
         var kIndex: [String: Int] = [:]
 
         if flags & flagSchema != 0 {
-            var off = 32
-            guard off + 2 <= size else { throw NXSError.outOfBounds("schema") }
-            let keyCount = Int(rdU16(data, off)); off += 2
-            guard off + keyCount <= size else { throw NXSError.outOfBounds("type manifest") }
-            kSigils = Array(data[off..<(off + keyCount)]); off += keyCount
-            for i in 0..<keyCount {
-                var end = off
-                while end < size && data[end] != 0 { end += 1 }
-                guard end < size else { throw NXSError.outOfBounds("string pool") }
-                let name = String(bytes: data[off..<end], encoding: .utf8) ?? ""
-                ks.append(name)
-                kIndex[name] = i
-                off = end + 1
-            }
-            // Pad to 8-byte boundary to find schema end
-            if off % 8 != 0 { off += 8 - (off % 8) }
-            let schemaEnd = off
-            let computed = nxsMurmur3_64(data, 32, schemaEnd - 32)
-            if computed != dictHash {
-                throw NXSError.badMagic("ERR_DICT_MISMATCH: schema hash mismatch")
-            }
+            (ks, kSigils, kIndex) = try Self.parseEmbeddedSchema(data: data, size: size, dictHash: dictHash)
         }
 
         keys      = ks
@@ -137,6 +116,14 @@ public final class NXSReader {
             resolvedTailPtr = rdU64(data, size - 28)
         }
         tailPtr = resolvedTailPtr
+        let tail = col.tailStart
+        let count = col.recordCount
+        prefetch = PrefetchState(
+            options: options, data: data, fileSize: size, tailStart: tail,
+            recordCount: { count },
+            recordOffset: { i in Int64(rdU64(data, tail + i * 10 + 2)) }
+        )
+        prefetch.startEagerBackgroundIfNeeded()
     }
 
     public func slot(_ key: String) throws -> Int {
@@ -151,6 +138,7 @@ public final class NXSReader {
         if col.layout != .row {
             return NYXObject(reader: self, offset: i, recordIndex: UInt32(i))
         }
+        prefetchOnAccess(i)
         let entryOff = tailStart + i * 10 + 2
         let absOff = Int(rdU64(data, entryOff))
         return NYXObject(reader: self, offset: absOff, recordIndex: 0)
@@ -292,7 +280,31 @@ public final class NXSReader {
     func keyIdx() -> [String: Int] { keyIndex }
     func kSigils() -> [UInt8] { keySigils }
 
-    // ── DictHash validation ───────────────────────────────────────────────────
+    private static func parseEmbeddedSchema(
+        data: Data, size: Int, dictHash: UInt64
+    ) throws -> ([String], [UInt8], [String: Int]) {
+        var off = 32
+        guard off + 2 <= size else { throw NXSError.outOfBounds("schema") }
+        let keyCount = Int(rdU16(data, off)); off += 2
+        guard off + keyCount <= size else { throw NXSError.outOfBounds("type manifest") }
+        let kSigils = Array(data[off..<(off + keyCount)]); off += keyCount
+        var ks: [String] = []
+        var kIndex: [String: Int] = [:]
+        for i in 0..<keyCount {
+            var end = off
+            while end < size && data[end] != 0 { end += 1 }
+            guard end < size else { throw NXSError.outOfBounds("string pool") }
+            let name = String(bytes: data[off..<end], encoding: .utf8) ?? ""
+            ks.append(name)
+            kIndex[name] = i
+            off = end + 1
+        }
+        if off % 8 != 0 { off += 8 - (off % 8) }
+        if nxsMurmur3_64(data, 32, off - 32) != dictHash {
+            throw NXSError.badMagic("ERR_DICT_MISMATCH: schema hash mismatch")
+        }
+        return (ks, kSigils, kIndex)
+    }
 
 }
 

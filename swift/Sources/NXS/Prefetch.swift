@@ -5,8 +5,25 @@ import Foundation
 public let defaultPageSize: Int = 65536
 public let defaultMaxPages: Int = 128
 public let defaultCoalesceGapPages: Int = 1
+public let defaultPrefetchDepth: Int = 4
+public let eagerThresholdMb: Int = 10
+public let lazyThresholdMb: Int = 50
 
-/// Advisory access hint (stored only in phase 1).
+public enum PrefetchStrategy: String { case lazy, adaptive, eager }
+
+public func initialPrefetchStrategy(hint: AccessHint, fileSize: Int) -> PrefetchStrategy {
+    let mb = fileSize / (1024 * 1024)
+    if hint == .full && mb <= eagerThresholdMb { return .eager }
+    if mb > lazyThresholdMb { return .lazy }
+    return .adaptive
+}
+
+public func rowDataSector(tailStart: Int, fileSize: Int) -> (start: Int, length: Int) {
+    if tailStart > 32 && tailStart <= fileSize { return (32, tailStart - 32) }
+    return (32, 0)
+}
+
+/// Advisory access hint.
 public enum AccessHint: UInt8 {
     case unknown = 0
     case sequential = 1
@@ -40,7 +57,7 @@ public struct NXSOpenOptions {
     public var maxPages: Int = defaultMaxPages
     public var pageSize: Int = defaultPageSize
     public var coalesceGapPages: Int = defaultCoalesceGapPages
-    /// Injectable byte-range fetcher (tests or remote I/O). Default copies from buffer.
+    public var prefetchDepth: Int = defaultPrefetchDepth
     public var fetchRange: ((Int64, Int64) throws -> Data)?
 
     public init(
@@ -48,12 +65,14 @@ public struct NXSOpenOptions {
         maxPages: Int = defaultMaxPages,
         pageSize: Int = defaultPageSize,
         coalesceGapPages: Int = defaultCoalesceGapPages,
+        prefetchDepth: Int = defaultPrefetchDepth,
         fetchRange: ((Int64, Int64) throws -> Data)? = nil
     ) {
         self.hint = hint
         self.maxPages = maxPages
         self.pageSize = pageSize
         self.coalesceGapPages = coalesceGapPages
+        self.prefetchDepth = prefetchDepth
         self.fetchRange = fetchRange
     }
 }
@@ -251,30 +270,50 @@ final class InFlightMap {
     }
 }
 
-/// Prefetch state owned by NXSReader.
+/// Phase-2 prefetch engine owned by NXSReader.
 final class PrefetchState {
     var hint: AccessHint
     var pageSize: Int
     var coalesceGapPages: Int
+    var prefetchDepth: Int
     let cache: PageCache
     let inFlight: InFlightMap
     var fetchesIssued = 0
-    let strategy = "lazy"
-    let pattern = "unknown"
     var fetchRange: (Int64, Int64) throws -> Data
 
-    init(options: NXSOpenOptions, data: Data) {
+    private let stateLock = NSLock()
+    private let cacheLock = NSLock()
+    private let detector = AccessPatternDetector()
+    private var strategy: PrefetchStrategy
+    private var eagerStarted = false
+    private var eagerComplete = false
+    private var eagerCancelled = false
+    private var eagerGroup: DispatchGroup?
+    private var closed = false
+    private let fileSize: Int
+    private(set) var tailStart: Int
+    private var recordCount: () -> Int
+    private var recordOffset: (Int) -> Int64
+
+    init(options: NXSOpenOptions, data: Data, fileSize: Int, tailStart: Int,
+         recordCount: @escaping () -> Int, recordOffset: @escaping (Int) -> Int64) {
         hint = options.hint
         pageSize = options.pageSize
         coalesceGapPages = options.coalesceGapPages
+        prefetchDepth = options.prefetchDepth
+        self.fileSize = fileSize
+        self.tailStart = tailStart
+        self.recordCount = recordCount
+        self.recordOffset = recordOffset
+        strategy = initialPrefetchStrategy(hint: options.hint, fileSize: fileSize)
         cache = PageCache(maxPages: options.maxPages, pageSize: options.pageSize)
         inFlight = InFlightMap()
         if let custom = options.fetchRange {
             fetchRange = custom
         } else {
             let buf = data
-            fetchRange = { off, length in
-                let end = off + length
+            fetchRange = { off, len in
+                let end = off + len
                 guard off >= 0, end <= Int64(buf.count) else {
                     throw NXSError.outOfBounds("fetch range [\(off), \(end))")
                 }
@@ -282,96 +321,96 @@ final class PrefetchState {
             }
         }
     }
-}
 
-// MARK: - NXSReader prefetch API (keeps NXSReader.swift under SwiftLint file_length limit)
-
-extension NXSReader {
-    /// Advisory access hint from open options (stored only in phase 1).
-    public var accessHint: AccessHint { prefetch.hint }
-
-    private func recordByteOffset(_ i: Int) -> Int64 {
-        Int64(rdU64(data, tailStart + i * 10 + 2))
+    func configureTailStart(_ start: Int) { tailStart = start }
+    func startEagerBackgroundIfNeeded() {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if strategy == .eager { startEagerBackgroundLocked() }
     }
-
-    /// Load pages for records [startIndex, endIndex] into the page cache (row layout only).
-    public func prefetchViewport(startIndex: Int, endIndex: Int) throws {
-        guard col.layout == .row else { return }
-        let n = recordCount
-        guard startIndex >= 0, endIndex >= startIndex, endIndex < n else {
-            throw NXSError.outOfBounds(
-                "prefetch_viewport [\(startIndex), \(endIndex)] out of [0, \(n))"
-            )
+    func onAccess(_ index: Int) {
+        guard recordCount() > 0 else { return }
+        stateLock.lock()
+        if closed { stateLock.unlock(); return }
+        detector.observe(index)
+        maybeUpgradeToEagerLocked()
+        let strat = strategy; let done = eagerComplete
+        stateLock.unlock()
+        if done || strat == .eager { return }
+        let off = recordOffset(index)
+        if off >= 0 {
+            cacheLock.lock(); _ = cache.get(Int(off / Int64(pageSize))); cacheLock.unlock()
         }
+        if strat == .adaptive && detector.pattern() == .sequential { speculativePrefetch() }
+    }
+    func warmup() { eagerGroup?.wait() }
+    func close() { stateLock.lock(); closed = true; eagerCancelled = true; stateLock.unlock() }
+    func currentStrategy() -> String { stateLock.lock(); defer { stateLock.unlock() }; return strategy.rawValue }
+    func currentPattern() -> String { detector.pattern().rawValue }
 
-        prefetchLock.lock()
-        defer { prefetchLock.unlock() }
-
-        let pageSize = prefetch.pageSize
-        let indices = pageIndicesForViewport(
-            startIndex: startIndex,
-            endIndex: endIndex,
-            pageSize: pageSize,
-            recordOffset: { [self] i in self.recordByteOffset(i) }
+    private func maybeUpgradeToEagerLocked() {
+        guard strategy == .adaptive, detector.pattern() == .sequential,
+              detector.sequentialRuns >= UInt32(PatternConstants.upgradeSequentialThreshold),
+              fileSize / (1024 * 1024) <= eagerThresholdMb else { return }
+        strategy = .eager; startEagerBackgroundLocked()
+    }
+    private func startEagerBackgroundLocked() {
+        guard strategy == .eager, !eagerStarted else { return }
+        eagerStarted = true
+        let g = DispatchGroup(); eagerGroup = g; g.enter()
+        DispatchQueue.global(qos: .utility).async { defer { g.leave() }; self.runEagerBackground() }
+    }
+    private func runEagerBackground() {
+        let s = rowDataSector(tailStart: tailStart, fileSize: fileSize)
+        guard s.length > 0 else { eagerComplete = true; return }
+        var end = s.start + s.length; if end > fileSize { end = fileSize }
+        guard s.start < end else { if !eagerCancelled { eagerComplete = true }; return }
+        let ps = pageSize
+        var idx: [Int] = []; for p in (s.start/ps)...((end-1)/ps) { idx.append(p) }
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if eagerCancelled { return }
+        fetchesIssued += 1
+        let eagerRanges = clampPageRanges(
+            coalescePageIndices(idx, gapPages: coalesceGapPages, pageSize: ps),
+            fileSize: Int64(fileSize)
         )
-
-        var missingSet = Set<Int>()
-        for p in indices {
-            if !prefetch.cache.has(p) && !prefetch.inFlight.has(p) {
-                missingSet.insert(p)
-            }
+        for pr in eagerRanges {
+            if eagerCancelled { return }
+            try? fetchCoalescedRangeLocked(pr)
         }
-        if missingSet.isEmpty {
-            prefetch.cache.pinPages(indices)
-            prefetch.cache.unpinAll()
-            return
+        if !eagerCancelled { eagerComplete = true }
+    }
+    private func speculativePrefetch() {
+        let pred = detector.predictNext(depth: prefetchDepth, recordCount: recordCount())
+        guard !pred.isEmpty else { return }
+        var pages: [Int] = []; var seen = Set<Int>()
+        cacheLock.lock()
+        for i in pred {
+            let off = recordOffset(i); guard off >= 0 else { continue }
+            let p = Int(off / Int64(pageSize)); guard seen.insert(p).inserted else { continue }
+            if !cache.has(p) && !inFlight.has(p) { pages.append(p) }
         }
-
-        let missing = Array(missingSet)
+        cacheLock.unlock()
+        guard !pages.isEmpty else { return }
         let ranges = clampPageRanges(
-            coalescePageIndices(missing, gapPages: prefetch.coalesceGapPages, pageSize: pageSize),
-            fileSize: Int64(data.count)
+            coalescePageIndices(pages, gapPages: coalesceGapPages, pageSize: pageSize),
+            fileSize: Int64(fileSize)
         )
-        for pr in ranges {
-            try fetchCoalescedRange(pr)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.cacheLock.lock(); defer { self.cacheLock.unlock() }
+            for pr in ranges { if self.closed { return }; try? self.fetchCoalescedRangeLocked(pr) }
         }
-        prefetch.cache.pinPages(indices)
-        prefetch.cache.unpinAll()
     }
-
-    private func fetchCoalescedRange(_ pr: PageRange) throws {
-        let blob = try fetchRangeBytes(byteStart: pr.byteStart, byteLength: pr.byteLength)
-        let pageSize = Int64(prefetch.pageSize)
+    func fetchCoalescedRangeLocked(_ pr: PageRange) throws {
+        fetchesIssued += 1
+        let blob = try fetchRange(pr.byteStart, pr.byteLength)
+        let ps = Int64(pageSize)
         for p in pr.pageStart...pr.pageEnd {
-            if prefetch.cache.has(p) { continue }
-            let pageOff = Int64(p) * pageSize - pr.byteStart
-            var pageLen = pageSize
-            if pageOff + pageLen > Int64(blob.count) {
-                pageLen = Int64(blob.count) - pageOff
-            }
-            guard pageLen > 0 else { continue }
-            let pageData = blob.subdata(in: Int(pageOff)..<Int(pageOff + pageLen))
-            prefetch.cache.set(p, data: pageData, pinned: false)
+            if cache.has(p) { continue }
+            let off = Int64(p) * ps - pr.byteStart
+            var len = ps; if off + len > Int64(blob.count) { len = Int64(blob.count) - off }
+            guard len > 0 else { continue }
+            cache.set(p, data: blob.subdata(in: Int(off)..<Int(off + len)), pinned: false)
         }
-    }
-
-    private func fetchRangeBytes(byteStart: Int64, byteLength: Int64) throws -> Data {
-        prefetch.fetchesIssued += 1
-        return try prefetch.fetchRange(byteStart, byteLength)
-    }
-
-    /// Diagnostic cache and prefetch counters.
-    public func cacheStats() -> CacheStats {
-        let (pagesCached, memoryUsed) = prefetch.cache.stats()
-        return CacheStats(
-            pagesCached: pagesCached,
-            pagesMax: prefetch.cache.maxPages,
-            memoryUsedBytes: memoryUsed,
-            cacheHits: prefetch.cache.hits,
-            cacheMisses: prefetch.cache.misses,
-            fetchesIssued: prefetch.fetchesIssued,
-            strategy: prefetch.strategy,
-            pattern: prefetch.pattern
-        )
     }
 }
