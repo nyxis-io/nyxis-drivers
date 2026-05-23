@@ -1,3 +1,3 @@
 module github.com/nyxis-io/nyxis-drivers/go
 
-go 1.25
+go 1.26

@@ -9,7 +9,7 @@ The **spec, Rust compiler, conformance vectors, demos, and bench UI** live in [`
 | Directory | Language | Notes |
 | --- | --- | --- |
 | [`c/`](./c/) | C99 | Native reader; used by Python/Ruby/PHP extensions |
-| [`go/`](./go/) | Go 1.21+ | `github.com/nyxis-io/nyxis-drivers/go` |
+| [`go/`](./go/) | Go 1.26+ | `github.com/nyxis-io/nyxis-drivers/go` |
 | [`py/`](./py/) | Python 3 | Pure reader + optional C extension |
 | [`js/`](./js/) | JavaScript | Node reader; WASM compile + decode; WASM build consumes core artifacts |
 | [`devtools-extension/`](./devtools-extension/) | Browser | **Nyxis Inspector** — DevTools panel decodes `.nxb` Network responses to `.nxs` text |

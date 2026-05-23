@@ -1,6 +1,6 @@
 # NXS — Go
 
-Zero-copy `.nxb` reader for Go 1.21+. No external dependencies.
+Zero-copy `.nxb` reader for Go 1.26+. No external dependencies.
 
 ## Install
 
@@ -10,7 +10,7 @@ go get github.com/nyxis-io/nyxis-drivers/go
 
 ## Requirements
 
-Go 1.21+.
+Go 1.26+ (see `go.mod`; CI uses 1.26).
 
 ## Read a file
 
@@ -85,6 +85,22 @@ bytes2 := nxs.WriterFromRecords(
     []map[string]any{{"id": int64(1), "username": "bob", "score": 8.2}},
 )
 ```
+
+## Streaming writer
+
+`StreamWriter` writes the preamble and schema on the first `EndObject`, using the same per-slot sigils as `Writer` (not all-string defaults). Call `Close()` once after all records.
+
+```go
+var buf bytes.Buffer
+sw, _ := nxs.NewStreamWriter(&buf, schema)
+sw.BeginObject()
+sw.WriteI64(0, 1)
+sw.WriteStr(1, "alice")
+_ = sw.EndObject()
+_ = sw.Close()
+```
+
+TypeManifest sigils match SPEC (`=`, `~`, `?`, `"`, `<`, `^`, `@`).
 
 ## Query engine
 
