@@ -8,7 +8,7 @@ all: test bench
 
 test: test.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h nxs_writer.c nxs_writer.h
 	$(CC) $(CFLAGS) -o test test.c nxs.c nxs_prefetch.c nxs_writer.c $(LDFLAGS)
-	./test ../js/fixtures
+	@# Run via top-level `make test-c` (passes FIXTURE_OUT) or: ./test ../js/fixtures
 
 test-prefetch: test_prefetch.c nxs.c nxs.h nxs_prefetch.c nxs_prefetch.h nxs_writer.c nxs_writer.h
 	$(CC) $(CFLAGS) -o test_prefetch test_prefetch.c nxs.c nxs_prefetch.c nxs_writer.c $(LDFLAGS)
