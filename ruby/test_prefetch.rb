@@ -2,6 +2,7 @@
 
 # Adaptive prefetch unit tests — run: ruby test_prefetch.rb
 
+require_relative 'pattern'
 require_relative 'nxs'
 require_relative 'nxs_writer'
 
@@ -38,12 +39,49 @@ def build_records(n)
   w.finish
 end
 
+def build_compact_records(n)
+  schema = Nxs::Schema.new(%w[id tag])
+  w = Nxs::Writer.new(schema)
+  n.times do |i|
+    w.begin_object
+    w.write_i64(0, i)
+    w.write_str(1, "r#{i}")
+    w.end_object
+  end
+  w.finish
+end
+
 puts
 puts 'NXS Ruby Prefetch — Tests'
 puts '━' * 60
 puts
 
 [
+  check('pattern unknown until min observations') do
+    d = Nxs::AccessPatternDetector.new
+    8.times { |i| d.observe(i) }
+    d.pattern == Nxs::PATTERN_UNKNOWN && d.observe(8) && d.pattern != Nxs::PATTERN_UNKNOWN
+  end,
+
+  check('pattern sequential small deltas') do
+    d = Nxs::AccessPatternDetector.new
+    20.times { |i| d.observe(i) }
+    d.pattern == Nxs::PATTERN_SEQUENTIAL
+  end,
+
+  check('pattern random large jumps') do
+    d = Nxs::AccessPatternDetector.new
+    8.times { |i| d.observe(i) }
+    12.times { |k| d.observe(k * 200) }
+    d.pattern == Nxs::PATTERN_RANDOM
+  end,
+
+  check('predict_next sequential') do
+    d = Nxs::AccessPatternDetector.new
+    10.times { |i| d.observe(i) }
+    d.predict_next(4, 100) == [10, 11, 12, 13]
+  end,
+
   check('coalesce_page_indices [3,4,6,7,12] gap=1 → 3 ranges') do
     r = Nxs.coalesce_page_indices([3, 4, 6, 7, 12], 1, Nxs::DEFAULT_PAGE_SIZE)
     r.length == 3 &&
@@ -136,7 +174,23 @@ puts
     stats = reader.cache_stats
     %i[pages_cached pages_max memory_used_bytes cache_hits cache_misses
        fetches_issued strategy pattern].all? { |k| stats.key?(k) } &&
-      stats[:strategy] == 'lazy' && stats[:pattern] == 'unknown'
+      stats[:strategy] == 'adaptive' && stats[:pattern] == Nxs::PATTERN_UNKNOWN
+  end,
+
+  check('hint full small file eager at open') do
+    buf = build_records(200)
+    reader = Nxs::Reader.new(buf, hint: Nxs::HINT_FULL)
+    reader.warmup
+    reader.cache_stats[:strategy] == 'eager'
+  end,
+
+  check('sequential upgrade to eager after 150 record() calls') do
+    buf = build_compact_records(200)
+    reader = Nxs::Reader.new(buf)
+    150.times { |i| reader.record(i) }
+    reader.warmup
+    stats = reader.cache_stats
+    stats[:strategy] == 'eager' && stats[:pattern] == Nxs::PATTERN_SEQUENTIAL
   end,
 
   check('prefetch_viewport out-of-bounds raises') do

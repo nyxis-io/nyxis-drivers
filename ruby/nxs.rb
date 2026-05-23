@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'pattern'
+
 # NXS Reader — .nxb parser (Ruby 3.x, stdlib only).
 #
 # Implements Nyxis v1.1 binary wire format.
@@ -39,6 +41,9 @@ module Nxs
   DEFAULT_PAGE_SIZE = 65_536
   DEFAULT_MAX_PAGES = 64
   DEFAULT_COALESCE_GAP_PAGES = 1
+  DEFAULT_PREFETCH_DEPTH = 4
+  EAGER_THRESHOLD_MB = 10
+  LAZY_THRESHOLD_MB = 50
 
   HINT_UNKNOWN = 0
   HINT_SEQUENTIAL = 1
@@ -58,6 +63,26 @@ module Nxs
     return hint if hint.is_a?(Integer)
 
     HINT_SYMBOLS.fetch(hint) { HINT_UNKNOWN }
+  end
+
+  # Initial prefetch strategy from open hint and file size (spec §5.1).
+  def self.initial_strategy(hint, file_size)
+    hint = normalize_hint(hint)
+    file_size_mb = file_size / (1024 * 1024)
+    return 'eager' if hint == HINT_FULL && file_size_mb <= EAGER_THRESHOLD_MB
+    return 'lazy' if file_size_mb > LAZY_THRESHOLD_MB
+
+    'adaptive'
+  end
+
+  # Row-layout data sector byte range [start, length).
+  def self.row_data_sector(tail_start, file_size)
+    sector_start = 32
+    if tail_start > sector_start && tail_start <= file_size
+      [sector_start, tail_start - sector_start]
+    else
+      [sector_start, 0]
+    end
   end
 
   # Merge sorted unique page indices when gap <= gap_pages (inclusive).
@@ -246,6 +271,7 @@ module Nxs
       max_pages = options.fetch(:max_pages, DEFAULT_MAX_PAGES)
       page_size = options.fetch(:page_size, DEFAULT_PAGE_SIZE)
       coalesce_gap_pages = options.fetch(:coalesce_gap_pages, DEFAULT_COALESCE_GAP_PAGES)
+      prefetch_depth = options.fetch(:prefetch_depth, DEFAULT_PREFETCH_DEPTH)
       fetch_range = options.fetch(:fetch_range, nil)
       @data = bytes.b # force binary encoding
       sz = @data.bytesize
@@ -288,6 +314,7 @@ module Nxs
         max_pages: max_pages,
         page_size: page_size,
         coalesce_gap_pages: coalesce_gap_pages,
+        prefetch_depth: prefetch_depth,
         fetch_range: fetch_range
       )
     end
@@ -300,6 +327,7 @@ module Nxs
 
       return Object.new(self, i, i) if @layout != :row
 
+      on_access(i)
       abs_offset = @data.unpack1("@#{@tail_start + i * 10 + 2}Q<")
       Object.new(self, abs_offset)
     end
@@ -486,16 +514,25 @@ module Nxs
       end
     end
 
-    def init_prefetch!(hint:, max_pages:, page_size:, coalesce_gap_pages:, fetch_range:)
+    # rubocop:disable Metrics/ParameterLists -- prefetch open options mirror Go OpenOptions
+    def init_prefetch!(hint:, max_pages:, page_size:, coalesce_gap_pages:, prefetch_depth:, fetch_range:)
       @prefetch_mu = Mutex.new
+      @cache_mu = Mutex.new
       @prefetch_hint = Nxs.normalize_hint(hint)
       @prefetch_page_size = page_size
+      @prefetch_depth = prefetch_depth.positive? ? prefetch_depth : DEFAULT_PREFETCH_DEPTH
       @coalesce_gap_pages = coalesce_gap_pages
       @page_cache = PageCache.new(max_pages, page_size)
       @in_flight = InFlightMap.new
       @fetches_issued = 0
-      @prefetch_strategy = 'lazy'
-      @prefetch_pattern = 'unknown'
+      @detector = AccessPatternDetector.new
+      @prefetch_strategy = Nxs.initial_strategy(@prefetch_hint, @data.bytesize)
+      @prefetch_pattern = PATTERN_UNKNOWN
+      @eager_started = false
+      @eager_complete = false
+      @eager_cancel = false
+      @eager_thread = nil
+      @closed = false
       @fetch_range = fetch_range || lambda do |byte_start, byte_length|
         raise NxsError.new('ERR_OUT_OF_BOUNDS', 'fetch range out of bounds') if byte_start.negative?
 
@@ -504,6 +541,52 @@ module Nxs
 
         @data[byte_start, byte_length]
       end
+      start_eager_background! if @layout == :row && @prefetch_strategy == 'eager'
+    end
+    # rubocop:enable Metrics/ParameterLists
+
+    # Block until eager / background prefetch completes (spec §8).
+    def warmup
+      t = @prefetch_mu.synchronize { @eager_thread }
+      t&.join
+    end
+
+    # Cancel in-flight eager prefetch and wait for the background thread.
+    def close
+      t = nil
+      @prefetch_mu.synchronize do
+        @closed = true
+        @eager_cancel = true
+        t = @eager_thread
+      end
+      t&.join
+    end
+
+    def on_access(index)
+      return unless @layout == :row
+      return if @record_count.zero?
+
+      adaptive_seq = false
+      skip_spec = false
+      start_eager = false
+      @prefetch_mu.synchronize do
+        return if @closed
+
+        @detector.observe(index)
+        @prefetch_pattern = @detector.pattern
+        start_eager = maybe_upgrade_to_eager!
+        if eager_complete? || @prefetch_strategy == 'eager'
+          skip_spec = true
+          next
+        end
+        page_index = record_byte_offset(index) / @prefetch_page_size
+        @cache_mu.synchronize { @page_cache.get(page_index) }
+        adaptive_seq = @prefetch_strategy == 'adaptive' && @detector.pattern == PATTERN_SEQUENTIAL
+      end
+      start_eager_background! if start_eager
+      return if skip_spec
+
+      speculative_prefetch! if adaptive_seq
     end
 
     def record_byte_offset(i)
@@ -522,7 +605,7 @@ module Nxs
         )
       end
 
-      @prefetch_mu.synchronize do
+      @cache_mu.synchronize do
         page_size = @prefetch_page_size
         indices = Nxs.page_indices_for_viewport(start_index, end_index, page_size) do |i|
           record_byte_offset(i)
@@ -538,7 +621,7 @@ module Nxs
           Nxs.coalesce_page_indices(missing, @coalesce_gap_pages, page_size),
           @data.bytesize
         )
-        ranges.each { |r| fetch_coalesced_range!(r) }
+        ranges.each { |r| fetch_coalesced_range_unlocked!(r) }
         @page_cache.pin_pages(indices)
         @page_cache.unpin_all
       end
@@ -547,16 +630,106 @@ module Nxs
 
     def cache_stats
       stats = @page_cache.stats
+      strategy, pattern = @prefetch_mu.synchronize do
+        [@prefetch_strategy, @detector.pattern]
+      end
       stats.merge(
         fetches_issued: @fetches_issued,
-        strategy: @prefetch_strategy,
-        pattern: @prefetch_pattern
+        strategy: strategy,
+        pattern: pattern
       )
     end
 
     private
 
+    def eager_complete?
+      @prefetch_strategy == 'eager' && @eager_complete
+    end
+
+    def maybe_upgrade_to_eager!
+      return unless @prefetch_strategy == 'adaptive'
+      return unless @detector.pattern == PATTERN_SEQUENTIAL
+      return if @detector.sequential_runs < UPGRADE_SEQUENTIAL_THRESHOLD
+      return if @data.bytesize / (1024 * 1024) > EAGER_THRESHOLD_MB
+
+      @prefetch_strategy = 'eager'
+      true
+    end
+
+    def speculative_prefetch!
+      predicted = @prefetch_mu.synchronize { @detector.predict_next(@prefetch_depth, @record_count) }
+      return if predicted.empty?
+
+      page_size = @prefetch_page_size
+      missing = @cache_mu.synchronize do
+        predicted.filter_map do |idx|
+          off = record_byte_offset(idx)
+          p = off / page_size
+          p unless @page_cache.has?(p) || @in_flight.has?(p)
+        end.uniq
+      end
+      return if missing.empty?
+
+      ranges = Nxs.clamp_page_ranges(
+        Nxs.coalesce_page_indices(missing, @coalesce_gap_pages, page_size),
+        @data.bytesize
+      )
+      ranges.each { |r| fetch_coalesced_range!(r) }
+    end
+
+    def start_eager_background!
+      return unless @prefetch_strategy == 'eager'
+
+      @prefetch_mu.synchronize do
+        return if @eager_started
+
+        @eager_started = true
+        sector_start, sector_len = Nxs.row_data_sector(@tail_start, @data.bytesize)
+        if sector_len.zero?
+          @eager_complete = true
+          next
+        end
+        @eager_thread = Thread.new { run_eager_background(sector_start, sector_len) }
+      end
+    end
+
+    def run_eager_background(sector_start, sector_len)
+      end_byte = [sector_start + sector_len, @data.bytesize].min
+      return if sector_start >= end_byte
+
+      page_size = @prefetch_page_size
+      first_page = sector_start / page_size
+      last_page = (end_byte - 1) / page_size
+      indices = (first_page..last_page).to_a
+      eager_cancelled = @prefetch_mu.synchronize { @eager_cancel }
+      return if eager_cancelled
+
+      missing = @cache_mu.synchronize do
+        indices.select { |p| !@page_cache.has?(p) && !@in_flight.has?(p) }
+      end
+      if missing.empty?
+        @prefetch_mu.synchronize { @eager_complete = true unless @eager_cancel }
+        return
+      end
+
+      ranges = Nxs.clamp_page_ranges(
+        Nxs.coalesce_page_indices(missing, @coalesce_gap_pages, page_size),
+        @data.bytesize
+      )
+      @cache_mu.synchronize { @fetches_issued += 1 } unless ranges.empty?
+      ranges.each do |r|
+        break if @prefetch_mu.synchronize { @eager_cancel }
+
+        fetch_coalesced_range!(r)
+      end
+      @prefetch_mu.synchronize { @eager_complete = true unless @eager_cancel }
+    end
+
     def fetch_coalesced_range!(page_range)
+      @cache_mu.synchronize { fetch_coalesced_range_unlocked!(page_range) }
+    end
+
+    def fetch_coalesced_range_unlocked!(page_range)
       blob = fetch_range_bytes!(page_range[:byte_start], page_range[:byte_length])
       page_size = @prefetch_page_size
       (page_range[:page_start]..page_range[:page_end]).each do |p|
