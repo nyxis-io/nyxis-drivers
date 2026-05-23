@@ -24,7 +24,10 @@ private const val FLAG_SCHEMA: Int = 0x0002
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
-class NxsReader(internal val data: ByteArray) {
+class NxsReader @JvmOverloads constructor(
+    internal val data: ByteArray,
+    options: OpenOptions = OpenOptions(),
+) {
     val version: Short
     val flags: Short
     var dictHash: Long
@@ -44,6 +47,23 @@ class NxsReader(internal val data: ByteArray) {
     internal var pageRecCount: IntArray = intArrayOf()
     internal var pageOffset: LongArray = longArrayOf()
     internal var pageLength: IntArray = intArrayOf()
+
+    private val prefetchLock = Any()
+    private val prefetchHint: AccessHint = options.hint
+    private val prefetchPageSize: Int = options.pageSize
+    private val coalesceGapPages: Int = options.coalesceGapPages
+    private val pageCache: PageCache = PageCache(options.maxPages, options.pageSize)
+    private var fetchesIssued: Int = 0
+    private val fetchRange: (Long, Long) -> ByteArray =
+        options.fetchRange ?: { off, len ->
+            val end = off + len
+            if (off < 0 || end > data.size) {
+                throw NxsError("ERR_OUT_OF_BOUNDS", "fetch range [$off, $end)")
+            }
+            data.copyOfRange(off.toInt(), end.toInt())
+        }
+    private val prefetchStrategy: String = "lazy"
+    private val prefetchPattern: String = "unknown"
 
     init {
         if (data.size < 32) throw NxsError("ERR_OUT_OF_BOUNDS", "file too small")
@@ -90,6 +110,84 @@ class NxsReader(internal val data: ByteArray) {
     }
 
     fun layoutKind(): Layout = layout
+
+    /** Advisory access hint (stored only in phase 1). */
+    fun accessHint(): AccessHint = prefetchHint
+
+    private fun recordByteOffset(i: Int): Long = readU64(tailStart + i * 10 + 2)
+
+    /**
+     * Prefetch pages for records [startIndex, endIndex] into the page cache (row layout only).
+     * Blocks until all required pages are cached.
+     */
+    fun prefetchViewport(
+        startIndex: Int,
+        endIndex: Int,
+    ) {
+        if (layout != Layout.ROW) return
+        if (startIndex < 0 || endIndex < startIndex || endIndex >= recordCount) {
+            throw NxsError(
+                "ERR_OUT_OF_BOUNDS",
+                "prefetch_viewport [$startIndex, $endIndex] out of [0, $recordCount)",
+            )
+        }
+
+        synchronized(prefetchLock) {
+            val indices =
+                pageIndicesForViewport(startIndex, endIndex, prefetchPageSize) { i ->
+                    recordByteOffset(i)
+                }
+
+            val missing = indices.filter { p -> !pageCache.has(p) }.distinct()
+            if (missing.isNotEmpty()) {
+                val ranges =
+                    clampPageRanges(
+                        coalescePageIndices(missing.toIntArray(), coalesceGapPages, prefetchPageSize),
+                        data.size.toLong(),
+                    )
+                for (pr in ranges) {
+                    fetchCoalescedRange(pr)
+                }
+            }
+            pageCache.pinPages(indices)
+        }
+    }
+
+    /** Diagnostic cache and prefetch counters. */
+    fun cacheStats(): CacheStats {
+        val (pagesCached, memoryUsed) = pageCache.stats()
+        return CacheStats(
+            pagesCached = pagesCached,
+            pagesMax = pageCache.maxPages,
+            memoryUsedBytes = memoryUsed,
+            cacheHits = pageCache.hits,
+            cacheMisses = pageCache.misses,
+            fetchesIssued = fetchesIssued,
+            strategy = prefetchStrategy,
+            pattern = prefetchPattern,
+        )
+    }
+
+    private fun fetchCoalescedRange(pr: PageRange) {
+        val blob = fetchRangeBytes(pr.byteStart, pr.byteLength)
+        val pageSize = prefetchPageSize.toLong()
+        for (p in pr.pageStart..pr.pageEnd) {
+            if (pageCache.has(p)) continue
+            val pageOff = p * pageSize - pr.byteStart
+            var pageLen = pageSize
+            if (pageOff + pageLen > blob.size) pageLen = blob.size - pageOff
+            if (pageLen <= 0) continue
+            pageCache.set(p, blob.copyOfRange(pageOff.toInt(), (pageOff + pageLen).toInt()))
+        }
+    }
+
+    private fun fetchRangeBytes(
+        byteStart: Long,
+        byteLength: Long,
+    ): ByteArray {
+        fetchesIssued++
+        return fetchRange(byteStart, byteLength)
+    }
 
     private val buf: ByteBuffer get() = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
 
