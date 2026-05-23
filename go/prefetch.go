@@ -1,9 +1,11 @@
 package nxs
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // Adaptive prefetch constants (spec §6–§8.4).
@@ -11,9 +13,81 @@ const (
 	DefaultPageSize         = 65536
 	DefaultMaxPages         = 256
 	DefaultCoalesceGapPages = 1
+	DefaultPrefetchDepth    = 4
+	EagerThresholdMB        = 10
+	LazyThresholdMB         = 50
 )
 
-// AccessHint is advisory only in phase 1 (stored, not acted on).
+// PrefetchStrategy is the active prefetch mode (spec §5).
+type PrefetchStrategy int
+
+const (
+	StrategyLazy PrefetchStrategy = iota
+	StrategyAdaptive
+	StrategyEager
+)
+
+func (s PrefetchStrategy) String() string {
+	switch s {
+	case StrategyAdaptive:
+		return "adaptive"
+	case StrategyEager:
+		return "eager"
+	default:
+		return "lazy"
+	}
+}
+
+// OpenOptions configures prefetch at open time.
+type OpenOptions struct {
+	Hint             AccessHint
+	MaxPages         int
+	PageSize         int
+	CoalesceGapPages int
+	PrefetchDepth    int
+}
+
+// DefaultOpenOptions returns spec defaults.
+func DefaultOpenOptions() OpenOptions {
+	return OpenOptions{
+		Hint:             HintUnknown,
+		MaxPages:         DefaultMaxPages,
+		PageSize:         DefaultPageSize,
+		CoalesceGapPages: DefaultCoalesceGapPages,
+		PrefetchDepth:    DefaultPrefetchDepth,
+	}
+}
+
+// Validate checks open-time options.
+func (o OpenOptions) Validate() error {
+	if o.PageSize <= 0 {
+		return fmt.Errorf("ERR_PARSE: prefetch page_size must be greater than 0")
+	}
+	return nil
+}
+
+// InitialStrategy selects lazy/adaptive/eager from hint and file size (§5.1).
+func InitialStrategy(hint AccessHint, fileSize int) PrefetchStrategy {
+	fileSizeMB := fileSize / (1024 * 1024)
+	if hint == HintFull && fileSizeMB <= EagerThresholdMB {
+		return StrategyEager
+	}
+	if fileSizeMB > LazyThresholdMB {
+		return StrategyLazy
+	}
+	return StrategyAdaptive
+}
+
+// RowDataSector returns row-layout data sector byte range [start, length).
+func RowDataSector(tailStart, fileSize int) (start, length int) {
+	const sectorStart = 32
+	if tailStart > sectorStart && tailStart <= fileSize {
+		return sectorStart, tailStart - sectorStart
+	}
+	return sectorStart, 0
+}
+
+// AccessHint is advisory for prefetch strategy selection.
 type AccessHint uint8
 
 const (
@@ -285,4 +359,334 @@ func (f *inFlightMap) finish(pageIndex int, entry *inFlightEntry) {
 		delete(f.m, pageIndex)
 	}
 	f.mu.Unlock()
+}
+
+// prefetchEngine drives page cache, pattern detection, and strategies (spec §4–§8.4).
+type prefetchEngine struct {
+	mu      sync.Mutex
+	cacheMu sync.Mutex
+
+	cache         *PageCache
+	inFlight      *inFlightMap
+	fetchesIssued int
+	options       OpenOptions
+	strategy      PrefetchStrategy
+	detector      *AccessPatternDetector
+	fileSize      int
+	tailStart     int
+	recordCount   int
+	data          []byte
+	recordOffset  func(int) int64
+	fetchRange    func(off, length int64) ([]byte, error)
+
+	eagerCancel   context.CancelFunc
+	eagerDone     chan struct{}
+	eagerStarted  bool
+	eagerComplete atomic.Bool
+	closed        bool
+}
+
+func newPrefetchEngine(opts OpenOptions, fileSize, tailStart, recordCount int, data []byte, recordOffset func(int) int64, fetchRange func(off, length int64) ([]byte, error)) *prefetchEngine {
+	if opts.MaxPages <= 0 {
+		opts.MaxPages = DefaultMaxPages
+	}
+	if opts.PageSize <= 0 {
+		opts.PageSize = DefaultPageSize
+	}
+	if opts.CoalesceGapPages < 0 {
+		opts.CoalesceGapPages = DefaultCoalesceGapPages
+	}
+	if opts.PrefetchDepth <= 0 {
+		opts.PrefetchDepth = DefaultPrefetchDepth
+	}
+	e := &prefetchEngine{
+		cache:        newPageCache(opts.MaxPages, opts.PageSize),
+		inFlight:     newInFlightMap(),
+		options:      opts,
+		strategy:     InitialStrategy(opts.Hint, fileSize),
+		detector:     NewAccessPatternDetector(),
+		fileSize:     fileSize,
+		tailStart:    tailStart,
+		recordCount:  recordCount,
+		data:         data,
+		recordOffset: recordOffset,
+		fetchRange:   fetchRange,
+	}
+	if e.strategy == StrategyEager {
+		e.startEagerBackground()
+	}
+	return e
+}
+
+func (e *prefetchEngine) cacheStats() CacheStats {
+	e.mu.Lock()
+	strategy := e.strategy.String()
+	pattern := e.detector.Pattern().String()
+	e.mu.Unlock()
+	e.cacheMu.Lock()
+	defer e.cacheMu.Unlock()
+	pagesCached, memoryUsed := e.cache.stats()
+	return CacheStats{
+		PagesCached:     pagesCached,
+		PagesMax:        e.cache.maxPages,
+		MemoryUsedBytes: memoryUsed,
+		CacheHits:       e.cache.hits,
+		CacheMisses:     e.cache.misses,
+		FetchesIssued:   e.fetchesIssued,
+		Strategy:        strategy,
+		Pattern:         pattern,
+	}
+}
+
+func (e *prefetchEngine) isEagerComplete() bool {
+	return e.strategy == StrategyEager && e.eagerComplete.Load()
+}
+
+func (e *prefetchEngine) close() {
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.closed = true
+	cancel := e.eagerCancel
+	done := e.eagerDone
+	e.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (e *prefetchEngine) warmup() {
+	e.mu.Lock()
+	done := e.eagerDone
+	e.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+func (e *prefetchEngine) onAccess(index int) {
+	if e.recordCount == 0 {
+		return
+	}
+	e.mu.Lock()
+	if e.closed {
+		e.mu.Unlock()
+		return
+	}
+	e.detector.Observe(index)
+	e.maybeUpgradeToEager()
+	eager := e.isEagerComplete() || e.strategy == StrategyEager
+	adaptiveSeq := e.strategy == StrategyAdaptive && e.detector.Pattern() == PatternSequential
+	e.mu.Unlock()
+	if eager {
+		return
+	}
+	if off := e.recordOffset(index); off >= 0 {
+		pageIndex := int(off / int64(e.options.PageSize))
+		e.cacheMu.Lock()
+		_ = e.cache.get(pageIndex)
+		e.cacheMu.Unlock()
+	}
+	if adaptiveSeq {
+		e.speculativePrefetch()
+	}
+}
+
+func (e *prefetchEngine) maybeUpgradeToEager() {
+	if e.strategy != StrategyAdaptive {
+		return
+	}
+	if e.detector.Pattern() != PatternSequential {
+		return
+	}
+	if e.detector.SequentialRuns() < UpgradeSequentialThreshold {
+		return
+	}
+	if e.fileSize/(1024*1024) > EagerThresholdMB {
+		return
+	}
+	e.strategy = StrategyEager
+	e.startEagerBackground()
+}
+
+func (e *prefetchEngine) startEagerBackground() {
+	if e.strategy != StrategyEager || e.eagerStarted {
+		return
+	}
+	e.eagerStarted = true
+	sectorStart, sectorLen := RowDataSector(e.tailStart, len(e.data))
+	if sectorLen == 0 {
+		e.eagerComplete.Store(true)
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.eagerCancel = cancel
+	done := make(chan struct{})
+	e.eagerDone = done
+
+	go func() {
+		defer close(done)
+		end := sectorStart + sectorLen
+		if end > len(e.data) {
+			end = len(e.data)
+		}
+		if sectorStart >= end {
+			if ctx.Err() == nil {
+				e.eagerComplete.Store(true)
+			}
+			return
+		}
+		pageSize := e.options.PageSize
+		firstPage := sectorStart / pageSize
+		lastPage := (end - 1) / pageSize
+		indices := make([]int, 0, lastPage-firstPage+1)
+		for p := firstPage; p <= lastPage; p++ {
+			indices = append(indices, p)
+		}
+		ranges := clampPageRanges(
+			CoalescePageIndices(indices, e.options.CoalesceGapPages, pageSize),
+			int64(len(e.data)),
+		)
+		e.cacheMu.Lock()
+		e.fetchesIssued++
+		e.cacheMu.Unlock()
+		for _, pr := range ranges {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := e.fetchCoalescedRange(ctx, pr); err != nil {
+				return
+			}
+		}
+		if ctx.Err() == nil {
+			e.eagerComplete.Store(true)
+		}
+	}()
+}
+
+func (e *prefetchEngine) speculativePrefetch() {
+	depth := e.options.PrefetchDepth
+	e.mu.Lock()
+	predicted := e.detector.PredictNext(depth, e.recordCount)
+	e.mu.Unlock()
+	if len(predicted) == 0 {
+		return
+	}
+	pageSize := e.options.PageSize
+	seen := make(map[int]struct{})
+	var pageIndices []int
+	e.cacheMu.Lock()
+	for _, idx := range predicted {
+		off := e.recordOffset(idx)
+		if off < 0 {
+			continue
+		}
+		p := int(off / int64(pageSize))
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		if !e.cache.has(p) && !e.inFlight.has(p) {
+			pageIndices = append(pageIndices, p)
+		}
+	}
+	e.cacheMu.Unlock()
+	if len(pageIndices) == 0 {
+		return
+	}
+	sort.Ints(pageIndices)
+	ranges := clampPageRanges(
+		CoalescePageIndices(pageIndices, e.options.CoalesceGapPages, pageSize),
+		int64(len(e.data)),
+	)
+	for _, pr := range ranges {
+		_ = e.fetchCoalescedRange(context.Background(), pr)
+	}
+}
+
+func (e *prefetchEngine) prefetchViewport(ctx context.Context, startIndex, endIndex int) error {
+	if e.recordCount == 0 || len(e.data) == 0 {
+		return nil
+	}
+	e.mu.Lock()
+	closed := e.closed
+	e.mu.Unlock()
+	if closed {
+		return ctx.Err()
+	}
+	pageSize := e.options.PageSize
+	indices := pageIndicesForViewport(startIndex, endIndex, pageSize, e.recordOffset)
+	e.cacheMu.Lock()
+	defer e.cacheMu.Unlock()
+	missingSet := make(map[int]struct{})
+	for _, p := range indices {
+		if !e.cache.has(p) && !e.inFlight.has(p) {
+			missingSet[p] = struct{}{}
+		}
+	}
+	if len(missingSet) > 0 {
+		missing := make([]int, 0, len(missingSet))
+		for p := range missingSet {
+			missing = append(missing, p)
+		}
+		ranges := clampPageRanges(
+			CoalescePageIndices(missing, e.options.CoalesceGapPages, pageSize),
+			int64(len(e.data)),
+		)
+		for _, pr := range ranges {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := e.fetchCoalescedRangeLocked(ctx, pr); err != nil {
+				return err
+			}
+		}
+	}
+	e.cache.pinPages(indices)
+	e.cache.unpinAll()
+	return nil
+}
+
+func (e *prefetchEngine) fetchCoalescedRange(ctx context.Context, pr PageRange) error {
+	e.cacheMu.Lock()
+	defer e.cacheMu.Unlock()
+	return e.fetchCoalescedRangeLocked(ctx, pr)
+}
+
+func (e *prefetchEngine) fetchCoalescedRangeLocked(ctx context.Context, pr PageRange) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.fetchesIssued++
+	blob, err := e.fetchRange(pr.ByteStart, pr.ByteLength)
+	if err != nil {
+		return err
+	}
+	pageSize := int64(e.options.PageSize)
+	for p := pr.PageStart; p <= pr.PageEnd; p++ {
+		if e.cache.has(p) {
+			continue
+		}
+		pageOff := int64(p)*pageSize - pr.ByteStart
+		pageLen := pageSize
+		if pageOff+pageLen > int64(len(blob)) {
+			pageLen = int64(len(blob)) - pageOff
+		}
+		if pageLen <= 0 {
+			continue
+		}
+		n, err := intFromInt64(pageLen)
+		if err != nil {
+			return err
+		}
+		pageData := make([]byte, n)
+		copy(pageData, blob[int(pageOff):int(pageOff+pageLen)])
+		e.cache.set(p, pageData, false)
+	}
+	return nil
 }

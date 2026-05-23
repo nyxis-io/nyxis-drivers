@@ -15,7 +15,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"sync"
 )
 
 // ── Format constants ─────────────────────────────────────────────────────────
@@ -57,16 +56,7 @@ type Reader struct {
 	pageOffset   []uint64
 	pageLength   []uint32
 
-	prefetchMu       sync.Mutex
-	prefetchHint     AccessHint
-	prefetchPageSize int
-	coalesceGapPages int
-	pageCache        *PageCache
-	inFlight         *inFlightMap
-	fetchesIssued    int
-	fetchRange       func(off, length int64) ([]byte, error)
-	prefetchStrategy string
-	prefetchPattern  string
+	prefetch *prefetchEngine
 }
 
 type readerConfig struct {
@@ -74,6 +64,7 @@ type readerConfig struct {
 	maxPages         int
 	pageSize         int
 	coalesceGapPages int
+	prefetchDepth    int
 	fetchRange       func(off, length int64) ([]byte, error)
 }
 
@@ -83,13 +74,14 @@ func defaultReaderConfig() readerConfig {
 		maxPages:         DefaultMaxPages,
 		pageSize:         DefaultPageSize,
 		coalesceGapPages: DefaultCoalesceGapPages,
+		prefetchDepth:    DefaultPrefetchDepth,
 	}
 }
 
 // ReaderOption configures prefetch behavior on NewReader.
 type ReaderOption func(*readerConfig)
 
-// WithHint sets an advisory access hint (stored only in phase 1).
+// WithHint sets an advisory access hint for prefetch strategy selection.
 func WithHint(h AccessHint) ReaderOption {
 	return func(c *readerConfig) { c.hint = h }
 }
@@ -109,27 +101,62 @@ func WithCoalesceGapPages(n int) ReaderOption {
 	return func(c *readerConfig) { c.coalesceGapPages = n }
 }
 
+// WithPrefetchDepth sets how many records ahead to speculatively prefetch when sequential.
+func WithPrefetchDepth(n int) ReaderOption {
+	return func(c *readerConfig) { c.prefetchDepth = n }
+}
+
+// WithOpenOptions applies a full OpenOptions struct.
+func WithOpenOptions(o OpenOptions) ReaderOption {
+	return func(c *readerConfig) {
+		c.hint = o.Hint
+		if o.MaxPages > 0 {
+			c.maxPages = o.MaxPages
+		}
+		if o.PageSize > 0 {
+			c.pageSize = o.PageSize
+		}
+		if o.CoalesceGapPages >= 0 {
+			c.coalesceGapPages = o.CoalesceGapPages
+		}
+		if o.PrefetchDepth > 0 {
+			c.prefetchDepth = o.PrefetchDepth
+		}
+	}
+}
+
 // WithFetchRange injects a byte-range fetcher (for tests or remote I/O).
 func WithFetchRange(fn func(off, length int64) ([]byte, error)) ReaderOption {
 	return func(c *readerConfig) { c.fetchRange = fn }
 }
 
 func (r *Reader) initPrefetch(cfg readerConfig) {
-	r.prefetchHint = cfg.hint
-	r.prefetchPageSize = cfg.pageSize
-	r.coalesceGapPages = cfg.coalesceGapPages
-	r.pageCache = newPageCache(cfg.maxPages, cfg.pageSize)
-	r.inFlight = newInFlightMap()
-	r.prefetchStrategy = "lazy"
-	r.prefetchPattern = "unknown"
-	if cfg.fetchRange != nil {
-		r.fetchRange = cfg.fetchRange
-	} else {
+	if r.layout != LayoutRow {
+		return
+	}
+	opts := OpenOptions{
+		Hint:             cfg.hint,
+		MaxPages:         cfg.maxPages,
+		PageSize:         cfg.pageSize,
+		CoalesceGapPages: cfg.coalesceGapPages,
+		PrefetchDepth:    cfg.prefetchDepth,
+	}
+	fetchRange := cfg.fetchRange
+	if fetchRange == nil {
 		data := r.data
-		r.fetchRange = func(off, length int64) ([]byte, error) {
+		fetchRange = func(off, length int64) ([]byte, error) {
 			return sliceInt64(data, off, length)
 		}
 	}
+	r.prefetch = newPrefetchEngine(
+		opts,
+		len(r.data),
+		r.tailStart,
+		int(r.recordCount),
+		r.data,
+		r.recordByteOffset,
+		fetchRange,
+	)
 }
 
 // NewReader validates the file header and extracts the schema and tail-index
@@ -138,6 +165,16 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 	cfg := defaultReaderConfig()
 	for _, o := range opts {
 		o(&cfg)
+	}
+	openOpts := OpenOptions{
+		Hint:             cfg.hint,
+		MaxPages:         cfg.maxPages,
+		PageSize:         cfg.pageSize,
+		CoalesceGapPages: cfg.coalesceGapPages,
+		PrefetchDepth:    cfg.prefetchDepth,
+	}
+	if err := openOpts.Validate(); err != nil {
+		return nil, err
 	}
 	if len(data) < 32 {
 		return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: file too small")
@@ -181,7 +218,7 @@ func (r *Reader) recordByteOffset(i int) int64 {
 // PrefetchViewport loads pages for records [startIndex, endIndex] into the page
 // cache (row layout only). Blocks until all required pages are cached.
 func (r *Reader) PrefetchViewport(ctx context.Context, startIndex, endIndex int) error {
-	if r.layout != LayoutRow {
+	if r.prefetch == nil {
 		return nil
 	}
 	n := int(r.recordCount)
@@ -191,96 +228,32 @@ func (r *Reader) PrefetchViewport(ctx context.Context, startIndex, endIndex int)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-
-	r.prefetchMu.Lock()
-	defer r.prefetchMu.Unlock()
-
-	pageSize := r.prefetchPageSize
-	indices := pageIndicesForViewport(startIndex, endIndex, pageSize, r.recordByteOffset)
-
-	missingSet := make(map[int]struct{})
-	for _, p := range indices {
-		if !r.pageCache.has(p) && !r.inFlight.has(p) {
-			missingSet[p] = struct{}{}
-		}
-	}
-	if len(missingSet) == 0 {
-		r.pageCache.pinPages(indices)
-		r.pageCache.unpinAll()
-		return nil
-	}
-	missing := make([]int, 0, len(missingSet))
-	for p := range missingSet {
-		missing = append(missing, p)
-	}
-
-	ranges := clampPageRanges(
-		CoalescePageIndices(missing, r.coalesceGapPages, pageSize),
-		int64(len(r.data)),
-	)
-	for _, pr := range ranges {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := r.fetchCoalescedRange(ctx, pr); err != nil {
-			return err
-		}
-	}
-	r.pageCache.pinPages(indices)
-	r.pageCache.unpinAll()
-	return nil
+	return r.prefetch.prefetchViewport(ctx, startIndex, endIndex)
 }
 
-func (r *Reader) fetchCoalescedRange(ctx context.Context, pr PageRange) error {
-	blob, err := r.fetchRangeBytes(ctx, pr.ByteStart, pr.ByteLength)
-	if err != nil {
-		return err
+// Warmup blocks until eager or background prefetch work completes.
+func (r *Reader) Warmup() {
+	if r.prefetch != nil {
+		r.prefetch.warmup()
 	}
-	pageSize := int64(r.prefetchPageSize)
-	for p := pr.PageStart; p <= pr.PageEnd; p++ {
-		if r.pageCache.has(p) {
-			continue
-		}
-		pageOff := int64(p)*pageSize - pr.ByteStart
-		pageLen := pageSize
-		if pageOff+pageLen > int64(len(blob)) {
-			pageLen = int64(len(blob)) - pageOff
-		}
-		if pageLen <= 0 {
-			continue
-		}
-		n, err := intFromInt64(pageLen)
-		if err != nil {
-			return err
-		}
-		pageData := make([]byte, n)
-		copy(pageData, blob[int(pageOff):int(pageOff+pageLen)])
-		r.pageCache.set(p, pageData, false)
-	}
-	return nil
 }
 
-func (r *Reader) fetchRangeBytes(ctx context.Context, byteStart, byteLength int64) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+// Close cancels in-flight eager prefetch and waits for the background goroutine.
+func (r *Reader) Close() {
+	if r.prefetch != nil {
+		r.prefetch.close()
 	}
-	r.fetchesIssued++
-	return r.fetchRange(byteStart, byteLength)
 }
 
 // CacheStats returns diagnostic cache and prefetch counters.
 func (r *Reader) CacheStats() CacheStats {
-	pagesCached, memoryUsed := r.pageCache.stats()
-	return CacheStats{
-		PagesCached:     pagesCached,
-		PagesMax:        r.pageCache.maxPages,
-		MemoryUsedBytes: memoryUsed,
-		CacheHits:       r.pageCache.hits,
-		CacheMisses:     r.pageCache.misses,
-		FetchesIssued:   r.fetchesIssued,
-		Strategy:        r.prefetchStrategy,
-		Pattern:         r.prefetchPattern,
+	if r.prefetch == nil {
+		return CacheStats{
+			Strategy: "disabled",
+			Pattern:  "unknown",
+		}
 	}
+	return r.prefetch.cacheStats()
 }
 
 func (r *Reader) readSchema(offset int) (int, error) {
@@ -367,6 +340,9 @@ func (r *Reader) Record(i int) *Object {
 	}
 	if r.layout != LayoutRow {
 		return &Object{reader: r, offset: i, recordIndex: uint32(i)}
+	}
+	if r.prefetch != nil {
+		r.prefetch.onAccess(i)
 	}
 	abs := binary.LittleEndian.Uint64(r.data[r.tailStart+i*10+2 : r.tailStart+i*10+10])
 	return &Object{reader: r, offset: int(abs)}
