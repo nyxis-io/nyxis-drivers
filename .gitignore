@@ -10,6 +10,8 @@ py/_nxs.cpython-*.so
 php/vendor/
 kotlin/.gradle/
 kotlin/build/
+# Local JDK bundles (e.g. downloaded for Gradle when system JDK ≠ 21)
+kotlin/.jdk*/
 csharp/bin/
 csharp/obj/
 csharp/nxs.Tests/bin/
@@ -44,6 +46,7 @@ php/nxs_ext/*.dep
 
 go/bench
 c/test
+c/test_prefetch
 c/bench
 c/bench_wal
 c/profile-selective
