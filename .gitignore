@@ -49,4 +49,5 @@ c/profile-selective
 *.png
 !devtools-extension/icons/*.png
 .para-worktrees/
+.claude/
 context

@@ -64,13 +64,15 @@ type slotOff struct {
 
 // ── Sigil constants ───────────────────────────────────────────────────────────
 
+// TypeManifest sigils match SPEC.md / Rust nxs::consts (not ASCII type names).
 const (
-	sigilStr    = 0x22 // '"' — string / var-length
-	sigilI64    = 0x69 // 'i'
-	sigilF64    = 0x64 // 'd'
-	sigilBool   = 0x62 // 'b'
-	sigilNull   = 0x6E // 'n'
-	sigilBinary = 0x42 // 'B'
+	sigilStr    = 0x22 // '"'
+	sigilI64    = 0x3D // '='
+	sigilF64    = 0x7E // '~'
+	sigilBool   = 0x3F // '?'
+	sigilNull   = 0x5E // '^'
+	sigilBinary = 0x3C // '<'
+	sigilTime   = 0x40 // '@'
 )
 
 // ── Writer ───────────────────────────────────────────────────────────────────
@@ -264,18 +266,31 @@ type StreamWriter struct {
 	writer        *Writer
 	inObject      bool
 	closed        bool
+	headerWritten bool
 }
 
-// NewStreamWriter creates a streaming writer and writes the v1.1 preamble plus schema.
+// NewStreamWriter creates a streaming writer. The preamble and schema header are
+// emitted lazily on the first EndObject, using slot sigils from that record.
 func NewStreamWriter(out io.Writer, schema *Schema) (*StreamWriter, error) {
-	// StreamWriter builds schema bytes at construction time before any records are
-	// written, so it uses default sigils (all sigilStr). The sigils are updated in
-	// the inner Writer and flushed per-record, but the stream header is written once.
-	defaultSigils := make([]byte, schema.Len())
-	for i := range defaultSigils {
-		defaultSigils[i] = sigilStr
+	sw := &StreamWriter{
+		schema:        schema,
+		out:           out,
+		recordOffsets: make([]int, 0, 1024),
+		writer:        NewWriterWithCapacity(schema, 4096),
 	}
-	schemaBytes := buildSchemaBytes(schema.Keys, defaultSigils)
+	if f, ok := out.(interface{ Flush() error }); ok {
+		sw.flush = f.Flush
+	} else if f, ok := out.(interface{ Flush() }); ok {
+		sw.flush = func() error {
+			f.Flush()
+			return nil
+		}
+	}
+	return sw, nil
+}
+
+func (sw *StreamWriter) writeHeader(sigils []byte) error {
+	schemaBytes := buildSchemaBytes(sw.schema.Keys, sigils)
 	header := make([]byte, 32+len(schemaBytes))
 	p := 0
 	binary.LittleEndian.PutUint32(header[p:], magicFile)
@@ -290,27 +305,13 @@ func NewStreamWriter(out io.Writer, schema *Schema) (*StreamWriter, error) {
 	p += 8
 	p += 8
 	copy(header[p:], schemaBytes)
-
-	if _, err := out.Write(header); err != nil {
-		return nil, err
+	if _, err := sw.out.Write(header); err != nil {
+		return err
 	}
-	sw := &StreamWriter{
-		schema:        schema,
-		out:           out,
-		dataStartAbs:  uint64(len(header)),
-		bytesWritten:  uint64(len(header)),
-		recordOffsets: make([]int, 0, 1024),
-		writer:        NewWriterWithCapacity(schema, 4096),
-	}
-	if f, ok := out.(interface{ Flush() error }); ok {
-		sw.flush = f.Flush
-	} else if f, ok := out.(interface{ Flush() }); ok {
-		sw.flush = func() error {
-			f.Flush()
-			return nil
-		}
-	}
-	return sw, nil
+	sw.dataStartAbs = sw.bytesWritten + uint64(len(header))
+	sw.bytesWritten += uint64(len(header))
+	sw.headerWritten = true
+	return nil
 }
 
 func (sw *StreamWriter) BeginObject() {
@@ -330,6 +331,13 @@ func (sw *StreamWriter) EndObject() error {
 		panic("nxs: EndObject without BeginObject")
 	}
 	sw.writer.EndObject()
+	if !sw.headerWritten {
+		sigils := make([]byte, len(sw.writer.slotSigils))
+		copy(sigils, sw.writer.slotSigils)
+		if err := sw.writeHeader(sigils); err != nil {
+			return err
+		}
+	}
 	record := sw.writer.buf
 	sw.recordOffsets = append(sw.recordOffsets, int(sw.bytesWritten-sw.dataStartAbs))
 	if _, err := sw.out.Write(record); err != nil {
@@ -365,6 +373,15 @@ func (sw *StreamWriter) Close() error {
 	}
 	if sw.inObject {
 		panic("nxs: Close with unclosed object")
+	}
+	if !sw.headerWritten {
+		defaultSigils := make([]byte, sw.schema.Len())
+		for i := range defaultSigils {
+			defaultSigils[i] = sigilStr
+		}
+		if err := sw.writeHeader(defaultSigils); err != nil {
+			return err
+		}
 	}
 	tailPtr := sw.bytesWritten
 	tail := buildTailIndexRecords(sw.dataStartAbs, sw.recordOffsets, tailPtr)
@@ -402,7 +419,8 @@ func (w *Writer) WriteBool(slot int, v bool) {
 }
 
 func (w *Writer) WriteTime(slot int, unixNs int64) {
-	w.WriteI64(slot, unixNs)
+	w.markSlot(slot, sigilTime)
+	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(unixNs))
 }
 
 func (w *Writer) WriteNull(slot int) {
