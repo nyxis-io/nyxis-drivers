@@ -13,7 +13,7 @@ FIXTURE_OUT     ?= $(shell d="$(FIXTURE_DIR)"; mkdir -p "$$d" out/fixtures 2>/de
 JAVA_HOME       ?= /opt/homebrew/opt/openjdk@21
 DOTNET_FRAMEWORK ?= net10.0
 
-.PHONY: lint fix test lint-js fix-js test-js lint-py fix-py test-py test-py-ci \
+.PHONY: install-git-hooks lint fix test lint-js fix-js test-js lint-py fix-py test-py test-py-ci \
         lint-go fix-go test-go lint-ruby fix-ruby test-ruby test-ruby-ci \
         lint-php fix-php test-php test-php-ci lint-c fix-c test-c \
         lint-swift fix-swift test-swift lint-kotlin test-kotlin \
@@ -135,3 +135,7 @@ fix-csharp:
 
 test-csharp:
 	cd csharp && dotnet run -p:NxsTargetFramework=$(DOTNET_FRAMEWORK) -- $(abspath $(FIXTURE_OUT))
+
+install-git-hooks:
+	git config core.hooksPath .githooks
+	@echo "Git hooks path set to .githooks (pre-commit runs: make lint). Bypass once: SKIP_HOOKS=1 git commit …"
