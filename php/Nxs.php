@@ -17,6 +17,8 @@
 
 namespace Nxs;
 
+require_once __DIR__ . '/Prefetch.php';
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const MAGIC_FILE   = 0x4E595842; // NYXB
@@ -390,7 +392,29 @@ class Reader
     private array  $pageOffset   = [];
     private array  $pageLength   = [];
 
-    public function __construct(string $bytes)
+    private int $prefetchHint = HINT_UNKNOWN;
+    private int $prefetchPageSize = DEFAULT_PAGE_SIZE;
+    private int $coalesceGapPages = DEFAULT_COALESCE_GAP_PAGES;
+    private PageCache $pageCache;
+    private InFlightMap $inFlight;
+    private int $fetchesIssued = 0;
+    /** @var callable(int, int): string|null */
+    private $fetchRange = null;
+    private string $prefetchStrategy = 'lazy';
+    private string $prefetchPattern = 'unknown';
+    /** @var object|null C extension NxsReader when available */
+    private ?object $extReader = null;
+
+    /**
+     * @param array{
+     *   hint?: int,
+     *   max_pages?: int,
+     *   page_size?: int,
+     *   coalesce_gap_pages?: int,
+     *   fetch_range?: callable(int, int): string
+     * } $options
+     */
+    public function __construct(string $bytes, array $options = [])
     {
         $this->bytes = $bytes;
         $len = strlen($bytes);
@@ -428,6 +452,167 @@ class Reader
         }
 
         $this->parseLayoutTail($flags, $preambleTail, $len);
+        $this->initPrefetch($options);
+        $this->tryInitExtReader($bytes, $options);
+    }
+
+    /**
+     * @param array{
+     *   hint?: int,
+     *   max_pages?: int,
+     *   page_size?: int,
+     *   coalesce_gap_pages?: int,
+     *   fetch_range?: callable(int, int): string
+     * } $options
+     */
+    private function initPrefetch(array $options): void
+    {
+        $maxPages = $options['max_pages'] ?? DEFAULT_MAX_PAGES;
+        $pageSize = $options['page_size'] ?? DEFAULT_PAGE_SIZE;
+        $this->prefetchHint = $options['hint'] ?? HINT_UNKNOWN;
+        $this->prefetchPageSize = $pageSize;
+        $this->coalesceGapPages = $options['coalesce_gap_pages'] ?? DEFAULT_COALESCE_GAP_PAGES;
+        $this->pageCache = new PageCache($maxPages, $pageSize);
+        $this->inFlight = new InFlightMap();
+        $this->fetchRange = $options['fetch_range'] ?? null;
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     */
+    private function tryInitExtReader(string $bytes, array $options): void
+    {
+        if (isset($options['fetch_range']) || !extension_loaded('nxs') || !class_exists('NxsReader', false)) {
+            return;
+        }
+        try {
+            $ext = new \NxsReader($bytes, $options);
+            if (method_exists($ext, 'prefetch_viewport')) {
+                $this->extReader = $ext;
+            }
+        } catch (\Throwable) {
+            // Pure PHP fallback.
+        }
+    }
+
+    private function recordByteOffset(int $i): int
+    {
+        return rdU64($this->bytes, $this->tailStart + $i * 10 + 2);
+    }
+
+    /**
+     * Prefetch pages for records [startIndex, endIndex] (row layout only).
+     * Synchronous — blocks until required pages are cached.
+     */
+    public function prefetch_viewport(int $startIndex, int $endIndex): void
+    {
+        if ($this->extReader !== null) {
+            $this->extReader->prefetch_viewport($startIndex, $endIndex);
+            return;
+        }
+
+        if ($this->layout !== 'row') {
+            return;
+        }
+        $n = $this->recordCount;
+        if ($startIndex < 0 || $endIndex < $startIndex || $endIndex >= $n) {
+            throw new NxsException(sprintf(
+                'ERR_OUT_OF_BOUNDS: prefetch_viewport [%d, %d] out of [0, %d)',
+                $startIndex, $endIndex, $n
+            ));
+        }
+
+        $pageSize = $this->prefetchPageSize;
+        $indices = pageIndicesForViewport(
+            $startIndex,
+            $endIndex,
+            $pageSize,
+            fn(int $i): int => $this->recordByteOffset($i),
+        );
+        $uniquePages = array_values(array_unique($indices));
+
+        $missing = [];
+        foreach ($uniquePages as $p) {
+            if (!$this->pageCache->has($p) && !$this->inFlight->has($p)) {
+                $missing[] = $p;
+            }
+        }
+
+        if ($missing !== []) {
+            $ranges = clampPageRanges(
+                coalescePageIndices($missing, $this->coalesceGapPages, $pageSize),
+                strlen($this->bytes),
+            );
+            foreach ($ranges as $range) {
+                $this->fetchCoalescedRange($range);
+            }
+        }
+
+        $this->pageCache->pinPages($uniquePages);
+        $this->pageCache->unpinAll();
+    }
+
+    /** @param array{pageStart: int, pageEnd: int, byteStart: int, byteLength: int} $range */
+    private function fetchCoalescedRange(array $range): void
+    {
+        $pages = [];
+        for ($p = $range['pageStart']; $p <= $range['pageEnd']; $p++) {
+            if (!$this->pageCache->has($p) && !$this->inFlight->has($p)) {
+                $pages[] = $p;
+            }
+        }
+        if ($pages === []) {
+            return;
+        }
+
+        $this->inFlight->begin($pages);
+        try {
+            $blob = $this->fetchRangeBytes($range['byteStart'], $range['byteLength']);
+            $pageSize = $this->prefetchPageSize;
+            for ($p = $range['pageStart']; $p <= $range['pageEnd']; $p++) {
+                if ($this->pageCache->has($p)) {
+                    continue;
+                }
+                $pageOff = $p * $pageSize - $range['byteStart'];
+                $pageLen = min($pageSize, strlen($blob) - $pageOff);
+                if ($pageLen <= 0) {
+                    continue;
+                }
+                $this->pageCache->set($p, substr($blob, $pageOff, $pageLen));
+            }
+        } finally {
+            $this->inFlight->end($pages);
+        }
+    }
+
+    private function fetchRangeBytes(int $byteStart, int $byteLength): string
+    {
+        $this->fetchesIssued++;
+        if ($this->fetchRange !== null) {
+            return ($this->fetchRange)($byteStart, $byteLength);
+        }
+        $end = $byteStart + $byteLength;
+        if ($byteStart < 0 || $end > strlen($this->bytes)) {
+            throw new NxsException(sprintf(
+                'ERR_OUT_OF_BOUNDS: fetch range [%d, %d)', $byteStart, $end
+            ));
+        }
+        return substr($this->bytes, $byteStart, $byteLength);
+    }
+
+    /** @return array<string, int|string> */
+    public function cache_stats(): array
+    {
+        if ($this->extReader !== null && method_exists($this->extReader, 'cache_stats')) {
+            return $this->extReader->cache_stats();
+        }
+        $s = $this->pageCache->stats();
+        return [
+            ...$s,
+            'fetches_issued' => $this->fetchesIssued,
+            'strategy'       => $this->prefetchStrategy,
+            'pattern'        => $this->prefetchPattern,
+        ];
     }
 
     /** @return 'row'|'columnar'|'pax' */
