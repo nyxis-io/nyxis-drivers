@@ -68,7 +68,7 @@ module Nxs
     spans = []
     start = uniq[0]
     end_ = uniq[0]
-    uniq.each_cons(2) do |a, b|
+    uniq.each_cons(2) do |_a, b|
       if b - end_ <= gap_pages
         end_ = b
       else
@@ -128,7 +128,7 @@ module Nxs
     def set(page_index, data, pinned: false)
       return if @max_pages <= 0
 
-      while @pages.size >= @max_pages && !evict_one; end
+      while @pages.size >= @max_pages && !evict_one?; end
       @clock += 1
       @pages[page_index] = { data: data, last_used: @clock, pinned: pinned }
     end
@@ -153,7 +153,7 @@ module Nxs
 
     private
 
-    def evict_one
+    def evict_one?
       victim = nil
       oldest = nil
       @pages.each do |idx, entry|
@@ -237,9 +237,12 @@ module Nxs
   class Reader
     attr_reader :keys, :record_count, :layout
 
-    def initialize(bytes, hint: HINT_UNKNOWN, max_pages: DEFAULT_MAX_PAGES,
-                   page_size: DEFAULT_PAGE_SIZE, coalesce_gap_pages: DEFAULT_COALESCE_GAP_PAGES,
-                   fetch_range: nil)
+    def initialize(bytes, **options)
+      hint = options.fetch(:hint, HINT_UNKNOWN)
+      max_pages = options.fetch(:max_pages, DEFAULT_MAX_PAGES)
+      page_size = options.fetch(:page_size, DEFAULT_PAGE_SIZE)
+      coalesce_gap_pages = options.fetch(:coalesce_gap_pages, DEFAULT_COALESCE_GAP_PAGES)
+      fetch_range = options.fetch(:fetch_range, nil)
       @data = bytes.b # force binary encoding
       sz = @data.bytesize
       raise NxsError.new('ERR_OUT_OF_BOUNDS', 'file too small') if sz < 32
@@ -508,7 +511,7 @@ module Nxs
       return self if @layout != :row
 
       n = @record_count
-      unless start_index >= 0 && end_index >= start_index && end_index < n
+      unless start_index.between?(0, end_index) && end_index < n
         raise NxsError.new(
           'ERR_OUT_OF_BOUNDS',
           "prefetch_viewport [#{start_index}, #{end_index}] out of [0, #{n})"

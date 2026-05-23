@@ -63,8 +63,8 @@ public func coalescePageIndices(_ indices: [Int], gapPages: Int, pageSize: Int) 
     guard !indices.isEmpty else { return [] }
     var seen = Set<Int>()
     var uniq: [Int] = []
-    for p in indices {
-        if seen.insert(p).inserted { uniq.append(p) }
+    for p in indices where seen.insert(p).inserted {
+        uniq.append(p)
     }
     uniq.sort()
 
@@ -273,5 +273,95 @@ final class PrefetchState {
                 return buf.subdata(in: Int(off)..<Int(end))
             }
         }
+    }
+}
+
+// MARK: - NXSReader prefetch API (keeps NXSReader.swift under SwiftLint file_length limit)
+
+extension NXSReader {
+    /// Advisory access hint from open options (stored only in phase 1).
+    public var accessHint: AccessHint { prefetch.hint }
+
+    private func recordByteOffset(_ i: Int) -> Int64 {
+        Int64(rdU64(data, tailStart + i * 10 + 2))
+    }
+
+    /// Load pages for records [startIndex, endIndex] into the page cache (row layout only).
+    public func prefetchViewport(startIndex: Int, endIndex: Int) throws {
+        guard col.layout == .row else { return }
+        let n = recordCount
+        guard startIndex >= 0, endIndex >= startIndex, endIndex < n else {
+            throw NXSError.outOfBounds(
+                "prefetch_viewport [\(startIndex), \(endIndex)] out of [0, \(n))"
+            )
+        }
+
+        prefetchLock.lock()
+        defer { prefetchLock.unlock() }
+
+        let pageSize = prefetch.pageSize
+        let indices = pageIndicesForViewport(
+            startIndex: startIndex,
+            endIndex: endIndex,
+            pageSize: pageSize,
+            recordOffset: { [self] i in self.recordByteOffset(i) }
+        )
+
+        var missingSet = Set<Int>()
+        for p in indices {
+            if !prefetch.cache.has(p) && !prefetch.inFlight.has(p) {
+                missingSet.insert(p)
+            }
+        }
+        if missingSet.isEmpty {
+            prefetch.cache.pinPages(indices)
+            return
+        }
+
+        let missing = Array(missingSet)
+        let ranges = clampPageRanges(
+            coalescePageIndices(missing, gapPages: prefetch.coalesceGapPages, pageSize: pageSize),
+            fileSize: Int64(data.count)
+        )
+        for pr in ranges {
+            try fetchCoalescedRange(pr)
+        }
+        prefetch.cache.pinPages(indices)
+    }
+
+    private func fetchCoalescedRange(_ pr: PageRange) throws {
+        let blob = try fetchRangeBytes(byteStart: pr.byteStart, byteLength: pr.byteLength)
+        let pageSize = Int64(prefetch.pageSize)
+        for p in pr.pageStart...pr.pageEnd {
+            if prefetch.cache.has(p) { continue }
+            let pageOff = Int64(p) * pageSize - pr.byteStart
+            var pageLen = pageSize
+            if pageOff + pageLen > Int64(blob.count) {
+                pageLen = Int64(blob.count) - pageOff
+            }
+            guard pageLen > 0 else { continue }
+            let pageData = blob.subdata(in: Int(pageOff)..<Int(pageOff + pageLen))
+            prefetch.cache.set(p, data: pageData, pinned: false)
+        }
+    }
+
+    private func fetchRangeBytes(byteStart: Int64, byteLength: Int64) throws -> Data {
+        prefetch.fetchesIssued += 1
+        return try prefetch.fetchRange(byteStart, byteLength)
+    }
+
+    /// Diagnostic cache and prefetch counters.
+    public func cacheStats() -> CacheStats {
+        let (pagesCached, memoryUsed) = prefetch.cache.stats()
+        return CacheStats(
+            pagesCached: pagesCached,
+            pagesMax: prefetch.cache.maxPages,
+            memoryUsedBytes: memoryUsed,
+            cacheHits: prefetch.cache.hits,
+            cacheMisses: prefetch.cache.misses,
+            fetchesIssued: prefetch.fetchesIssued,
+            strategy: prefetch.strategy,
+            pattern: prefetch.pattern
+        )
     }
 }

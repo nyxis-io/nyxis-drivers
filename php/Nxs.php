@@ -612,6 +612,7 @@ class Reader
             'fetches_issued' => $this->fetchesIssued,
             'strategy'       => $this->prefetchStrategy,
             'pattern'        => $this->prefetchPattern,
+            'hint'           => $this->prefetchHint,
         ];
     }
 

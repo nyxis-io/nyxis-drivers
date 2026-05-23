@@ -1,10 +1,10 @@
 package nxs
 
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
-import kotlin.concurrent.thread
 
 class PrefetchTest {
     private fun buildRecords(n: Int): ByteArray {

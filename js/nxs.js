@@ -16,10 +16,6 @@
 
 import {
   HINT_UNKNOWN,
-  HINT_SEQUENTIAL,
-  HINT_RANDOM,
-  HINT_FULL,
-  HINT_PARTIAL,
   PageCache,
   InFlightMap,
   coalescePageIndices,

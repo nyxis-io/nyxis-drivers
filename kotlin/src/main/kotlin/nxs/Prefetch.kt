@@ -115,10 +115,11 @@ internal class PageCache(
     fun has(pageIndex: Int): Boolean = pages.containsKey(pageIndex)
 
     fun get(pageIndex: Int): ByteArray? {
-        val e = pages[pageIndex] ?: run {
-            misses++
-            return null
-        }
+        val e =
+            pages[pageIndex] ?: run {
+                misses++
+                return null
+            }
         e.lastUsed = ++clock
         hits++
         return e.data
