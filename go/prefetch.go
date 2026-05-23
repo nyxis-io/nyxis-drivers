@@ -65,6 +65,8 @@ func intFromInt64(n int64) (int, error) {
 	}
 	return int(n), nil
 }
+
+// CoalescePageIndices merges page indices into byte ranges where the gap between
 // consecutive indices is at most gapPages (Adaptive-prefetch-spec §7.2).
 func CoalescePageIndices(indices []int, gapPages, pageSize int) []PageRange {
 	if len(indices) == 0 {
