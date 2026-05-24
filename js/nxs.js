@@ -481,7 +481,7 @@ export class NxsReader {
       this.bytes.length,
     );
     for (const range of ranges) {
-      void this._startCoalescedRangeFetch(range);
+      void this._startCoalescedRangeFetch(range).catch(() => {});
     }
   }
 

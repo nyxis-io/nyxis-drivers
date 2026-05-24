@@ -27,6 +27,7 @@ struct nxs_prefetch_state {
     uint32_t                    prefetch_depth;
     nxs_cached_page_t          *cache;
     uint32_t                    cache_count;
+    size_t                      cache_bytes;
     nxs_in_flight_page_t       *in_flight;
     uint64_t                    clock;
     uint64_t                    hits;
@@ -120,6 +121,7 @@ static int cache_evict_one(struct nxs_prefetch_state *pf) {
     if (prev_victim) prev_victim->next = victim->next;
     else pf->cache = victim->next;
     pf->cache_count--;
+    pf->cache_bytes -= victim->data_len;
     cache_free_entry(victim);
     return 1;
 }
@@ -133,7 +135,7 @@ static size_t cache_memory_bytes(struct nxs_prefetch_state *pf) {
 
 static void cache_enforce_byte_limit(struct nxs_prefetch_state *pf) {
     if (pf->cache_max_bytes == 0) return;
-    while (cache_memory_bytes(pf) > pf->cache_max_bytes) {
+    while (pf->cache_bytes > pf->cache_max_bytes) {
         if (!cache_evict_one(pf)) break;
     }
 }
@@ -165,6 +167,7 @@ static nxs_err_t cache_insert(struct nxs_prefetch_state *pf, uint32_t page_index
     e->next = pf->cache;
     pf->cache = e;
     pf->cache_count++;
+    pf->cache_bytes += data_len;
     cache_enforce_byte_limit(pf);
     return NXS_OK;
 }
@@ -221,6 +224,7 @@ static void prefetch_free_locked(struct nxs_prefetch_state *pf) {
     }
     pf->cache = NULL;
     pf->cache_count = 0;
+    pf->cache_bytes = 0;
     in_flight_clear(pf);
 }
 

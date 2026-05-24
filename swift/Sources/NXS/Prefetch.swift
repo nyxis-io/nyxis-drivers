@@ -375,14 +375,16 @@ final class PrefetchState {
         if closed || paused { stateLock.unlock(); return }
         detector.observe(index)
         maybeUpgradeToEagerLocked()
-        let strat = strategy; let done = eagerComplete
+        let strat = strategy
+        let done = eagerComplete
+        let adaptiveSeq = strat == .adaptive && detector.pattern() == .sequential
         stateLock.unlock()
         if done || strat == .eager { return }
         let off = recordOffset(index)
         if off >= 0 {
             cacheLock.lock(); _ = cache.get(Int(off / Int64(pageSize))); cacheLock.unlock()
         }
-        if strat == .adaptive && detector.pattern() == .sequential { speculativePrefetch() }
+        if adaptiveSeq { speculativePrefetch() }
     }
     func warmup() { eagerGroup?.wait() }
 
