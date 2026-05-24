@@ -33,7 +33,14 @@ jobs:
 
       - name: Publish
         working-directory: js
-        run: npm publish --access public --provenance
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          if curl -sf "https://registry.npmjs.org/nyxis/${VERSION}" >/dev/null; then
+            echo "nyxis@${VERSION} already on npm — skipping publish (re-run / workflow_dispatch)"
+          else
+            npm publish --access public --provenance
+          fi
 
       - name: Smoke test (install from registry)
         run: |
