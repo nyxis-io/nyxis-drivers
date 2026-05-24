@@ -53,7 +53,7 @@ class NxsReader
         private val prefetchHint: AccessHint = options.hint
         private val openOptions: OpenOptions = options
         private var prefetch: PrefetchEngine? = null
-        private var columnWarm: ColumnWarmState? = null
+        internal var columnWarm: ColumnWarmState? = null
 
         init {
             if (data.size < 32) throw NxsError("ERR_OUT_OF_BOUNDS", "file too small")

@@ -210,11 +210,15 @@ public sealed class NxsReader
 
         if (LayoutKind == Layout.Columnar)
         {
-            Func<long, long, byte[]?>? colFetch = null;
+            Func<long, long, byte[]>? colFetch = null;
             if (prefetchOptions.FetchRange != null)
             {
                 var fr = prefetchOptions.FetchRange;
-                colFetch = (off, len) => fr(off, len, default).GetAwaiter().GetResult();
+                colFetch = (off, len) =>
+                {
+                    byte[]? blob = fr(off, len, default).GetAwaiter().GetResult();
+                    return blob ?? throw new NxsException("ERR_OUT_OF_BOUNDS", "column fetch returned null");
+                };
             }
             _columnWarm = new ColumnWarmState(_data, colFetch);
         }

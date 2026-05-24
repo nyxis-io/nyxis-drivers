@@ -14,7 +14,7 @@ internal sealed class ColumnWarmState
     private readonly object _lock = new();
     public int Fetches { get; private set; }
 
-    public ColumnWarmState(byte[] data, Func<long, long, byte[]?>? fetchRange)
+    public ColumnWarmState(byte[] data, Func<long, long, byte[]>? fetchRange)
     {
         _data = data;
         _fetch = fetchRange ?? ((off, len) =>
