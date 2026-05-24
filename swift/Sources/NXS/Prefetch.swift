@@ -386,6 +386,19 @@ final class PrefetchState {
     }
     func warmup() { eagerGroup?.wait() }
 
+    func pausePrefetch() { stateLock.lock(); paused = true; stateLock.unlock() }
+    func resumePrefetch() { stateLock.lock(); paused = false; stateLock.unlock() }
+    func respondToMemoryPressure() {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        cache.maxPages = max(1, cache.maxPages / 2)
+        while cache.stats().pagesCached > cache.maxPages {
+            if !cache.evictOneUnpinned() { break }
+        }
+    }
+    func close() { stateLock.lock(); closed = true; eagerCancelled = true; stateLock.unlock() }
+    func currentStrategy() -> String { stateLock.lock(); defer { stateLock.unlock() }; return strategy.rawValue }
+    func currentPattern() -> String { detector.pattern().rawValue }
+
     private func maybeUpgradeToEagerLocked() {
         guard !paused, strategy == .adaptive, detector.pattern() == .sequential,
               detector.sequentialRuns >= UInt32(PatternConstants.upgradeSequentialThreshold),
