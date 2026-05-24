@@ -136,7 +136,27 @@ def main() -> int:
         assert arr.shape == (100,)
         assert math.isclose(float(arr.sum()), 2475.0, rel_tol=1e-6)
 
+    def prefetch_column_columnar():
+        candidates = [
+            fixture_dir.parent.parent / "conformance/columnar_flat8_dense_100.nxb",
+            Path(__file__).resolve().parent / "../../nyxis/conformance/columnar_flat8_dense_100.nxb",
+        ]
+        path = next((p for p in candidates if p.is_file()), None)
+        if path is None:
+            print("      (skip: columnar_flat8_dense_100.nxb not found)")
+            return
+        data = path.read_bytes()
+        r = _nxs.Reader(data)
+        if not hasattr(r, "prefetch_column"):
+            print("      (skip: prefetch_column not in extension)")
+            return
+        r.prefetch_column("score")
+        s = r.col_sum_f64("score")
+        assert math.isclose(s, 2475.0, rel_tol=1e-6)
+        r.prefetch_column("score")
+
     case("columnar col_buffer + col_sum_f64", col_buffer_columnar)
+    case("columnar prefetch_column", prefetch_column_columnar)
     case("columnar col_numpy_f64", col_numpy_columnar)
 
     def col_var_buffer_columnar():

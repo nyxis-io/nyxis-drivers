@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Nxs;
@@ -195,6 +197,36 @@ public sealed class PrefetchTests
         var stats = reader.CacheStats();
         Assert.Equal("eager", stats.Strategy);
         Assert.Equal("sequential", stats.Pattern);
+    }
+
+    [Fact]
+    public void PrefetchColumn_SingleFetchBeforeColSum()
+    {
+        string[] candidates =
+        [
+            Path.Combine("..", "..", "..", "..", "nyxis", "conformance", "columnar_flat8_dense_100.nxb"),
+            Path.Combine("..", "..", "conformance", "columnar_flat8_dense_100.nxb"),
+        ];
+        string? path = candidates.FirstOrDefault(File.Exists);
+        if (path == null) return;
+
+        byte[] data = File.ReadAllBytes(path);
+        int fetches = 0;
+        var reader = new NxsReader(data, new NxsOpenOptions
+        {
+            FetchRange = (off, len, _) =>
+            {
+                fetches++;
+                return Task.FromResult(CopyRange(data, off, len));
+            },
+        });
+        reader.PrefetchColumn("score");
+        Assert.Equal(1, fetches);
+        double sum = reader.ColSumF64("score");
+        reader.PrefetchColumn("score");
+        Assert.Equal(1, fetches);
+        Assert.Equal(2475.0, sum, 3);
+        Assert.Equal(1, reader.CacheStats().ColumnFetchesIssued);
     }
 
     private static byte[] CopyRange(byte[] buf, long off, long len)

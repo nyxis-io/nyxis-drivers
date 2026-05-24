@@ -72,6 +72,7 @@ data class CacheStats(
     val cacheHits: Int,
     val cacheMisses: Int,
     val fetchesIssued: Int,
+    val columnFetchesIssued: Int = 0,
     val strategy: String,
     val pattern: String,
 )

@@ -85,6 +85,7 @@ public sealed class NxsReader
     private uint[] _pageLength = Array.Empty<uint>();
 
     private readonly PrefetchEngine _prefetch;
+    private ColumnWarmState? _columnWarm;
 
     public AccessHint AccessHint { get; }
 
@@ -206,6 +207,21 @@ public sealed class NxsReader
         _prefetch = new PrefetchEngine(
             prefetchOptions, size, _tailStart, RecordCount, RecordByteOffset, fetchRange);
         _prefetch.StartEagerBackgroundIfNeeded();
+
+        if (LayoutKind == Layout.Columnar)
+        {
+            Func<long, long, byte[]>? colFetch = null;
+            if (prefetchOptions.FetchRange != null)
+            {
+                var fr = prefetchOptions.FetchRange;
+                colFetch = (off, len) =>
+                {
+                    byte[]? blob = fr(off, len, default).GetAwaiter().GetResult();
+                    return blob ?? throw new NxsException("ERR_OUT_OF_BOUNDS", "column fetch returned null");
+                };
+            }
+            _columnWarm = new ColumnWarmState(_data, colFetch, customFetch: colFetch != null);
+        }
     }
 
     private long RecordByteOffset(int i) => (long)RdU64(_tailStart + i * 10 + 2);
@@ -241,8 +257,23 @@ public sealed class NxsReader
         return (int)length;
     }
 
+    /// <summary>Prefetch one column buffer (columnar layout only; §7.4).</summary>
+    public void PrefetchColumn(string key)
+    {
+        if (LayoutKind != Layout.Columnar)
+            throw new NxsException("ERR_LAYOUT", "prefetch_column requires columnar layout");
+        if (_columnWarm == null)
+            throw new NxsException("ERR_LAYOUT", "column prefetch not initialized");
+        _columnWarm.PrefetchColumn(Slot(key), _colBufOff, _colBufLen);
+    }
+
     /// <summary>Diagnostic cache and prefetch counters.</summary>
-    public CacheStats CacheStats() => _prefetch.CacheStats();
+    public CacheStats CacheStats()
+    {
+        var s = _prefetch.CacheStats();
+        int col = _columnWarm?.Fetches ?? 0;
+        return s with { ColumnFetchesIssued = col };
+    }
 
     private void ParseColumnarFooter(int size)
     {
@@ -351,7 +382,7 @@ public sealed class NxsReader
 
     public byte[]? ColBuffer(string key)
     {
-        if (LayoutKind == Layout.Row) return null;
+        if (LayoutKind != Layout.Columnar) return null;
         int slot = Slot(key);
         if (IsVarSigil(KeySigils[slot])) return null;
         var (_, vals) = ColFieldParts(slot);
@@ -360,7 +391,7 @@ public sealed class NxsReader
 
     public byte[]? ColNullBitmap(string key)
     {
-        if (LayoutKind == Layout.Row) return null;
+        if (LayoutKind != Layout.Columnar) return null;
         int slot = Slot(key);
         var (bm, _) = ColFieldParts(slot);
         return bm;
@@ -532,19 +563,18 @@ public sealed class NxsReader
 
     private (byte[] bm, byte[] vals) ColFieldParts(int slot)
     {
+        if (LayoutKind != Layout.Columnar || _columnWarm == null)
+            throw new NxsException("ERR_LAYOUT", "column field parts require columnar layout");
         if (slot < 0 || slot >= _colBufOff.Length)
             throw new NxsException("ERR_KEY_NOT_FOUND", $"slot {slot}");
-        int off = (int)_colBufOff[slot];
-        int length = (int)_colBufLen[slot];
-        if (off + length > _data.Length)
-            throw new NxsException("ERR_OUT_OF_BOUNDS", "column buffer");
+        byte[] sector = _columnWarm.Sector(slot, _colBufOff, _colBufLen);
         int bmLen = NullBitmapBytes(_recordCount);
-        if (length < bmLen)
+        if (sector.Length < bmLen)
             throw new NxsException("ERR_OUT_OF_BOUNDS", "null bitmap");
         var bm = new byte[bmLen];
-        Array.Copy(_data, off, bm, 0, bmLen);
-        var vals = new byte[length - bmLen];
-        Array.Copy(_data, off + bmLen, vals, 0, vals.Length);
+        Array.Copy(sector, 0, bm, 0, bmLen);
+        var vals = new byte[sector.Length - bmLen];
+        Array.Copy(sector, bmLen, vals, 0, vals.Length);
         return (bm, vals);
     }
 

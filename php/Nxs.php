@@ -387,6 +387,14 @@ class Reader
     private string $layout    = 'row';
     private array  $colBufOff = [];
     private array  $colBufLen = [];
+    /** @var array<int, true> */
+    private array  $colWarmed = [];
+    /** @var array<int, string> */
+    private array  $colOverlay = [];
+    private int    $colFetches = 0;
+    /** @var callable(int, int): string|null */
+    private $colFetchRange = null;
+    private bool $colRemoteFetch = false;
     private int    $pageCount    = 0;
     private array  $pageRecStart = [];
     private array  $pageRecCount = [];
@@ -458,7 +466,62 @@ class Reader
 
         $this->parseLayoutTail($flags, $preambleTail, $len);
         $this->initPrefetch($options);
+        $this->initColumnPrefetch($options);
         $this->tryInitExtReader($bytes, $options);
+    }
+
+    /**
+     * @param array{fetch_range?: callable(int, int): string} $options
+     */
+    private function initColumnPrefetch(array $options): void
+    {
+        if ($this->layout !== 'columnar') {
+            return;
+        }
+        $this->colWarmed = [];
+        $this->colOverlay = [];
+        $this->colFetches = 0;
+        $fetch = $options['fetch_range'] ?? null;
+        $bytes = $this->bytes;
+        $this->colRemoteFetch = $fetch !== null;
+        $this->colFetchRange = $fetch ?? static function (int $off, int $len) use ($bytes): string {
+            if ($off < 0 || $off + $len > strlen($bytes)) {
+                throw new NxsException('ERR_OUT_OF_BOUNDS: column fetch');
+            }
+            return substr($bytes, $off, $len);
+        };
+    }
+
+    /** Prefetch one column buffer (columnar layout only; §7.4). */
+    public function prefetch_column(string $key): void
+    {
+        if ($this->layout !== 'columnar') {
+            throw new NxsException('ERR_LAYOUT: prefetch_column requires columnar layout');
+        }
+        if (!isset($this->keyIndex[$key])) {
+            throw new NxsException('ERR_KEY_NOT_FOUND: ' . $key);
+        }
+        $slot = $this->keyIndex[$key];
+        if (isset($this->colWarmed[$slot])) {
+            return;
+        }
+        $off = (int)$this->colBufOff[$slot];
+        $length = (int)$this->colBufLen[$slot];
+        if ($off < 0 || $length < 0) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        }
+        if (!$this->colRemoteFetch && $off + $length > strlen($this->bytes)) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        }
+        $blob = ($this->colFetchRange)($off, $length);
+        if (isset($this->colWarmed[$slot])) {
+            return;
+        }
+        if ($off + strlen($blob) > strlen($this->bytes)) {
+            $this->colOverlay[$slot] = $blob;
+        }
+        $this->colWarmed[$slot] = true;
+        $this->colFetches++;
     }
 
     /**
@@ -622,6 +685,7 @@ class Reader
         return [
             ...$s,
             'fetches_issued' => $this->fetchesIssued,
+            'column_fetches_issued' => $this->colFetches,
             'strategy'       => $this->prefetchStrategy,
             'pattern'        => $this->patternDetector->pattern(),
             'hint'           => $this->prefetchHint,
@@ -751,23 +815,45 @@ class Reader
         return null;
     }
 
+    private function columnSector(int $slot): string
+    {
+        if (isset($this->colOverlay[$slot])) {
+            $o = $this->colOverlay[$slot];
+            $len = (int)$this->colBufLen[$slot];
+            if (strlen($o) >= $len) {
+                return substr($o, 0, $len);
+            }
+        }
+        $off = (int)$this->colBufOff[$slot];
+        $length = (int)$this->colBufLen[$slot];
+        if ($off + $length > strlen($this->bytes)) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        }
+        return substr($this->bytes, $off, $length);
+    }
+
     /** @return array{0: string, 1: string} bitmap, values */
     private function colFieldParts(int $slot): array
     {
         if ($slot < 0 || $slot >= count($this->colBufOff)) {
             throw new NxsException('ERR_KEY_NOT_FOUND');
         }
-        $off    = (int)$this->colBufOff[$slot];
-        $length = (int)$this->colBufLen[$slot];
-        if ($off + $length > strlen($this->bytes)) {
-            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        if ($this->layout === 'columnar') {
+            $sector = $this->columnSector($slot);
+        } else {
+            $off    = (int)$this->colBufOff[$slot];
+            $length = (int)$this->colBufLen[$slot];
+            if ($off + $length > strlen($this->bytes)) {
+                throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+            }
+            $sector = substr($this->bytes, $off, $length);
         }
         $bmLen = nullBitmapBytes($this->recordCount);
-        if ($length < $bmLen) {
+        if (strlen($sector) < $bmLen) {
             throw new NxsException('ERR_OUT_OF_BOUNDS: null bitmap');
         }
-        $bm   = substr($this->bytes, $off, $bmLen);
-        $vals = substr($this->bytes, $off + $bmLen, $length - $bmLen);
+        $bm   = substr($sector, 0, $bmLen);
+        $vals = substr($sector, $bmLen);
         return [$bm, $vals];
     }
 

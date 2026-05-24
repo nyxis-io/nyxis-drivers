@@ -27,6 +27,7 @@ cc -O3 -Wall -Wextra -Wno-unknown-pragmas -fPIC \
    _nxs.c \
    ../c/nxs.c \
    ../c/nxs_prefetch.c \
+   ../c/nxs_column_prefetch.c \
    -o "$OUT"
 
 echo "Built $OUT"

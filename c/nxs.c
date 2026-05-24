@@ -124,7 +124,7 @@ static nxs_err_t col_field_parts(const nxs_reader_t *r, int slot,
     if (slot < 0 || slot >= r->key_count) return NXS_ERR_KEY_NOT_FOUND;
     uint64_t off = r->col_buf_off[slot];
     uint64_t len = r->col_buf_len[slot];
-    if (off + len > r->size) return NXS_ERR_OUT_OF_BOUNDS;
+    if (off > r->size || len > r->size - off) return NXS_ERR_OUT_OF_BOUNDS;
     *bm_len = null_bitmap_bytes(r->record_count);
     if (len < *bm_len) return NXS_ERR_OUT_OF_BOUNDS;
     *bitmap = r->data + off;

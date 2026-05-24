@@ -137,7 +137,8 @@ internal sealed class PrefetchEngine
             var (pagesCached, memoryUsed) = _cache.Stats();
             return new CacheStats(
                 pagesCached, _cache.MaxPages, memoryUsed,
-                _cache.Hits, _cache.Misses, _fetchesIssued, strategy, pattern);
+                _cache.Hits, _cache.Misses, _fetchesIssued,
+                ColumnFetchesIssued: 0, strategy, pattern);
         }
         finally { _cacheLock.Release(); }
     }

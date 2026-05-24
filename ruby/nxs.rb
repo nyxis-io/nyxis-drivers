@@ -309,6 +309,7 @@ module Nxs
       @col_buf_off = []
       @col_buf_len = []
       parse_layout_tail!(preamble_tail)
+      init_column_prefetch!(fetch_range: fetch_range)
       init_prefetch!(
         hint: hint,
         max_pages: max_pages,
@@ -330,6 +331,36 @@ module Nxs
       on_access(i)
       abs_offset = @data.unpack1("@#{@tail_start + i * 10 + 2}Q<")
       Object.new(self, abs_offset)
+    end
+
+    # Prefetch one column buffer (columnar layout only; §7.4).
+    def prefetch_column(key)
+      raise NxsError.new('ERR_LAYOUT', 'prefetch_column requires columnar layout') unless @layout == :columnar
+
+      slot = @key_index[key]
+      raise NxsError.new('ERR_KEY_NOT_FOUND', "key #{key.inspect} not in schema") unless slot
+
+      off = nil
+      length = nil
+      fetch = nil
+      @col_mu.synchronize do
+        return if @col_warmed[slot]
+
+        off = @col_buf_off[slot].to_i
+        length = @col_buf_len[slot].to_i
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if off.negative? || length.negative?
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if !@col_remote_fetch && off + length > @data.bytesize
+
+        fetch = @col_fetch_range
+      end
+      blob = fetch.call(off, length)
+      @col_mu.synchronize do
+        return if @col_warmed[slot]
+
+        @col_overlay[slot] = blob if off + blob.bytesize > @data.bytesize
+        @col_warmed[slot] = true
+        @col_fetches += 1
+      end
     end
 
     # Sum f64 column — columnar/PAX buffer path or row scan.
@@ -641,11 +672,13 @@ module Nxs
 
     def cache_stats
       stats = @page_cache.stats
+      col_fetches = @col_mu.synchronize { @col_fetches }
       strategy, pattern = @prefetch_mu.synchronize do
         [@prefetch_strategy, @detector.pattern]
       end
       stats.merge(
         fetches_issued: @fetches_issued,
+        column_fetches_issued: col_fetches,
         strategy: strategy,
         pattern: pattern
       )
@@ -899,17 +932,39 @@ module Nxs
     end
 
     def col_field_parts(slot)
+      sector = column_sector(slot)
+      bm_len = null_bitmap_bytes(@record_count)
+      raise NxsError.new('ERR_OUT_OF_BOUNDS', 'null bitmap') if sector.bytesize < bm_len
+
+      [sector[0, bm_len], sector[bm_len..]]
+    end
+
+    def init_column_prefetch!(fetch_range: nil)
+      return unless @layout == :columnar
+
+      @col_mu = Mutex.new
+      @col_warmed = {}
+      @col_overlay = {}
+      @col_fetches = 0
+      @col_remote_fetch = !fetch_range.nil?
+      data = @data
+      @col_fetch_range = fetch_range || ->(off, len) { data[off, len] }
+    end
+
+    def column_sector(slot)
       raise NxsError.new('ERR_OUT_OF_BOUNDS', "key slot #{slot}") if slot.negative? || slot >= @col_buf_off.length
 
       off = @col_buf_off[slot].to_i
       length = @col_buf_len[slot].to_i
+      if @col_warmed
+        @col_mu.synchronize do
+          overlay = @col_overlay[slot]
+          return overlay[0, length] if @col_warmed[slot] && overlay && !overlay.empty?
+        end
+      end
       raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if off + length > @data.bytesize
 
-      bm_len = null_bitmap_bytes(@record_count)
-      raise NxsError.new('ERR_OUT_OF_BOUNDS', 'null bitmap') if length < bm_len
-
-      sector = @data[off, length]
-      [sector[0, bm_len], sector[bm_len..]]
+      @data[off, length]
     end
 
     def col_var_parts(slot)
