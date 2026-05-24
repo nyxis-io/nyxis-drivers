@@ -432,7 +432,7 @@ test("columnar prefetch_column — single fetch before colSumF64", () => {
       return bytes.subarray(off, off + len);
     },
   });
-  r.prefetchColumn("score");
+  r.prefetch_column("score");
   assertEq(fetches, 1, "prefetch_column fetches");
   let want = 0;
   for (let i = 0; i < 100; i++) want += i * 0.5;

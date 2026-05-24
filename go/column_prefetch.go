@@ -13,15 +13,24 @@ func (r *Reader) PrefetchColumn(key string) error {
 		return fmt.Errorf("ERR_KEY_NOT_FOUND: %q", key)
 	}
 	r.colMu.Lock()
-	defer r.colMu.Unlock()
 	if r.colWarmed[slot] {
+		r.colMu.Unlock()
 		return nil
 	}
 	off := int64(r.colBufOff[slot])
 	ln := int64(r.colBufLen[slot])
-	blob, err := r.colFetchRange(off, ln)
+	fetch := r.colFetchRange
+	r.colMu.Unlock()
+
+	blob, err := fetch(off, ln)
 	if err != nil {
 		return err
+	}
+
+	r.colMu.Lock()
+	defer r.colMu.Unlock()
+	if r.colWarmed[slot] {
+		return nil
 	}
 	if int(off)+len(blob) > len(r.data) {
 		r.colOverlay[slot] = blob
@@ -32,6 +41,9 @@ func (r *Reader) PrefetchColumn(key string) error {
 }
 
 func (r *Reader) initColumnPrefetch(cfg readerConfig) {
+	if r.layout != LayoutColumnar {
+		return
+	}
 	data := r.data
 	fetchRange := cfg.fetchRange
 	if fetchRange == nil {
@@ -50,14 +62,16 @@ func (r *Reader) columnSector(slot int) ([]byte, error) {
 	}
 	off := int(r.colBufOff[slot])
 	length := int(r.colBufLen[slot])
-	r.colMu.Lock()
-	overlay, warmed := r.colOverlay[slot], r.colWarmed[slot]
-	r.colMu.Unlock()
-	if warmed && len(overlay) > 0 {
-		if len(overlay) < length {
-			return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: column overlay")
+	if r.colWarmed != nil {
+		r.colMu.Lock()
+		overlay, warmed := r.colOverlay[slot], r.colWarmed[slot]
+		r.colMu.Unlock()
+		if warmed && len(overlay) > 0 {
+			if len(overlay) < length {
+				return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: column overlay")
+			}
+			return overlay[:length], nil
 		}
-		return overlay[:length], nil
 	}
 	if off+length > len(r.data) {
 		return nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: column buffer")

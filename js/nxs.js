@@ -348,9 +348,9 @@ export class NxsReader {
    * Prefetch one column buffer (columnar layout only; §7.4).
    * @param {string} key
    */
-  prefetchColumn(key) {
+  prefetch_column(key) {
     if (this._layout !== "columnar") {
-      throw new NxsError("ERR_LAYOUT", "prefetchColumn requires columnar layout");
+      throw new NxsError("ERR_LAYOUT", "prefetch_column requires columnar layout");
     }
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
@@ -359,7 +359,10 @@ export class NxsReader {
     const len = this._colBufLen[slot];
     let sector = this._colFetchRange(off, len);
     if (sector && typeof sector.then === "function") {
-      throw new NxsError("ERR_UNSUPPORTED", "prefetchColumn requires synchronous fetchRange");
+      throw new NxsError("ERR_UNSUPPORTED", "prefetch_column requires synchronous fetchRange");
+    }
+    if (!sector || typeof sector.byteLength !== "number") {
+      throw new NxsError("ERR_INVALID", "fetchRange must return Uint8Array");
     }
     if (off + sector.byteLength > this.bytes.byteLength) {
       this._colOverlay.set(
