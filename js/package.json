@@ -1,11 +1,13 @@
 {
   "name": "nyxis",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "type": "module",
   "description": "JavaScript reader for the Nyxis (NXS) binary format",
   "main": "nxs.js",
   "files": [
     "nxs.js",
+    "pattern.js",
+    "prefetch.js",
     "nxs_writer.js",
     "nxs_compile.js",
     "nxs_compile_wasm.js",
