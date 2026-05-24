@@ -11,7 +11,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>nyxis</PackageId>
-    <Version>1.2.0</Version>
+    <Version>1.2.1</Version>
     <Authors>Micael Malta</Authors>
     <Description>Zero-copy reader for the Nyxis (NXS) binary format. Provides O(1) random access to typed records via the tail-index.</Description>
     <!-- NuGet rejects non-OSI expressions (e.g. BUSL); ship the full license text instead. -->
