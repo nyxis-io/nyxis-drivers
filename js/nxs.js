@@ -338,9 +338,21 @@ export class NxsReader {
   }
 
   _initPrefetch(options) {
-    const maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+    let maxPages = options.maxPages ?? DEFAULT_MAX_PAGES;
+    if (typeof globalThis.navigator !== "undefined"
+      && typeof globalThis.navigator.deviceMemory === "number"
+      && globalThis.navigator.deviceMemory <= 2) {
+      maxPages = Math.max(4, Math.floor(maxPages / 2));
+    }
     const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     const hint = options.hint ?? HINT_UNKNOWN;
+    const abortController = new AbortController();
+    if (options.signal) {
+      if (options.signal.aborted) abortController.abort();
+      else {
+        options.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+      }
+    }
     this._prefetch = {
       hint,
       pageSize,
@@ -356,7 +368,62 @@ export class NxsReader {
       eagerComplete: false,
       eagerCancelled: false,
       eagerPromise: null,
+      paused: false,
+      destroyed: false,
+      abortController,
+      lifecycleHandlers: [],
     };
+    if (options.autoLifecycle !== false && typeof globalThis.document !== "undefined") {
+      this._wireLifecycle();
+    }
+  }
+
+  /** Stop scheduling speculative prefetch (§8.1). */
+  pausePrefetch() {
+    if (this._prefetch) this._prefetch.paused = true;
+  }
+
+  /** Resume speculative prefetch after pause. */
+  resumePrefetch() {
+    if (this._prefetch) this._prefetch.paused = false;
+  }
+
+  _wireLifecycle() {
+    const pf = this._prefetch;
+    if (!pf || pf.lifecycleHandlers.length) return;
+    const doc = globalThis.document;
+    const win = globalThis.window;
+    if (!doc || !win) return;
+    const onVisibility = () => {
+      if (doc.hidden) this.pausePrefetch();
+      else this.resumePrefetch();
+    };
+    const onUnload = () => this.destroy();
+    doc.addEventListener("visibilitychange", onVisibility);
+    win.addEventListener("beforeunload", onUnload);
+    pf.lifecycleHandlers.push(
+      ["visibilitychange", onVisibility, doc],
+      ["beforeunload", onUnload, win],
+    );
+  }
+
+  _unwireLifecycle() {
+    const pf = this._prefetch;
+    if (!pf) return;
+    for (const [event, fn, target] of pf.lifecycleHandlers) {
+      target.removeEventListener(event, fn);
+    }
+    pf.lifecycleHandlers = [];
+  }
+
+  /** Cancel in-flight fetches and detach lifecycle hooks (§8.3). */
+  destroy() {
+    const pf = this._prefetch;
+    if (!pf || pf.destroyed) return;
+    pf.destroyed = true;
+    pf.eagerCancelled = true;
+    pf.abortController?.abort();
+    this._unwireLifecycle();
   }
 
   _isEagerReady() {
@@ -368,6 +435,7 @@ export class NxsReader {
     if (this._layout !== "row" || !this._prefetch) return;
     if (this.recordCount === 0) return;
     const pf = this._prefetch;
+    if (pf.paused || pf.destroyed) return;
     pf.detector.observe(index);
     this._maybeUpgradeToEager();
     if (this._isEagerReady() || pf.strategy === "eager") return;
@@ -382,7 +450,7 @@ export class NxsReader {
 
   _maybeUpgradeToEager() {
     const pf = this._prefetch;
-    if (pf.strategy !== "adaptive") return;
+    if (pf.paused || pf.destroyed || pf.strategy !== "adaptive") return;
     const det = pf.detector;
     if (det.pattern() !== PATTERN_SEQUENTIAL) return;
     if (det.sequentialRuns() < UPGRADE_SEQUENTIAL_THRESHOLD) return;
@@ -399,6 +467,7 @@ export class NxsReader {
 
   _speculativePrefetch() {
     const pf = this._prefetch;
+    if (pf.paused || pf.destroyed || pf.eagerCancelled) return;
     const predicted = pf.detector.predictNext(pf.prefetchDepth, this.recordCount);
     const pageSet = new Set();
     for (const idx of predicted) {
@@ -458,10 +527,9 @@ export class NxsReader {
     if (p) await p;
   }
 
-  /** Cancel background eager prefetch (mirrors Rust Drop). */
+  /** Cancel background eager prefetch and in-flight fetches (mirrors Rust Drop). */
   close() {
-    if (!this._prefetch) return;
-    this._prefetch.eagerCancelled = true;
+    this.destroy();
   }
 
   /** Absolute data-sector offset for row-layout record `i`. */
@@ -571,9 +639,16 @@ export class NxsReader {
   }
 
   async _fetchRangeBytes(byteStart, byteLength) {
-    this._prefetch.fetchesIssued++;
-    const { fetchRange } = this._prefetch;
+    const pf = this._prefetch;
+    if (pf.destroyed || pf.abortController?.signal.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
+    pf.fetchesIssued++;
+    const { fetchRange } = pf;
     if (fetchRange) {
+      if (fetchRange.length >= 3) {
+        return await fetchRange(byteStart, byteLength, pf.abortController.signal);
+      }
       return await fetchRange(byteStart, byteLength);
     }
     return this.bytes.subarray(byteStart, byteStart + byteLength);

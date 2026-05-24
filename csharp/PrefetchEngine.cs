@@ -28,6 +28,7 @@ internal sealed class PrefetchEngine
     private bool _eagerStarted;
     private volatile bool _eagerComplete;
     private bool _closed;
+    private bool _paused;
 
     public PrefetchEngine(
         NxsOpenOptions options,
@@ -61,7 +62,7 @@ internal sealed class PrefetchEngine
         if (_recordCount == 0) return;
         lock (_stateLock)
         {
-            if (_closed) return;
+            if (_closed || _paused) return;
             _detector.Observe(index);
             MaybeUpgradeToEagerLocked();
         }
@@ -97,6 +98,16 @@ internal sealed class PrefetchEngine
         lock (_stateLock) eager = _eagerTask;
         if (eager != null)
             await eager.WaitAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public void PausePrefetch()
+    {
+        lock (_stateLock) _paused = true;
+    }
+
+    public void ResumePrefetch()
+    {
+        lock (_stateLock) _paused = false;
     }
 
     public void Close()
@@ -176,7 +187,7 @@ internal sealed class PrefetchEngine
 
     private void MaybeUpgradeToEagerLocked()
     {
-        if (_strategy != PrefetchStrategy.Adaptive) return;
+        if (_paused || _strategy != PrefetchStrategy.Adaptive) return;
         if (_detector.Pattern() != AccessPattern.Sequential) return;
         if (_detector.SequentialRuns < PatternConstants.UpgradeSequentialThreshold) return;
         if (_fileSize / (1024 * 1024) > PrefetchDefaults.EagerThresholdMb) return;
@@ -186,7 +197,7 @@ internal sealed class PrefetchEngine
 
     private void StartEagerBackgroundLocked()
     {
-        if (_strategy != PrefetchStrategy.Eager || _eagerStarted) return;
+        if (_paused || _strategy != PrefetchStrategy.Eager || _eagerStarted) return;
         _eagerStarted = true;
         _eagerCts = new CancellationTokenSource();
         var token = _eagerCts.Token;
@@ -226,6 +237,10 @@ internal sealed class PrefetchEngine
 
     private Task SpeculativePrefetchAsync(CancellationToken cancellationToken)
     {
+        lock (_stateLock)
+        {
+            if (_paused) return Task.CompletedTask;
+        }
         List<int> predicted;
         lock (_stateLock)
             predicted = _detector.PredictNext(_options.PrefetchDepth, _recordCount);

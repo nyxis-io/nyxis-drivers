@@ -187,6 +187,32 @@ func TestSequentialUpgrade(t *testing.T) {
 	}
 }
 
+func TestPauseStopsSpeculative(t *testing.T) {
+	buf := buildCompactRecords(t, 200)
+	r, err := NewReader(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for i := 0; i < 25; i++ {
+		_ = r.Record(i)
+	}
+	if stats := r.CacheStats(); stats.Pattern != "sequential" {
+		t.Fatalf("pattern = %q, want sequential", stats.Pattern)
+	}
+	before := r.CacheStats().FetchesIssued
+	r.PausePrefetch()
+	_ = r.Record(26)
+	if got := r.CacheStats().FetchesIssued; got != before {
+		t.Fatalf("fetches while paused: got %d, want %d", got, before)
+	}
+	r.ResumePrefetch()
+	_ = r.Record(27)
+	if got := r.CacheStats().FetchesIssued; got < before {
+		t.Fatalf("fetches after resume: got %d, before pause %d", got, before)
+	}
+}
+
 func TestHintFullEager(t *testing.T) {
 	buf := buildCompactRecords(t, 200)
 	if len(buf) > EagerThresholdMB*1024*1024 {

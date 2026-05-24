@@ -95,6 +95,9 @@ nxs_err_t nxs_open_ex(nxs_reader_t *r, const uint8_t *data, size_t size,
 nxs_err_t nxs_prefetch_init(nxs_reader_t *r, const nxs_open_options_t *opts);
 void          nxs_prefetch_destroy(nxs_reader_t *r);
 void          nxs_prefetch_on_access(nxs_reader_t *r, uint32_t index);
+void          nxs_pause_prefetch(nxs_reader_t *r);
+void          nxs_resume_prefetch(nxs_reader_t *r);
+void          nxs_prefetch_set_cache_limit(nxs_reader_t *r, size_t max_bytes);
 void          nxs_warmup(nxs_reader_t *r);
 nxs_err_t nxs_prefetch_viewport(nxs_reader_t *r, uint32_t start_index, uint32_t end_index);
 void nxs_cache_stats(const nxs_reader_t *r, nxs_cache_stats_t *stats);

@@ -144,7 +144,7 @@ private data class PageEntry(
 )
 
 internal class PageCache(
-    val maxPages: Int,
+    var maxPages: Int,
     val pageSize: Int,
 ) {
     private val pages = mutableMapOf<Int, PageEntry>()
@@ -179,7 +179,9 @@ internal class PageCache(
         pages[pageIndex] = PageEntry(data, ++clock, pinned)
     }
 
-    private fun evictOne(): Boolean {
+    private fun evictOne(): Boolean = evictOneForPressure()
+
+    fun evictOneForPressure(): Boolean {
         var oldest = Int.MAX_VALUE
         var victim = -1
         for ((idx, e) in pages) {
@@ -240,6 +242,8 @@ internal class PrefetchEngine(
 
     @Volatile private var closed = false
 
+    @Volatile private var paused = false
+
     @Volatile private var eagerCancel = false
 
     @Volatile private var eagerStarted = false
@@ -292,11 +296,30 @@ internal class PrefetchEngine(
         eagerThread?.join()
     }
 
+    fun pausePrefetch() {
+        paused = true
+    }
+
+    fun resumePrefetch() {
+        paused = false
+    }
+
+    /** Evict unpinned pages and halve max_pages (platform memory pressure, §8.2). */
+    fun onTrimMemory() {
+        synchronized(cacheLock) {
+            val newMax = maxOf(1, cache.maxPages / 2)
+            cache.maxPages = newMax
+            while (cache.stats().first > cache.maxPages) {
+                if (!cache.evictOneForPressure()) break
+            }
+        }
+    }
+
     fun onAccess(index: Int) {
         if (recordCount == 0) return
         val speculative: Boolean
         synchronized(lock) {
-            if (closed) return
+            if (closed || paused) return
             detector.observe(index)
             maybeUpgradeToEager()
             if (isEagerActive()) return
@@ -338,7 +361,7 @@ internal class PrefetchEngine(
     private fun isEagerActive(): Boolean = strategy == PrefetchStrategy.EAGER && !eagerComplete
 
     private fun maybeUpgradeToEager() {
-        if (strategy != PrefetchStrategy.ADAPTIVE) return
+        if (paused || strategy != PrefetchStrategy.ADAPTIVE) return
         if (detector.pattern() != AccessPattern.SEQUENTIAL) return
         if (detector.sequentialRuns() < UPGRADE_SEQUENTIAL_THRESHOLD) return
         if (fileSize / (1024 * 1024) > EAGER_THRESHOLD_MB) return
@@ -347,7 +370,7 @@ internal class PrefetchEngine(
     }
 
     private fun startEagerBackground() {
-        if (strategy != PrefetchStrategy.EAGER || eagerStarted) return
+        if (paused || strategy != PrefetchStrategy.EAGER || eagerStarted) return
         eagerStarted = true
         val (sectorStart, sectorLen) = rowDataSector(tailStart, fileSize)
         if (sectorLen == 0) {
@@ -381,6 +404,7 @@ internal class PrefetchEngine(
     }
 
     private fun speculativePrefetch() {
+        if (paused) return
         val predicted: IntArray
         synchronized(lock) {
             predicted = detector.predictNext(prefetchDepth, recordCount)

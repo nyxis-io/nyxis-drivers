@@ -384,6 +384,7 @@ type prefetchEngine struct {
 	eagerStarted  bool
 	eagerComplete atomic.Bool
 	closed        bool
+	paused        bool
 }
 
 func newPrefetchEngine(opts OpenOptions, fileSize, tailStart, recordCount int, data []byte, recordOffset func(int) int64, fetchRange func(off, length int64) ([]byte, error)) *prefetchEngine {
@@ -469,12 +470,30 @@ func (e *prefetchEngine) warmup() {
 	}
 }
 
+func (e *prefetchEngine) pausePrefetch() {
+	e.mu.Lock()
+	e.paused = true
+	e.mu.Unlock()
+}
+
+func (e *prefetchEngine) resumePrefetch() {
+	e.mu.Lock()
+	e.paused = false
+	e.mu.Unlock()
+}
+
+func (e *prefetchEngine) isPaused() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.paused
+}
+
 func (e *prefetchEngine) onAccess(index int) {
 	if e.recordCount == 0 {
 		return
 	}
 	e.mu.Lock()
-	if e.closed {
+	if e.closed || e.paused {
 		e.mu.Unlock()
 		return
 	}
@@ -498,7 +517,7 @@ func (e *prefetchEngine) onAccess(index int) {
 }
 
 func (e *prefetchEngine) maybeUpgradeToEager() {
-	if e.strategy != StrategyAdaptive {
+	if e.paused || e.strategy != StrategyAdaptive {
 		return
 	}
 	if e.detector.Pattern() != PatternSequential {
@@ -515,7 +534,7 @@ func (e *prefetchEngine) maybeUpgradeToEager() {
 }
 
 func (e *prefetchEngine) startEagerBackground() {
-	if e.strategy != StrategyEager || e.eagerStarted {
+	if e.paused || e.strategy != StrategyEager || e.eagerStarted {
 		return
 	}
 	e.eagerStarted = true
@@ -567,6 +586,9 @@ func (e *prefetchEngine) startEagerBackground() {
 }
 
 func (e *prefetchEngine) speculativePrefetch() {
+	if e.isPaused() {
+		return
+	}
 	depth := e.options.PrefetchDepth
 	e.mu.Lock()
 	predicted := e.detector.PredictNext(depth, e.recordCount)

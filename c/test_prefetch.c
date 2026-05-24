@@ -203,6 +203,33 @@ int main(int argc, char **argv) {
         free(buf);
     }
 
+    {
+        size_t sz = 0;
+        uint8_t *buf = build_compact_records(200, &sz);
+        nxs_reader_t r;
+        nxs_open_ex(&r, buf, sz, NULL);
+        nxs_object_t obj;
+        for (uint32_t i = 0; i < 25; i++)
+            nxs_record(&r, i, &obj);
+        nxs_cache_stats_t stats;
+        nxs_cache_stats(&r, &stats);
+        CHECK("pause: pattern sequential before pause",
+              stats.pattern && strcmp(stats.pattern, "sequential") == 0);
+        uint64_t before = stats.fetches_issued;
+        nxs_pause_prefetch(&r);
+        nxs_record(&r, 26, &obj);
+        nxs_cache_stats(&r, &stats);
+        CHECK("pause: no new fetches while paused",
+              stats.fetches_issued == before);
+        nxs_resume_prefetch(&r);
+        nxs_record(&r, 27, &obj);
+        nxs_cache_stats(&r, &stats);
+        CHECK("pause: fetches resume after resume",
+              stats.fetches_issued >= before);
+        nxs_close(&r);
+        free(buf);
+    }
+
     /* cache_stats on fixture file */
     {
         const char *dir = "../js/fixtures";

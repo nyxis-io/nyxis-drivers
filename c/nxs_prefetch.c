@@ -36,6 +36,8 @@ struct nxs_prefetch_state {
     nxs_prefetch_strategy_t     strategy;
     size_t                      file_size;
     int                         closed;
+    int                         paused;
+    size_t                      cache_max_bytes;
     int                         eager_cancel;
     int                         eager_complete;
     int                         eager_started;
@@ -122,6 +124,20 @@ static int cache_evict_one(struct nxs_prefetch_state *pf) {
     return 1;
 }
 
+static size_t cache_memory_bytes(struct nxs_prefetch_state *pf) {
+    size_t total = 0;
+    for (nxs_cached_page_t *e = pf->cache; e; e = e->next)
+        total += e->data_len;
+    return total;
+}
+
+static void cache_enforce_byte_limit(struct nxs_prefetch_state *pf) {
+    if (pf->cache_max_bytes == 0) return;
+    while (cache_memory_bytes(pf) > pf->cache_max_bytes) {
+        if (!cache_evict_one(pf)) break;
+    }
+}
+
 static void cache_unpin_all(struct nxs_prefetch_state *pf) {
     for (nxs_cached_page_t *e = pf->cache; e; e = e->next) e->pinned = 0;
 }
@@ -149,6 +165,7 @@ static nxs_err_t cache_insert(struct nxs_prefetch_state *pf, uint32_t page_index
     e->next = pf->cache;
     pf->cache = e;
     pf->cache_count++;
+    cache_enforce_byte_limit(pf);
     return NXS_OK;
 }
 
@@ -419,7 +436,7 @@ static void *eager_worker(void *arg) {
 
 static int start_eager_background(nxs_reader_t *r, struct nxs_prefetch_state *pf) {
     pthread_mutex_lock(&pf->mu);
-    if (pf->strategy != NXS_STRATEGY_EAGER || pf->eager_started || pf->closed) {
+    if (pf->paused || pf->strategy != NXS_STRATEGY_EAGER || pf->eager_started || pf->closed) {
         pthread_mutex_unlock(&pf->mu);
         return 0;
     }
@@ -452,7 +469,7 @@ static int start_eager_background(nxs_reader_t *r, struct nxs_prefetch_state *pf
 }
 
 static int maybe_upgrade_to_eager_locked(struct nxs_prefetch_state *pf) {
-    if (pf->strategy != NXS_STRATEGY_ADAPTIVE) return 0;
+    if (pf->paused || pf->strategy != NXS_STRATEGY_ADAPTIVE) return 0;
     if (nxs_pattern_detector_pattern(&pf->detector) != NXS_PATTERN_SEQUENTIAL) return 0;
     if (nxs_pattern_detector_sequential_runs(&pf->detector) < NXS_PREFETCH_UPGRADE_SEQ_THRESHOLD)
         return 0;
@@ -462,6 +479,13 @@ static int maybe_upgrade_to_eager_locked(struct nxs_prefetch_state *pf) {
 }
 
 static void speculative_prefetch(nxs_reader_t *r, struct nxs_prefetch_state *pf) {
+    pthread_mutex_lock(&pf->mu);
+    if (pf->paused) {
+        pthread_mutex_unlock(&pf->mu);
+        return;
+    }
+    pthread_mutex_unlock(&pf->mu);
+
     uint32_t depth = pf->prefetch_depth;
     uint32_t predicted[32];
     size_t n_pred = 0;
@@ -658,7 +682,7 @@ void nxs_prefetch_on_access(nxs_reader_t *r, uint32_t index) {
     int adaptive_seq = 0;
 
     pthread_mutex_lock(&pf->mu);
-    if (pf->closed) {
+    if (pf->closed || pf->paused) {
         pthread_mutex_unlock(&pf->mu);
         return;
     }
@@ -684,6 +708,29 @@ void nxs_prefetch_on_access(nxs_reader_t *r, uint32_t index) {
 
     if (adaptive_seq)
         speculative_prefetch(r, pf);
+}
+
+void nxs_pause_prefetch(nxs_reader_t *r) {
+    if (!r || !r->prefetch) return;
+    pthread_mutex_lock(&r->prefetch->mu);
+    r->prefetch->paused = 1;
+    pthread_mutex_unlock(&r->prefetch->mu);
+}
+
+void nxs_resume_prefetch(nxs_reader_t *r) {
+    if (!r || !r->prefetch) return;
+    pthread_mutex_lock(&r->prefetch->mu);
+    r->prefetch->paused = 0;
+    pthread_mutex_unlock(&r->prefetch->mu);
+}
+
+void nxs_prefetch_set_cache_limit(nxs_reader_t *r, size_t max_bytes) {
+    if (!r || !r->prefetch) return;
+    struct nxs_prefetch_state *pf = r->prefetch;
+    pthread_mutex_lock(&pf->mu);
+    pf->cache_max_bytes = max_bytes;
+    cache_enforce_byte_limit(pf);
+    pthread_mutex_unlock(&pf->mu);
 }
 
 void nxs_warmup(nxs_reader_t *r) {

@@ -181,6 +181,23 @@ await testAsync("hint full small file eager at open", async () => {
   }
 });
 
+await testAsync("pause stops speculative prefetch", async () => {
+  const buf = buildRecords(200);
+  const reader = new NxsReader(buf, { autoLifecycle: false });
+  for (let i = 0; i < 25; i++) reader.record(i);
+  if (reader.cache_stats().pattern !== "sequential") {
+    throw new Error(`expected sequential pattern, got ${reader.cache_stats().pattern}`);
+  }
+  const before = reader.cache_stats().fetches_issued;
+  reader.pausePrefetch();
+  reader.record(26);
+  if (reader.cache_stats().fetches_issued !== before) {
+    throw new Error("speculative fetch issued while paused");
+  }
+  reader.resumePrefetch();
+  reader.record(27);
+});
+
 await testAsync("sequential upgrade to eager after 150 record() calls", async () => {
   const buf = buildRecords(200);
   const reader = new NxsReader(buf);

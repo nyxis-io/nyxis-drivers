@@ -544,6 +544,10 @@ nxs_err_t nxs_open_ex(nxs_reader_t *r, const uint8_t *data, size_t size,
     return nxs_prefetch_init(r, opts);
 }
 
+void nxs_reader_set_cache_limit(nxs_reader_t *r, size_t max_bytes) {
+    nxs_prefetch_set_cache_limit(r, max_bytes);
+}
+
 void nxs_close(nxs_reader_t *r) {
     if (!r) return;
     nxs_prefetch_destroy(r);

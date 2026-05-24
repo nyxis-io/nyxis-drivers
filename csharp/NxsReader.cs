@@ -228,6 +228,10 @@ public sealed class NxsReader
     public Task WarmupAsync(CancellationToken cancellationToken = default) =>
         _prefetch.WarmupAsync(cancellationToken);
 
+    public void PausePrefetch() => _prefetch.PausePrefetch();
+
+    public void ResumePrefetch() => _prefetch.ResumePrefetch();
+
     public void Close() => _prefetch.Close();
 
     private static int ToByteCount(long length)

@@ -147,7 +147,7 @@ private struct PageEntry {
 }
 
 final class PageCache {
-    let maxPages: Int
+    var maxPages: Int
     let pageSize: Int
     private var pages: [Int: PageEntry] = [:]
     private var clock = 0
@@ -178,14 +178,14 @@ final class PageCache {
     func set(_ pageIndex: Int, data: Data, pinned: Bool = false) {
         guard maxPages > 0 else { return }
         while pages.count >= maxPages {
-            if !evictOne() { break }
+            if !evictOneUnpinned() { break }
         }
         clock += 1
         pages[pageIndex] = PageEntry(data: data, lastUsed: clock, pinned: pinned)
     }
 
     @discardableResult
-    private func evictOne() -> Bool {
+    func evictOneUnpinned() -> Bool {
         var oldest = Int.max
         var victim = -1
         for (idx, e) in pages where !e.pinned {
@@ -290,6 +290,7 @@ final class PrefetchState {
     private var eagerCancelled = false
     private var eagerGroup: DispatchGroup?
     private var closed = false
+    private var paused = false
     private let fileSize: Int
     private(set) var tailStart: Int
     private var recordCount: () -> Int
@@ -371,7 +372,7 @@ final class PrefetchState {
     func onAccess(_ index: Int) {
         guard recordCount() > 0 else { return }
         stateLock.lock()
-        if closed { stateLock.unlock(); return }
+        if closed || paused { stateLock.unlock(); return }
         detector.observe(index)
         maybeUpgradeToEagerLocked()
         let strat = strategy; let done = eagerComplete
@@ -384,18 +385,15 @@ final class PrefetchState {
         if strat == .adaptive && detector.pattern() == .sequential { speculativePrefetch() }
     }
     func warmup() { eagerGroup?.wait() }
-    func close() { stateLock.lock(); closed = true; eagerCancelled = true; stateLock.unlock() }
-    func currentStrategy() -> String { stateLock.lock(); defer { stateLock.unlock() }; return strategy.rawValue }
-    func currentPattern() -> String { detector.pattern().rawValue }
 
     private func maybeUpgradeToEagerLocked() {
-        guard strategy == .adaptive, detector.pattern() == .sequential,
+        guard !paused, strategy == .adaptive, detector.pattern() == .sequential,
               detector.sequentialRuns >= UInt32(PatternConstants.upgradeSequentialThreshold),
               fileSize / (1024 * 1024) <= eagerThresholdMb else { return }
         strategy = .eager; startEagerBackgroundLocked()
     }
     private func startEagerBackgroundLocked() {
-        guard strategy == .eager, !eagerStarted else { return }
+        guard !paused, strategy == .eager, !eagerStarted else { return }
         eagerStarted = true
         let g = DispatchGroup(); eagerGroup = g; g.enter()
         DispatchQueue.global(qos: .utility).async { defer { g.leave() }; self.runEagerBackground() }
@@ -437,6 +435,10 @@ final class PrefetchState {
         stateLock.unlock()
     }
     private func speculativePrefetch() {
+        stateLock.lock()
+        let isPaused = paused
+        stateLock.unlock()
+        if isPaused { return }
         let pred = detector.predictNext(depth: prefetchDepth, recordCount: recordCount())
         guard !pred.isEmpty else { return }
         var pages: [Int] = []; var seen = Set<Int>()
