@@ -380,20 +380,16 @@ func (r *Reader) colNumericBytes(rec uint32, slot int) ([]byte, bool) {
 }
 
 func (r *Reader) colFieldParts(slot int) (bm []byte, vals []byte, err error) {
-	if slot < 0 || slot >= len(r.colBufOff) {
-		return nil, nil, fmt.Errorf("ERR_KEY_NOT_FOUND")
-	}
-	off := int(r.colBufOff[slot])
-	length := int(r.colBufLen[slot])
-	if off+length > len(r.data) {
-		return nil, nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: column buffer")
+	sector, err := r.columnSector(slot)
+	if err != nil {
+		return nil, nil, err
 	}
 	bmLen := nullBitmapBytes(r.recordCount)
-	if length < bmLen {
+	if len(sector) < bmLen {
 		return nil, nil, fmt.Errorf("ERR_OUT_OF_BOUNDS: null bitmap")
 	}
-	bm = r.data[off : off+bmLen]
-	vals = r.data[off+bmLen : off+length]
+	bm = sector[:bmLen]
+	vals = sector[bmLen:]
 	return bm, vals, nil
 }
 

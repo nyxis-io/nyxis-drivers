@@ -82,7 +82,8 @@ console.log(stats.fetches_issued, stats.pages_cached, stats.strategy); // "lazy"
 ## Columnar scan
 
 ```js
-const sum = reader.sumF64("score");
+reader.prefetchColumn("score");   // one range fetch for the column buffer (§7.4)
+const sum = reader.colSumF64("score");
 const min = reader.minF64("score");
 const max = reader.maxF64("score");
 ```

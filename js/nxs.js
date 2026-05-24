@@ -313,6 +313,9 @@ export class NxsReader {
 
     this._colBufOff = [];
     this._colBufLen = [];
+    this._colWarmed = new Set();
+    this._colOverlay = new Map();
+    this._colFetches = 0;
 
     if ((this.flags & FLAG_COLUMNAR) && (this.flags & FLAG_PAX)) {
       throw new NxsError("ERR_INVALID_FLAGS", "columnar and PAX both set");
@@ -331,10 +334,41 @@ export class NxsReader {
       this._readTailIndex();
     }
 
+    const bytes = this.bytes;
+    this._colFetchRange =
+      options.fetchRange ??
+      ((off, len) => bytes.subarray(off, off + len));
     this._initPrefetch(options);
     if (this._layout === "row" && this._prefetch.strategy === "eager") {
       this._startEagerBackground();
     }
+  }
+
+  /**
+   * Prefetch one column buffer (columnar layout only; §7.4).
+   * @param {string} key
+   */
+  prefetchColumn(key) {
+    if (this._layout !== "columnar") {
+      throw new NxsError("ERR_LAYOUT", "prefetchColumn requires columnar layout");
+    }
+    const slot = this._slotOf(key);
+    if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
+    if (this._colWarmed.has(slot)) return;
+    const off = this._colBufOff[slot];
+    const len = this._colBufLen[slot];
+    let sector = this._colFetchRange(off, len);
+    if (sector && typeof sector.then === "function") {
+      throw new NxsError("ERR_UNSUPPORTED", "prefetchColumn requires synchronous fetchRange");
+    }
+    if (off + sector.byteLength > this.bytes.byteLength) {
+      this._colOverlay.set(
+        slot,
+        sector instanceof Uint8Array ? sector : new Uint8Array(sector),
+      );
+    }
+    this._colWarmed.add(slot);
+    this._colFetches++;
   }
 
   _initPrefetch(options) {
@@ -679,12 +713,14 @@ export class NxsReader {
   /** Diagnostic cache / prefetch counters. */
   cache_stats() {
     const s = this._prefetch.cache.stats();
-    return {
+    const out = {
       ...s,
       fetches_issued: this._prefetch.fetchesIssued,
       strategy: this._prefetch.strategy,
       pattern: this._prefetch.detector.pattern(),
+      column_fetches_issued: this._colFetches,
     };
+    return out;
   }
 
   /** `row` | `columnar` | `pax` */
@@ -956,7 +992,9 @@ export class NxsReader {
     }
     const bmLen = this._nullBitmapBytes(this.recordCount);
     if (len < bmLen) throw new NxsError("ERR_OUT_OF_BOUNDS", "column sector short");
-    const sector = this.bytes.subarray(off, off + len);
+    const sector = this._colOverlay.has(slot)
+      ? this._colOverlay.get(slot)
+      : this.bytes.subarray(off, off + len);
     return {
       bitmap: sector.subarray(0, bmLen),
       values: sector.subarray(bmLen),
