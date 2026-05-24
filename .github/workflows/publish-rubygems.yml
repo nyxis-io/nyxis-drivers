@@ -52,5 +52,35 @@ jobs:
 
       - name: Smoke test (install from registry)
         run: |
-          gem install nyxis
-          ruby -e "require 'nxs'; puts 'ok'"
+          set -euo pipefail
+          VERSION=$(sed -n 's/.*spec.version.*=.*"\(.*\)".*/\1/p' ruby/nyxis.gemspec | head -1)
+          PACKAGE=nyxis
+
+          echo "Waiting for ${PACKAGE} ${VERSION} on RubyGems (publish already succeeded)..."
+          indexed=0
+          for attempt in $(seq 1 40); do
+            if curl -sf "https://rubygems.org/api/v2/rubygems/${PACKAGE}/versions/${VERSION}.json" >/dev/null; then
+              echo "Version ${VERSION} listed on rubygems.org (attempt ${attempt}/40)"
+              indexed=1
+              break
+            fi
+            echo "Waiting for RubyGems index (attempt ${attempt}/40, ~13 min max)..."
+            sleep 20
+          done
+
+          if [ "$indexed" -eq 0 ]; then
+            echo "::warning::${PACKAGE} ${VERSION} not yet visible on RubyGems after ~13 minutes. Publish succeeded; registry propagation may lag."
+            exit 0
+          fi
+
+          for attempt in $(seq 1 12); do
+            if gem install "${PACKAGE}" -v "${VERSION}"; then
+              echo "Smoke test: gem install ${PACKAGE} -v ${VERSION} OK (attempt ${attempt})"
+              ruby -e "require 'nxs'; puts 'ok'"
+              exit 0
+            fi
+            echo "gem install not ready yet (attempt ${attempt}/12)..."
+            sleep 10
+          done
+          echo "::error::${PACKAGE} ${VERSION} is indexed but gem install failed after retries"
+          exit 1

@@ -36,16 +36,38 @@ jobs:
         run: npm publish --access public --provenance
 
       - name: Smoke test (install from registry)
-        # Wait out npm's index propagation (can lag ~30-60s after publish).
         run: |
-          mkdir /tmp/smoke-npm && cd /tmp/smoke-npm
-          npm init -y
-          for i in 1 2 3 4 5 6; do
-            if npm install nyxis; then
-              ok=1; break
+          set -euo pipefail
+          VERSION=$(node -p "require('./js/package.json').version")
+          PACKAGE=nyxis
+
+          echo "Waiting for ${PACKAGE}@${VERSION} on npm (publish already succeeded)..."
+          indexed=0
+          for attempt in $(seq 1 40); do
+            if curl -sf "https://registry.npmjs.org/${PACKAGE}/${VERSION}" >/dev/null; then
+              echo "Version ${VERSION} listed on npm (attempt ${attempt}/40)"
+              indexed=1
+              break
             fi
-            echo "registry not ready yet (attempt $i), sleeping 20s"
+            echo "Waiting for npm registry (attempt ${attempt}/40, ~13 min max)..."
             sleep 20
           done
-          [ "${ok:-0}" = "1" ] || { echo '::error::npm install failed after retries'; exit 1; }
-          node -e "import('nyxis').then(m => { console.log('ok', Object.keys(m)) })"
+
+          if [ "$indexed" -eq 0 ]; then
+            echo "::warning::${PACKAGE}@${VERSION} not yet visible on npm after ~13 minutes. Publish succeeded; registry propagation may lag."
+            exit 0
+          fi
+
+          mkdir /tmp/smoke-npm && cd /tmp/smoke-npm
+          npm init -y
+          for attempt in $(seq 1 12); do
+            if npm install "${PACKAGE}@${VERSION}"; then
+              echo "Smoke test: npm install ${PACKAGE}@${VERSION} OK (attempt ${attempt})"
+              node -e "import('nyxis').then(m => { console.log('ok', Object.keys(m)) })"
+              exit 0
+            fi
+            echo "npm install not ready yet (attempt ${attempt}/12)..."
+            sleep 10
+          done
+          echo "::error::${PACKAGE}@${VERSION} is indexed but npm install failed after retries"
+          exit 1
