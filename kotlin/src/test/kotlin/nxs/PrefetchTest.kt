@@ -199,6 +199,25 @@ class PrefetchTest {
     }
 
     @Test
+    fun pauseStopsSpeculative() {
+        val buf = buildCompactRecords(200)
+        val reader = NxsReader(buf)
+        try {
+            for (i in 0 until 25) reader.record(i)
+            assertEquals("sequential", reader.cacheStats().pattern)
+            val before = reader.cacheStats().fetchesIssued
+            reader.pausePrefetch()
+            reader.record(26)
+            assertEquals(before, reader.cacheStats().fetchesIssued)
+            reader.resumePrefetch()
+            reader.record(27)
+            assertTrue(reader.cacheStats().fetchesIssued >= before)
+        } finally {
+            reader.close()
+        }
+    }
+
+    @Test
     fun hintFull_eagerAtOpen() {
         val buf = buildCompactRecords(200)
         val reader = NxsReader(buf, OpenOptions(hint = AccessHint.FULL))

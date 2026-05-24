@@ -99,6 +99,15 @@ uint32_t nxs_record_count(const nxs_reader_t *r);
 /** Wait for eager / in-flight background prefetch (requires nxs_open_ex). */
 void nxs_warmup(nxs_reader_t *r);
 
+/** Stop scheduling speculative and eager prefetch (§8.1). */
+void nxs_pause_prefetch(nxs_reader_t *r);
+
+/** Re-enable speculative prefetch after nxs_pause_prefetch. */
+void nxs_resume_prefetch(nxs_reader_t *r);
+
+/** Cap page-cache resident memory; evicts unpinned pages (requires nxs_open_ex). */
+void nxs_reader_set_cache_limit(nxs_reader_t *r, size_t max_bytes);
+
 // Resolve a key name to its integer slot index.
 // Returns -1 if not found.
 int nxs_slot(const nxs_reader_t *r, const char *key);

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import struct
 import threading
 from typing import Any, Callable, Iterator, Optional, Union
@@ -171,15 +172,33 @@ class PageCache:
     def set(self, page_index: int, data: bytes, *, pinned: bool = False) -> None:
         if self.max_pages <= 0:
             return
-        while len(self.pages) >= self.max_pages:
-            if not self._evict_one():
-                break
-        self._clock += 1
-        self.pages[page_index] = {
-            "data": data,
-            "last_used": self._clock,
-            "pinned": pinned,
-        }
+        try:
+            while len(self.pages) >= self.max_pages:
+                if not self._evict_one():
+                    break
+            self._clock += 1
+            self.pages[page_index] = {
+                "data": data,
+                "last_used": self._clock,
+                "pinned": pinned,
+            }
+        except MemoryError:
+            new_max = max(1, self.max_pages // 2)
+            logging.warning(
+                "nxs page cache MemoryError: halving max_pages %d -> %d",
+                self.max_pages,
+                new_max,
+            )
+            self.max_pages = new_max
+            while len(self.pages) >= self.max_pages:
+                if not self._evict_one():
+                    break
+            self._clock += 1
+            self.pages[page_index] = {
+                "data": data,
+                "last_used": self._clock,
+                "pinned": pinned,
+            }
 
     def _evict_one(self) -> bool:
         victim = -1
@@ -290,6 +309,7 @@ class PrefetchEngine:
         "_eager_cancel",
         "_eager_done",
         "_eager_thread",
+        "_paused",
     )
 
     def __init__(
@@ -338,6 +358,7 @@ class PrefetchEngine:
         self._eager_cancel: Optional[threading.Event] = None
         self._eager_done: Optional[threading.Event] = None
         self._eager_thread: Optional[threading.Thread] = None
+        self._paused = False
 
         if self._strategy == "eager":
             self._start_eager_background()
@@ -349,7 +370,7 @@ class PrefetchEngine:
         if self._record_count == 0:
             return
         with self._lock:
-            if self._closed:
+            if self._closed or self._paused:
                 return
             self._detector.observe(index)
             self._maybe_upgrade_to_eager()
@@ -366,8 +387,16 @@ class PrefetchEngine:
         if adaptive_seq:
             self._speculative_prefetch()
 
+    def pause_prefetch(self) -> None:
+        with self._lock:
+            self._paused = True
+
+    def resume_prefetch(self) -> None:
+        with self._lock:
+            self._paused = False
+
     def _maybe_upgrade_to_eager(self) -> None:
-        if self._strategy != "adaptive":
+        if self._paused or self._strategy != "adaptive":
             return
         if self._detector.pattern() != PATTERN_SEQUENTIAL:
             return
@@ -379,7 +408,7 @@ class PrefetchEngine:
         self._start_eager_background()
 
     def _start_eager_background(self) -> None:
-        if self._strategy != "eager" or self._eager_started:
+        if self._paused or self._strategy != "eager" or self._eager_started:
             return
         self._eager_started = True
         sector_start, sector_len = row_data_sector(self._tail_start, len(self._mv))
@@ -431,6 +460,9 @@ class PrefetchEngine:
         thread.start()
 
     def _speculative_prefetch(self) -> None:
+        with self._lock:
+            if self._paused:
+                return
         with self._lock:
             predicted = self._detector.predict_next(
                 self._prefetch_depth, self._record_count,
@@ -762,6 +794,14 @@ class NxsReader:
     def warmup(self) -> None:
         """Block until eager or background prefetch work completes."""
         self._prefetch.warmup()
+
+    def pause_prefetch(self) -> None:
+        """Stop scheduling speculative and eager prefetch (§8.1)."""
+        self._prefetch.pause_prefetch()
+
+    def resume_prefetch(self) -> None:
+        """Re-enable speculative prefetch after pause_prefetch."""
+        self._prefetch.resume_prefetch()
 
     def close(self) -> None:
         """Cancel in-flight eager prefetch and wait for the background thread."""

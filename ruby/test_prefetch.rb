@@ -177,6 +177,23 @@ puts
       stats[:strategy] == 'adaptive' && stats[:pattern] == Nxs::PATTERN_UNKNOWN
   end,
 
+  check('pause stops speculative prefetch') do
+    buf = build_compact_records(200)
+    reader = Nxs::Reader.new(buf)
+    25.times { |i| reader.record(i) }
+    stats = reader.cache_stats
+    next false unless stats[:pattern] == Nxs::PATTERN_SEQUENTIAL
+
+    before = stats[:fetches_issued]
+    reader.pause_prefetch
+    reader.record(26)
+    after_pause = reader.cache_stats[:fetches_issued]
+    reader.resume_prefetch
+    reader.record(27)
+    after_resume = reader.cache_stats[:fetches_issued]
+    after_pause == before && after_resume >= before
+  end,
+
   check('hint full small file eager at open') do
     buf = build_records(200)
     reader = Nxs::Reader.new(buf, hint: Nxs::HINT_FULL)

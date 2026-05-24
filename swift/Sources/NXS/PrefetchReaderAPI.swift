@@ -9,6 +9,12 @@ extension NXSReader {
 
     public func warmup() { prefetch.warmup() }
 
+    public func pausePrefetch() { prefetch.pausePrefetch() }
+
+    public func resumePrefetch() { prefetch.resumePrefetch() }
+
+    public func respondToMemoryPressure() { prefetch.respondToMemoryPressure() }
+
     public func close() { prefetch.close() }
 
     func prefetchOnAccess(_ index: Int) {

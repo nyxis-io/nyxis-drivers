@@ -533,6 +533,7 @@ module Nxs
       @eager_cancel = false
       @eager_thread = nil
       @closed = false
+      @prefetch_paused = false
       @fetch_range = fetch_range || lambda do |byte_start, byte_length|
         raise NxsError.new('ERR_OUT_OF_BOUNDS', 'fetch range out of bounds') if byte_start.negative?
 
@@ -549,6 +550,16 @@ module Nxs
     def warmup
       t = @prefetch_mu.synchronize { @eager_thread }
       t&.join
+    end
+
+    # Stop scheduling speculative and eager prefetch (§8.1).
+    def pause_prefetch
+      @prefetch_mu.synchronize { @prefetch_paused = true }
+    end
+
+    # Re-enable speculative prefetch after pause_prefetch.
+    def resume_prefetch
+      @prefetch_mu.synchronize { @prefetch_paused = false }
     end
 
     # Cancel in-flight eager prefetch and wait for the background thread.
@@ -570,7 +581,7 @@ module Nxs
       skip_spec = false
       start_eager = false
       @prefetch_mu.synchronize do
-        return if @closed
+        return if @closed || @prefetch_paused
 
         @detector.observe(index)
         @prefetch_pattern = @detector.pattern
@@ -647,6 +658,7 @@ module Nxs
     end
 
     def maybe_upgrade_to_eager!
+      return if @prefetch_paused
       return unless @prefetch_strategy == 'adaptive'
       return unless @detector.pattern == PATTERN_SEQUENTIAL
       return if @detector.sequential_runs < UPGRADE_SEQUENTIAL_THRESHOLD
@@ -657,6 +669,8 @@ module Nxs
     end
 
     def speculative_prefetch!
+      return if @prefetch_mu.synchronize { @prefetch_paused }
+
       predicted = @prefetch_mu.synchronize { @detector.predict_next(@prefetch_depth, @record_count) }
       return if predicted.empty?
 
@@ -681,7 +695,7 @@ module Nxs
       return unless @prefetch_strategy == 'eager'
 
       @prefetch_mu.synchronize do
-        return if @eager_started
+        return if @prefetch_paused || @eager_started
 
         @eager_started = true
         sector_start, sector_len = Nxs.row_data_sector(@tail_start, @data.bytesize)

@@ -161,6 +161,22 @@ public sealed class PrefetchTests
     }
 
     [Fact]
+    public void PauseStopsSpeculative()
+    {
+        byte[] buf = BuildRecords(200);
+        var reader = new NxsReader(buf);
+        for (int i = 0; i < 25; i++) _ = reader.Record(i);
+        Assert.Equal("sequential", reader.CacheStats().Pattern);
+        int before = reader.CacheStats().FetchesIssued;
+        reader.PausePrefetch();
+        _ = reader.Record(26);
+        Assert.Equal(before, reader.CacheStats().FetchesIssued);
+        reader.ResumePrefetch();
+        _ = reader.Record(27);
+        Assert.True(reader.CacheStats().FetchesIssued >= before);
+    }
+
+    [Fact]
     public async Task HintFull_SmallFile_EagerAtOpen()
     {
         byte[] buf = BuildRecords(200);

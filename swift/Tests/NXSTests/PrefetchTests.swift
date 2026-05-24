@@ -3,6 +3,18 @@ import XCTest
 
 final class PrefetchTests: XCTestCase {
 
+    private func buildCompactRecords(_ n: Int) -> Data {
+        let schema = NXSSchema(keys: ["id", "tag"])
+        let w = NXSWriter(schema: schema)
+        for i in 0..<n {
+            w.beginObject()
+            w.writeI64(slot: 0, value: Int64(i))
+            w.writeStr(slot: 1, value: "r\(i)")
+            w.endObject()
+        }
+        return Data(w.finish())
+    }
+
     private func buildPrefetchRecords(_ n: Int) -> Data {
         let schema = NXSSchema(keys: ["id", "username", "score", "active"])
         let w = NXSWriter(schema: schema)
@@ -130,6 +142,20 @@ final class PrefetchTests: XCTestCase {
         let d = AccessPatternDetector()
         for i in 0..<10 { d.observe(i) }
         XCTAssertEqual(d.predictNext(depth: 4, recordCount: 100), [10, 11, 12, 13])
+    }
+
+    func testPauseStopsSpeculative() throws {
+        let buf = buildCompactRecords(200)
+        let r = try NXSReader(buf)
+        for i in 0..<25 { _ = try r.record(i) }
+        XCTAssertEqual(r.cacheStats().pattern, "sequential")
+        let before = r.cacheStats().fetchesIssued
+        r.pausePrefetch()
+        _ = try r.record(26)
+        XCTAssertEqual(r.cacheStats().fetchesIssued, before)
+        r.resumePrefetch()
+        _ = try r.record(27)
+        XCTAssertGreaterThanOrEqual(r.cacheStats().fetchesIssued, before)
     }
 
     func testHintFullEagerAtOpen() throws {

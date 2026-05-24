@@ -238,6 +238,20 @@ func (r *Reader) Warmup() {
 	}
 }
 
+// PausePrefetch stops scheduling speculative and eager prefetch (§8.1).
+func (r *Reader) PausePrefetch() {
+	if r.prefetch != nil {
+		r.prefetch.pausePrefetch()
+	}
+}
+
+// ResumePrefetch re-enables speculative prefetch after PausePrefetch.
+func (r *Reader) ResumePrefetch() {
+	if r.prefetch != nil {
+		r.prefetch.resumePrefetch()
+	}
+}
+
 // Close cancels in-flight eager prefetch and waits for the background goroutine.
 func (r *Reader) Close() {
 	if r.prefetch != nil {

@@ -18,6 +18,17 @@ from nxs_writer import NxsSchema, NxsWriter
 from pattern import AccessPatternDetector
 
 
+def build_compact_records(n: int) -> bytes:
+    schema = NxsSchema(["id", "tag"])
+    w = NxsWriter(schema)
+    for i in range(n):
+        w.begin_object()
+        w.write_i64(0, i)
+        w.write_str(1, f"r{i}")
+        w.end_object()
+    return w.finish()
+
+
 def build_records(n: int) -> bytes:
     schema = NxsSchema(["id", "username", "score", "active"])
     w = NxsWriter(schema)
@@ -80,6 +91,7 @@ def main() -> int:
         lambda: _test_dedup(),
     )
     case("cache_stats returns expected keys", lambda: _test_cache_stats())
+    case("pause stops speculative prefetch", lambda: _test_pause_stops_speculative())
     case("hint full small file eager at open", lambda: _test_hint_full_eager())
     case(
         "sequential upgrade to eager after 150 record() calls",
@@ -245,6 +257,21 @@ def _test_cache_stats() -> None:
     assert stats["pages_max"] == 32
     assert stats["strategy"] == "adaptive"
     assert stats["pattern"] == "unknown"
+
+
+def _test_pause_stops_speculative() -> None:
+    buf = build_compact_records(200)
+    reader = NxsReader(buf)
+    for i in range(25):
+        reader.record(i)
+    assert reader.cache_stats()["pattern"] == "sequential"
+    before = reader.cache_stats()["fetches_issued"]
+    reader.pause_prefetch()
+    reader.record(26)
+    assert reader.cache_stats()["fetches_issued"] == before
+    reader.resume_prefetch()
+    reader.record(27)
+    assert reader.cache_stats()["fetches_issued"] >= before
 
 
 def _test_hint_full_eager() -> None:

@@ -26,6 +26,19 @@ function check(string $label, bool $ok, string $detail = ''): void
     }
 }
 
+function buildCompactRecords(int $n): string
+{
+    $schema = new Nxs\Schema(['id', 'tag']);
+    $w = new Nxs\Writer($schema);
+    for ($i = 0; $i < $n; $i++) {
+        $w->beginObject();
+        $w->writeI64(0, $i);
+        $w->writeStr(1, "r$i");
+        $w->endObject();
+    }
+    return $w->finish();
+}
+
 function buildRecords(int $n): string
 {
     $schema = new Nxs\Schema(['id', 'username', 'score', 'active']);
@@ -180,6 +193,30 @@ for ($i = 0; $i < 10; $i++) {
 check(
     'predict_next sequential',
     $d4->predictNext(4, 100) === [10, 11, 12, 13]
+);
+
+// pause stops speculative prefetch
+$bufPause = buildCompactRecords(200);
+$readerPause = new Nxs\Reader($bufPause);
+for ($i = 0; $i < 25; $i++) {
+    $readerPause->record($i);
+}
+$statsPause = $readerPause->cache_stats();
+check(
+    'pause: pattern sequential before pause',
+    ($statsPause['pattern'] ?? '') === 'sequential'
+);
+$beforePause = $statsPause['fetches_issued'] ?? 0;
+$readerPause->pausePrefetch();
+$readerPause->record(26);
+$afterPause = $readerPause->cache_stats()['fetches_issued'] ?? 0;
+$readerPause->resumePrefetch();
+$readerPause->record(27);
+$afterResume = $readerPause->cache_stats()['fetches_issued'] ?? 0;
+check(
+    'pause stops speculative prefetch',
+    $afterPause === $beforePause && $afterResume >= $beforePause,
+    "before=$beforePause after_pause=$afterPause after_resume=$afterResume"
 );
 
 // hint full → eager at open (sync load via warmup)

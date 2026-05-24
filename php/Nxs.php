@@ -405,6 +405,7 @@ class Reader
     private int $prefetchDepth = DEFAULT_PREFETCH_DEPTH;
     private AccessPatternDetector $patternDetector;
     private bool $eagerLoadComplete = false;
+    private bool $prefetchPaused = false;
     /** @var object|null C extension NxsReader when available */
     private ?object $extReader = null;
 
@@ -1072,6 +1073,26 @@ class Reader
     /**
      * Wait for eager prefetch — PHP has no background threads; eager loads run here (§8 stub).
      */
+    /** Stop scheduling speculative and eager prefetch (§8.1). */
+    public function pausePrefetch(): void
+    {
+        if ($this->extReader !== null && method_exists($this->extReader, 'pausePrefetch')) {
+            $this->extReader->pausePrefetch();
+            return;
+        }
+        $this->prefetchPaused = true;
+    }
+
+    /** Re-enable speculative prefetch after pausePrefetch(). */
+    public function resumePrefetch(): void
+    {
+        if ($this->extReader !== null && method_exists($this->extReader, 'resumePrefetch')) {
+            $this->extReader->resumePrefetch();
+            return;
+        }
+        $this->prefetchPaused = false;
+    }
+
     public function warmup(): void
     {
         if ($this->extReader !== null && method_exists($this->extReader, 'warmup')) {
@@ -1086,6 +1107,9 @@ class Reader
     private function onAccess(int $index): void
     {
         if ($this->extReader !== null || $this->layout !== 'row' || $this->recordCount === 0) {
+            return;
+        }
+        if ($this->prefetchPaused) {
             return;
         }
         $this->patternDetector->observe($index);
@@ -1107,6 +1131,9 @@ class Reader
 
     private function maybeUpgradeToEager(): void
     {
+        if ($this->prefetchPaused) {
+            return;
+        }
         if ($this->prefetchStrategy !== 'adaptive') {
             return;
         }
@@ -1125,6 +1152,9 @@ class Reader
 
     private function speculativePrefetch(): void
     {
+        if ($this->prefetchPaused) {
+            return;
+        }
         $predicted = $this->patternDetector->predictNext(
             $this->prefetchDepth,
             $this->recordCount,

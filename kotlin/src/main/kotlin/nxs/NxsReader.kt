@@ -126,6 +126,18 @@ class NxsReader
             prefetch?.warmup()
         }
 
+        fun pausePrefetch() {
+            prefetch?.pausePrefetch()
+        }
+
+        fun resumePrefetch() {
+            prefetch?.resumePrefetch()
+        }
+
+        fun onTrimMemory() {
+            prefetch?.onTrimMemory()
+        }
+
         fun close() {
             prefetch?.close()
         }
