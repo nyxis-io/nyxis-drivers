@@ -9,6 +9,48 @@ export const HINT_PARTIAL = 4;
 export const DEFAULT_PAGE_SIZE = 65536;
 export const DEFAULT_MAX_PAGES = 64;
 export const DEFAULT_COALESCE_GAP_PAGES = 4;
+export const DEFAULT_PREFETCH_DEPTH = 4;
+export const EAGER_THRESHOLD_MB = 10;
+export const LAZY_THRESHOLD_MB = 50;
+
+export { UPGRADE_SEQUENTIAL_THRESHOLD } from "./pattern.js";
+
+/**
+ * Initial prefetch strategy from open hint and file size (spec §5.1).
+ * @param {number} hint
+ * @param {number} fileSize
+ * @returns {"lazy"|"adaptive"|"eager"}
+ */
+export function initialStrategy(hint, fileSize) {
+  const fileSizeMb = Math.floor(fileSize / (1024 * 1024));
+  if (hint === HINT_FULL && fileSizeMb <= EAGER_THRESHOLD_MB) return "eager";
+  if (fileSizeMb > LAZY_THRESHOLD_MB) return "lazy";
+  return "adaptive";
+}
+
+/** Row-layout data sector byte range. */
+export function rowDataSector(tailStart, fileSize) {
+  const start = 32;
+  if (tailStart > start && tailStart <= fileSize) {
+    return { byteStart: start, byteLength: tailStart - start };
+  }
+  return { byteStart: start, byteLength: 0 };
+}
+
+/**
+ * Absolute byte offset for row-layout record `index`.
+ * @param {Uint8Array} bytes
+ * @param {number} tailStart
+ * @param {number} index
+ * @returns {number | null}
+ */
+export function rowRecordOffset(bytes, tailStart, index) {
+  const entry = tailStart + index * 10;
+  if (entry + 10 > bytes.length) return null;
+  const lo = bytes[entry + 2] | (bytes[entry + 3] << 8) | (bytes[entry + 4] << 16) | (bytes[entry + 5] << 24);
+  const hi = bytes[entry + 6] | (bytes[entry + 7] << 8) | (bytes[entry + 8] << 16) | (bytes[entry + 9] << 24);
+  return hi * 0x100000000 + (lo >>> 0);
+}
 
 /**
  * @param {number[]} indices page indices (any order)

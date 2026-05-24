@@ -100,8 +100,52 @@ final class PrefetchTests: XCTestCase {
         let r = try NXSReader(buf, options: NXSOpenOptions(hint: .sequential))
         XCTAssertEqual(r.accessHint, .sequential)
         let stats = r.cacheStats()
-        XCTAssertEqual(stats.strategy, "lazy")
+        XCTAssertEqual(stats.strategy, "adaptive")
         XCTAssertEqual(stats.pattern, "unknown")
         XCTAssertEqual(stats.pagesMax, defaultMaxPages)
+    }
+
+    func testPatternUnknownUntilMinObservations() {
+        let d = AccessPatternDetector()
+        for i in 0..<8 { d.observe(i) }
+        XCTAssertEqual(d.pattern(), .unknown)
+        d.observe(8)
+        XCTAssertNotEqual(d.pattern(), .unknown)
+    }
+
+    func testPatternSequential() {
+        let d = AccessPatternDetector()
+        for i in 0..<20 { d.observe(i) }
+        XCTAssertEqual(d.pattern(), .sequential)
+    }
+
+    func testPatternRandom() {
+        let d = AccessPatternDetector()
+        for i in 0..<8 { d.observe(i) }
+        for k in 0..<12 { d.observe(k * 200) }
+        XCTAssertEqual(d.pattern(), .random)
+    }
+
+    func testPredictNextSequential() {
+        let d = AccessPatternDetector()
+        for i in 0..<10 { d.observe(i) }
+        XCTAssertEqual(d.predictNext(depth: 4, recordCount: 100), [10, 11, 12, 13])
+    }
+
+    func testHintFullEagerAtOpen() throws {
+        let buf = buildPrefetchRecords(200)
+        let r = try NXSReader(buf, options: NXSOpenOptions(hint: .full))
+        r.warmup()
+        XCTAssertEqual(r.cacheStats().strategy, "eager")
+    }
+
+    func testSequentialUpgradeToEager() throws {
+        let buf = buildPrefetchRecords(200)
+        let r = try NXSReader(buf)
+        for i in 0..<150 { _ = try r.record(i) }
+        r.warmup()
+        let stats = r.cacheStats()
+        XCTAssertEqual(stats.strategy, "eager")
+        XCTAssertEqual(stats.pattern, "sequential")
     }
 }

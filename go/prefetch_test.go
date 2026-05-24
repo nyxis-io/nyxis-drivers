@@ -134,3 +134,79 @@ func TestDedup(t *testing.T) {
 		t.Fatalf("too many fetches: %d", n)
 	}
 }
+
+func TestPatternSequential(t *testing.T) {
+	d := NewAccessPatternDetector()
+	for i := 0; i < 8; i++ {
+		d.Observe(i)
+	}
+	if got := d.Pattern(); got != PatternUnknown {
+		t.Fatalf("after 8 obs: got %v, want unknown", got)
+	}
+	for i := 8; i < 20; i++ {
+		d.Observe(i)
+	}
+	if got := d.Pattern(); got != PatternSequential {
+		t.Fatalf("got %v, want sequential", got)
+	}
+	if got := d.PredictNext(4, 100); len(got) != 4 || got[0] != 20 {
+		t.Fatalf("predict_next: %v", got)
+	}
+}
+
+func buildCompactRecords(t *testing.T, n int) []byte {
+	t.Helper()
+	schema := NewSchema([]string{"id", "tag"})
+	w := NewWriter(schema)
+	for i := 0; i < n; i++ {
+		w.BeginObject()
+		w.WriteI64(0, int64(i))
+		w.WriteStr(1, "r"+itoa(i))
+		w.EndObject()
+	}
+	return w.Finish()
+}
+
+func TestSequentialUpgrade(t *testing.T) {
+	buf := buildCompactRecords(t, 200)
+	r, err := NewReader(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for i := 0; i < 150; i++ {
+		_ = r.Record(i)
+	}
+	r.Warmup()
+	stats := r.CacheStats()
+	if stats.Strategy != "eager" {
+		t.Fatalf("strategy = %q, want eager", stats.Strategy)
+	}
+	if stats.Pattern != "sequential" {
+		t.Fatalf("pattern = %q, want sequential", stats.Pattern)
+	}
+}
+
+func TestHintFullEager(t *testing.T) {
+	buf := buildCompactRecords(t, 200)
+	if len(buf) > EagerThresholdMB*1024*1024 {
+		t.Fatalf("fixture too large for eager threshold: %d bytes", len(buf))
+	}
+	r, err := NewReader(buf, WithHint(HintFull))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	r.Warmup()
+	if got := r.CacheStats().Strategy; got != "eager" {
+		t.Fatalf("strategy = %q, want eager at open", got)
+	}
+}
+
+func TestOpenOptionsZeroPageSize(t *testing.T) {
+	buf := buildCompactRecords(t, 10)
+	_, err := NewReader(buf, WithPageSize(0))
+	if err == nil {
+		t.Fatal("expected error for page_size=0")
+	}
+}

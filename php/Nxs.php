@@ -18,6 +18,7 @@
 namespace Nxs;
 
 require_once __DIR__ . '/Prefetch.php';
+require_once __DIR__ . '/Pattern.php';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -401,7 +402,9 @@ class Reader
     /** @var callable(int, int): string|null */
     private $fetchRange = null;
     private string $prefetchStrategy = 'lazy';
-    private string $prefetchPattern = 'unknown';
+    private int $prefetchDepth = DEFAULT_PREFETCH_DEPTH;
+    private AccessPatternDetector $patternDetector;
+    private bool $eagerLoadComplete = false;
     /** @var object|null C extension NxsReader when available */
     private ?object $extReader = null;
 
@@ -411,6 +414,7 @@ class Reader
      *   max_pages?: int,
      *   page_size?: int,
      *   coalesce_gap_pages?: int,
+     *   prefetch_depth?: int,
      *   fetch_range?: callable(int, int): string
      * } $options
      */
@@ -462,6 +466,7 @@ class Reader
      *   max_pages?: int,
      *   page_size?: int,
      *   coalesce_gap_pages?: int,
+     *   prefetch_depth?: int,
      *   fetch_range?: callable(int, int): string
      * } $options
      */
@@ -472,9 +477,15 @@ class Reader
         $this->prefetchHint = $options['hint'] ?? HINT_UNKNOWN;
         $this->prefetchPageSize = $pageSize;
         $this->coalesceGapPages = $options['coalesce_gap_pages'] ?? DEFAULT_COALESCE_GAP_PAGES;
+        $this->prefetchDepth = $options['prefetch_depth'] ?? DEFAULT_PREFETCH_DEPTH;
         $this->pageCache = new PageCache($maxPages, $pageSize);
         $this->inFlight = new InFlightMap();
         $this->fetchRange = $options['fetch_range'] ?? null;
+        $this->patternDetector = new AccessPatternDetector();
+        $this->prefetchStrategy = initialPrefetchStrategy(
+            $this->prefetchHint,
+            strlen($this->bytes),
+        );
     }
 
     /**
@@ -611,7 +622,7 @@ class Reader
             ...$s,
             'fetches_issued' => $this->fetchesIssued,
             'strategy'       => $this->prefetchStrategy,
-            'pattern'        => $this->prefetchPattern,
+            'pattern'        => $this->patternDetector->pattern(),
             'hint'           => $this->prefetchHint,
         ];
     }
@@ -1051,10 +1062,136 @@ class Reader
         if ($this->layout !== 'row') {
             return new NxsObject($this, $i, $i);
         }
+        $this->onAccess($i);
         // Tail entry: KeyID u16 (skip 2) + AbsoluteOffset u64
         $entryOff  = $this->tailStart + $i * 10;
         $absOffset = rdU64($this->bytes, $entryOff + 2);
         return new NxsObject($this, (int)$absOffset);
+    }
+
+    /**
+     * Wait for eager prefetch — PHP has no background threads; eager loads run here (§8 stub).
+     */
+    public function warmup(): void
+    {
+        if ($this->extReader !== null && method_exists($this->extReader, 'warmup')) {
+            $this->extReader->warmup();
+            return;
+        }
+        if ($this->prefetchStrategy === 'eager' && !$this->eagerLoadComplete) {
+            $this->runEagerLoadSync();
+        }
+    }
+
+    private function onAccess(int $index): void
+    {
+        if ($this->extReader !== null || $this->layout !== 'row' || $this->recordCount === 0) {
+            return;
+        }
+        $this->patternDetector->observe($index);
+        $this->maybeUpgradeToEager();
+
+        if ($this->prefetchStrategy === 'eager' && $this->eagerLoadComplete) {
+            return;
+        }
+
+        $off = $this->recordByteOffset($index);
+        $pageIndex = intdiv($off, $this->prefetchPageSize);
+        $this->pageCache->get($pageIndex);
+
+        if ($this->prefetchStrategy === 'adaptive'
+            && $this->patternDetector->pattern() === PATTERN_SEQUENTIAL) {
+            $this->speculativePrefetch();
+        }
+    }
+
+    private function maybeUpgradeToEager(): void
+    {
+        if ($this->prefetchStrategy !== 'adaptive') {
+            return;
+        }
+        if ($this->patternDetector->pattern() !== PATTERN_SEQUENTIAL) {
+            return;
+        }
+        if ($this->patternDetector->sequentialRuns < UPGRADE_SEQUENTIAL_THRESHOLD) {
+            return;
+        }
+        if (intdiv(strlen($this->bytes), 1024 * 1024) > EAGER_THRESHOLD_MB) {
+            return;
+        }
+        $this->prefetchStrategy = 'eager';
+        // No background thread — caller may invoke warmup() for sync eager load.
+    }
+
+    private function speculativePrefetch(): void
+    {
+        $predicted = $this->patternDetector->predictNext(
+            $this->prefetchDepth,
+            $this->recordCount,
+        );
+        if ($predicted === []) {
+            return;
+        }
+
+        $pageIndices = [];
+        $seen = [];
+        foreach ($predicted as $idx) {
+            $off = $this->recordByteOffset($idx);
+            $p = intdiv($off, $this->prefetchPageSize);
+            if (isset($seen[$p])) {
+                continue;
+            }
+            $seen[$p] = true;
+            if (!$this->pageCache->has($p) && !$this->inFlight->has($p)) {
+                $pageIndices[] = $p;
+            }
+        }
+        if ($pageIndices === []) {
+            return;
+        }
+
+        $ranges = clampPageRanges(
+            coalescePageIndices($pageIndices, $this->coalesceGapPages, $this->prefetchPageSize),
+            strlen($this->bytes),
+        );
+        foreach ($ranges as $range) {
+            $this->fetchCoalescedRange($range);
+        }
+    }
+
+    /** Synchronous eager data-sector fetch (PHP eager stub — no background worker). */
+    private function runEagerLoadSync(): void
+    {
+        if ($this->eagerLoadComplete) {
+            return;
+        }
+        [$sectorStart, $sectorLen] = rowDataSector($this->tailStart, strlen($this->bytes));
+        if ($sectorLen === 0) {
+            $this->eagerLoadComplete = true;
+            return;
+        }
+        $end = min($sectorStart + $sectorLen, strlen($this->bytes));
+        if ($sectorStart >= $end) {
+            $this->eagerLoadComplete = true;
+            return;
+        }
+
+        $pageSize = $this->prefetchPageSize;
+        $firstPage = intdiv($sectorStart, $pageSize);
+        $lastPage = intdiv($end - 1, $pageSize);
+        $indices = [];
+        for ($p = $firstPage; $p <= $lastPage; $p++) {
+            $indices[] = $p;
+        }
+
+        $ranges = clampPageRanges(
+            coalescePageIndices($indices, $this->coalesceGapPages, $pageSize),
+            strlen($this->bytes),
+        );
+        foreach ($ranges as $range) {
+            $this->fetchCoalescedRange($range);
+        }
+        $this->eagerLoadComplete = true;
     }
 
     // ── Bulk reducers (tight loops, no per-record NxsObject allocation) ──

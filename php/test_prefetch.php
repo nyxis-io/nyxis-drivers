@@ -149,6 +149,61 @@ $shapeOk = isset($stats['pages_cached'], $stats['pages_max'], $stats['memory_use
     $stats['strategy'], $stats['pattern']);
 check('cache_stats returns expected keys', $shapeOk);
 
+// pattern detector
+$d = new Nxs\AccessPatternDetector();
+for ($i = 0; $i < 8; $i++) {
+    $d->observe($i);
+}
+check('pattern unknown until min observations', $d->pattern() === Nxs\PATTERN_UNKNOWN);
+$d->observe(8);
+check('pattern classified after 9th access', $d->pattern() !== Nxs\PATTERN_UNKNOWN);
+
+$d2 = new Nxs\AccessPatternDetector();
+for ($i = 0; $i < 20; $i++) {
+    $d2->observe($i);
+}
+check('pattern sequential small deltas', $d2->pattern() === Nxs\PATTERN_SEQUENTIAL);
+
+$d3 = new Nxs\AccessPatternDetector();
+for ($i = 0; $i < 8; $i++) {
+    $d3->observe($i);
+}
+for ($k = 0; $k < 12; $k++) {
+    $d3->observe($k * 200);
+}
+check('pattern random large jumps', $d3->pattern() === Nxs\PATTERN_RANDOM);
+
+$d4 = new Nxs\AccessPatternDetector();
+for ($i = 0; $i < 10; $i++) {
+    $d4->observe($i);
+}
+check(
+    'predict_next sequential',
+    $d4->predictNext(4, 100) === [10, 11, 12, 13]
+);
+
+// hint full → eager at open (sync load via warmup)
+$buf200 = buildRecords(200);
+$readerFull = new Nxs\Reader($buf200, ['hint' => Nxs\HINT_FULL]);
+$readerFull->warmup();
+check(
+    'hint full small file eager at open',
+    ($readerFull->cache_stats()['strategy'] ?? '') === 'eager'
+);
+
+// sequential upgrade after 150 record() calls
+$readerUp = new Nxs\Reader($buf200);
+for ($i = 0; $i < 150; $i++) {
+    $readerUp->record($i);
+}
+$readerUp->warmup();
+$statsUp = $readerUp->cache_stats();
+check(
+    'sequential upgrade to eager after 150 accesses',
+    ($statsUp['strategy'] ?? '') === 'eager' && ($statsUp['pattern'] ?? '') === 'sequential',
+    json_encode($statsUp)
+);
+
 echo str_repeat('─', 56) . "\n";
 $total = $pass + $fail;
 if ($fail === 0) {

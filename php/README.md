@@ -72,10 +72,30 @@ $data2 = Nxs\Writer::fromRecords(
 );
 ```
 
+## Adaptive prefetch (phase 2)
+
+The pure-PHP reader includes access-pattern detection, adaptive strategy selection, and synchronous speculative prefetch on `record()`. Open-time hints are advisory:
+
+```php
+$reader = new Nxs\Reader($bytes, [
+    'hint' => Nxs\HINT_FULL,       // eager for files ≤10MB (after warmup)
+    'max_pages' => 32,
+    'prefetch_depth' => 4,
+]);
+$reader->warmup();                  // required for eager — see below
+```
+
+**Eager limitation:** PHP has no background worker threads. When strategy becomes `eager` (hint or sequential upgrade), the full data-sector fetch runs **synchronously** inside `warmup()` only — not on a background thread. `record()` does not block on eager I/O unless you call `warmup()` first.
+
+```bash
+php test_prefetch.php
+```
+
 ## Tests
 
 ```bash
 php test.php ../js/fixtures    # 11 tests
+php test_prefetch.php          # prefetch unit tests
 ```
 
 ## Benchmarks

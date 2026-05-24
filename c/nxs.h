@@ -96,6 +96,9 @@ void nxs_close(nxs_reader_t *r);
 // Total number of top-level records.
 uint32_t nxs_record_count(const nxs_reader_t *r);
 
+/** Wait for eager / in-flight background prefetch (requires nxs_open_ex). */
+void nxs_warmup(nxs_reader_t *r);
+
 // Resolve a key name to its integer slot index.
 // Returns -1 if not found.
 int nxs_slot(const nxs_reader_t *r, const char *key);

@@ -35,6 +35,11 @@
 #define NXS_DEFAULT_MAX_PAGES         32
 #define NXS_DEFAULT_COALESCE_GAP_PAGES 1
 
+#define NXS_HINT_FULL 3
+#define NXS_EAGER_THRESHOLD_MB 10
+#define NXS_LAZY_THRESHOLD_MB 50
+#define NXS_UPGRADE_SEQUENTIAL_THRESHOLD 100
+
 typedef struct {
     zend_string *data;
     int          last_used;
@@ -85,6 +90,12 @@ typedef struct _nxs_reader_t {
     int            cache_hits;
     int            cache_misses;
     int            cache_clock;
+    int            prefetch_hint;
+    char          *prefetch_strategy; /* lazy | adaptive | eager */
+    char          *prefetch_pattern;
+    int            sequential_runs;
+    int            random_jumps;
+    int            last_access_index;
     HashTable     *page_cache;    /* zend_long page → nxs_page_entry_t* */
     HashTable     *in_flight;     /* zend_long page → bool */
     zend_object    std;
@@ -97,6 +108,20 @@ static void nxs_page_entry_dtor(zval *zv)
         if (e->data) zend_string_release(e->data);
         efree(e);
     }
+}
+
+static const char *nxs_initial_prefetch_strategy(int hint, size_t file_size)
+{
+    size_t mb = file_size / (1024 * 1024);
+    if (hint == NXS_HINT_FULL && mb <= NXS_EAGER_THRESHOLD_MB) return "eager";
+    if (mb > NXS_LAZY_THRESHOLD_MB) return "lazy";
+    return "adaptive";
+}
+
+static void nxs_set_prefetch_strategy(nxs_reader_t *r, const char *strategy)
+{
+    if (r->prefetch_strategy) efree(r->prefetch_strategy);
+    r->prefetch_strategy = estrdup(strategy);
 }
 
 static void reader_init_prefetch(nxs_reader_t *r, HashTable *options)
@@ -120,7 +145,12 @@ static void reader_init_prefetch(nxs_reader_t *r, HashTable *options)
         if ((zv = zend_hash_str_find(options, "coalesce_gap_pages", sizeof("coalesce_gap_pages") - 1)) != NULL) {
             r->coalesce_gap = (int)zval_get_long(zv);
         }
+        if ((zv = zend_hash_str_find(options, "hint", sizeof("hint") - 1)) != NULL) {
+            r->prefetch_hint = (int)zval_get_long(zv);
+        }
     }
+
+    nxs_set_prefetch_strategy(r, nxs_initial_prefetch_strategy(r->prefetch_hint, r->size));
 
     ALLOC_HASHTABLE(r->page_cache);
     zend_hash_init(r->page_cache, r->max_pages, NULL, nxs_page_entry_dtor, 0);
@@ -305,6 +335,9 @@ static zend_object *nxs_reader_create(zend_class_entry *ce)
     object_properties_init(&r->std, ce);
     r->std.handlers = &nxs_reader_handlers;
     ZVAL_UNDEF(&r->keys_zv);
+    r->last_access_index = -1;
+    r->prefetch_strategy = estrdup("lazy");
+    r->prefetch_pattern = estrdup("unknown");
     return &r->std;
 }
 
@@ -328,6 +361,8 @@ static void nxs_reader_free(zend_object *obj)
         r->in_flight = NULL;
     }
     zval_ptr_dtor(&r->keys_zv);
+    if (r->prefetch_strategy) { efree(r->prefetch_strategy); r->prefetch_strategy = NULL; }
+    if (r->prefetch_pattern) { efree(r->prefetch_pattern); r->prefetch_pattern = NULL; }
     zend_object_std_dtor(obj);
 }
 
@@ -525,6 +560,36 @@ PHP_METHOD(NxsReader, record)
             (long)idx, r->record_count);
         return;
     }
+    if (r->last_access_index >= 0) {
+        int delta = (int)idx - r->last_access_index;
+        if (delta < 0) delta = -delta;
+        if (delta <= 10) {
+            if (r->sequential_runs < INT_MAX) r->sequential_runs++;
+        } else if (delta > 100) {
+            if (r->random_jumps < INT_MAX) r->random_jumps++;
+        }
+    }
+    r->last_access_index = (int)idx;
+    {
+        int total = r->sequential_runs + r->random_jumps;
+        if (total >= 8) {
+            if (r->sequential_runs > r->random_jumps * 3) {
+                if (r->prefetch_pattern) efree(r->prefetch_pattern);
+                r->prefetch_pattern = estrdup("sequential");
+                if (r->sequential_runs >= NXS_UPGRADE_SEQUENTIAL_THRESHOLD
+                    && r->prefetch_strategy
+                    && strcmp(r->prefetch_strategy, "adaptive") == 0) {
+                    size_t mb = r->size / (1024 * 1024);
+                    if (mb <= NXS_EAGER_THRESHOLD_MB) {
+                        nxs_set_prefetch_strategy(r, "eager");
+                    }
+                }
+            } else if (r->random_jumps > r->sequential_runs) {
+                if (r->prefetch_pattern) efree(r->prefetch_pattern);
+                r->prefetch_pattern = estrdup("random");
+            }
+        }
+    }
     size_t entry = r->tail_start + (size_t)idx * 10;
     uint64_t abs = rd_u64(r->data + entry + 2);
 
@@ -641,8 +706,10 @@ PHP_METHOD(NxsReader, cache_stats)
     add_assoc_long(return_value, "cache_hits", r->cache_hits);
     add_assoc_long(return_value, "cache_misses", r->cache_misses);
     add_assoc_long(return_value, "fetches_issued", r->fetches_issued);
-    add_assoc_string(return_value, "strategy", "lazy");
-    add_assoc_string(return_value, "pattern", "unknown");
+    add_assoc_string(return_value, "strategy",
+        r->prefetch_strategy ? r->prefetch_strategy : "lazy");
+    add_assoc_string(return_value, "pattern",
+        r->prefetch_pattern ? r->prefetch_pattern : "unknown");
 }
 
 /* ── NxsObject: lazy bitmask parse ────────────────────────────────────────── */

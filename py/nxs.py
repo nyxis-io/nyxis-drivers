@@ -24,6 +24,12 @@ import struct
 import threading
 from typing import Any, Callable, Iterator, Optional, Union
 
+from pattern import (
+    PATTERN_SEQUENTIAL,
+    UPGRADE_SEQUENTIAL_THRESHOLD,
+    AccessPatternDetector,
+)
+
 
 # Adaptive prefetch constants (spec §6–§8.4; native coalesce_gap=1).
 HINT_UNKNOWN = 0
@@ -35,6 +41,27 @@ HINT_PARTIAL = 4
 DEFAULT_PAGE_SIZE = 65536
 DEFAULT_MAX_PAGES = 64
 DEFAULT_COALESCE_GAP_PAGES = 1
+DEFAULT_PREFETCH_DEPTH = 4
+EAGER_THRESHOLD_MB = 10
+LAZY_THRESHOLD_MB = 50
+
+
+def initial_strategy(hint: int, file_size: int) -> str:
+    """Select lazy/adaptive/eager from hint and file size (spec §5.1)."""
+    file_size_mb = file_size // (1024 * 1024)
+    if hint == HINT_FULL and file_size_mb <= EAGER_THRESHOLD_MB:
+        return "eager"
+    if file_size_mb > LAZY_THRESHOLD_MB:
+        return "lazy"
+    return "adaptive"
+
+
+def row_data_sector(tail_start: int, file_size: int) -> tuple[int, int]:
+    """Row-layout data sector byte range (start, length)."""
+    sector_start = 32
+    if tail_start > sector_start and tail_start <= file_size:
+        return sector_start, tail_start - sector_start
+    return sector_start, 0
 
 
 # Magic bytes (little-endian u32)
@@ -237,6 +264,334 @@ class InFlightMap:
                 del self._map[page_index]
 
 
+class PrefetchEngine:
+    """Page cache, pattern detection, and adaptive/eager strategies (spec §4–§8.4)."""
+
+    __slots__ = (
+        "_lock",
+        "_mv",
+        "_hint",
+        "_page_size",
+        "_coalesce_gap_pages",
+        "_prefetch_depth",
+        "_file_size",
+        "_tail_start",
+        "_record_count",
+        "_record_offset",
+        "_fetch_range",
+        "_cache",
+        "_in_flight",
+        "_fetches_issued",
+        "_strategy",
+        "_detector",
+        "_closed",
+        "_eager_started",
+        "_eager_complete",
+        "_eager_cancel",
+        "_eager_done",
+        "_eager_thread",
+    )
+
+    def __init__(
+        self,
+        *,
+        hint: int,
+        max_pages: int,
+        page_size: int,
+        coalesce_gap_pages: int,
+        prefetch_depth: int,
+        file_size: int,
+        tail_start: int,
+        record_count: int,
+        mv: memoryview,
+        record_offset: Callable[[int], int],
+        fetch_range: Callable[..., Any],
+    ) -> None:
+        if max_pages <= 0:
+            max_pages = DEFAULT_MAX_PAGES
+        if page_size <= 0:
+            page_size = DEFAULT_PAGE_SIZE
+        if coalesce_gap_pages < 0:
+            coalesce_gap_pages = DEFAULT_COALESCE_GAP_PAGES
+        if prefetch_depth <= 0:
+            prefetch_depth = DEFAULT_PREFETCH_DEPTH
+
+        self._lock = threading.Lock()
+        self._mv = mv
+        self._hint = hint
+        self._page_size = page_size
+        self._coalesce_gap_pages = coalesce_gap_pages
+        self._prefetch_depth = prefetch_depth
+        self._file_size = file_size
+        self._tail_start = tail_start
+        self._record_count = record_count
+        self._record_offset = record_offset
+        self._fetch_range = fetch_range
+        self._cache = PageCache(max_pages, page_size)
+        self._in_flight = InFlightMap()
+        self._fetches_issued = 0
+        self._strategy = initial_strategy(hint, file_size)
+        self._detector = AccessPatternDetector()
+        self._closed = False
+        self._eager_started = False
+        self._eager_complete = False
+        self._eager_cancel: Optional[threading.Event] = None
+        self._eager_done: Optional[threading.Event] = None
+        self._eager_thread: Optional[threading.Thread] = None
+
+        if self._strategy == "eager":
+            self._start_eager_background()
+
+    def _is_eager_complete(self) -> bool:
+        return self._strategy == "eager" and self._eager_complete
+
+    def on_access(self, index: int) -> None:
+        if self._record_count == 0:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._detector.observe(index)
+            self._maybe_upgrade_to_eager()
+            eager = self._is_eager_complete() or self._strategy == "eager"
+            adaptive_seq = (
+                self._strategy == "adaptive"
+                and self._detector.pattern() == PATTERN_SEQUENTIAL
+            )
+        if eager:
+            return
+        off = self._record_offset(index)
+        if off >= 0:
+            self._cache.get(off // self._page_size)
+        if adaptive_seq:
+            self._speculative_prefetch()
+
+    def _maybe_upgrade_to_eager(self) -> None:
+        if self._strategy != "adaptive":
+            return
+        if self._detector.pattern() != PATTERN_SEQUENTIAL:
+            return
+        if self._detector.sequential_runs() < UPGRADE_SEQUENTIAL_THRESHOLD:
+            return
+        if self._file_size // (1024 * 1024) > EAGER_THRESHOLD_MB:
+            return
+        self._strategy = "eager"
+        self._start_eager_background()
+
+    def _start_eager_background(self) -> None:
+        if self._strategy != "eager" or self._eager_started:
+            return
+        self._eager_started = True
+        sector_start, sector_len = row_data_sector(self._tail_start, len(self._mv))
+        if sector_len == 0:
+            self._eager_complete = True
+            return
+
+        cancel = threading.Event()
+        done = threading.Event()
+        self._eager_cancel = cancel
+        self._eager_done = done
+
+        def run() -> None:
+            try:
+                end = min(sector_start + sector_len, len(self._mv))
+                if sector_start >= end:
+                    if not cancel.is_set():
+                        self._eager_complete = True
+                    return
+                page_size = self._page_size
+                first_page = sector_start // page_size
+                last_page = (end - 1) // page_size
+                indices = list(range(first_page, last_page + 1))
+                missing = [
+                    p for p in indices
+                    if not self._cache.has(p) and not self._in_flight.has(p)
+                ]
+                if not missing:
+                    if not cancel.is_set():
+                        self._eager_complete = True
+                    return
+                ranges = _clamp_page_ranges(
+                    coalesce_page_indices(
+                        missing, self._coalesce_gap_pages, page_size,
+                    ),
+                    len(self._mv),
+                )
+                for pr in ranges:
+                    if cancel.is_set():
+                        return
+                    self._fetch_coalesced_range(pr)
+                if not cancel.is_set():
+                    self._eager_complete = True
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run, daemon=True)
+        self._eager_thread = thread
+        thread.start()
+
+    def _speculative_prefetch(self) -> None:
+        with self._lock:
+            predicted = self._detector.predict_next(
+                self._prefetch_depth, self._record_count,
+            )
+        if not predicted:
+            return
+        page_size = self._page_size
+        seen: set[int] = set()
+        page_indices: list[int] = []
+        for idx in predicted:
+            off = self._record_offset(idx)
+            if off < 0:
+                continue
+            p = off // page_size
+            if p in seen:
+                continue
+            seen.add(p)
+            if not self._cache.has(p) and not self._in_flight.has(p):
+                page_indices.append(p)
+        if not page_indices:
+            return
+        ranges = _clamp_page_ranges(
+            coalesce_page_indices(
+                sorted(page_indices), self._coalesce_gap_pages, page_size,
+            ),
+            len(self._mv),
+        )
+        for pr in ranges:
+            self._fetch_coalesced_range(pr)
+
+    def prefetch_viewport(self, start_index: int, end_index: int) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            page_size = self._page_size
+            indices = page_indices_for_viewport(
+                start_index, end_index, page_size, self._record_offset,
+            )
+            missing = {
+                p for p in set(indices)
+                if not self._cache.has(p) and not self._in_flight.has(p)
+            }
+            if not missing:
+                self._cache.pin_pages(indices)
+                self._cache.unpin_all()
+                return
+            ranges = _clamp_page_ranges(
+                coalesce_page_indices(
+                    sorted(missing), self._coalesce_gap_pages, page_size,
+                ),
+                len(self._mv),
+            )
+        for r in ranges:
+            self._fetch_coalesced_range(r)
+        with self._lock:
+            self._cache.pin_pages(indices)
+            self._cache.unpin_all()
+
+    def _fetch_coalesced_range(self, page_range: dict[str, int]) -> None:
+        self._fetches_issued += 1
+        blob = self._fetch_range_bytes(page_range["byte_start"], page_range["byte_length"])
+        page_size = self._page_size
+        cache = self._cache
+        for p in range(page_range["page_start"], page_range["page_end"] + 1):
+            if cache.has(p):
+                continue
+            page_off = p * page_size - page_range["byte_start"]
+            page_len = min(page_size, len(blob) - page_off)
+            if page_len <= 0:
+                continue
+            cache.set(p, blob[page_off:page_off + page_len])
+
+    def _fetch_range_bytes(self, byte_start: int, byte_length: int) -> bytes:
+        result = self._fetch_range(byte_start, byte_length)
+        if inspect.isawaitable(result):
+            raise TypeError(
+                "async fetch_range requires prefetch_viewport_async(); "
+                "use a synchronous fetch_range with prefetch_viewport()",
+            )
+        return result
+
+    async def prefetch_viewport_async(self, start_index: int, end_index: int) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            page_size = self._page_size
+            indices = page_indices_for_viewport(
+                start_index, end_index, page_size, self._record_offset,
+            )
+            missing = {
+                p for p in set(indices)
+                if not self._cache.has(p) and not self._in_flight.has(p)
+            }
+            if not missing:
+                self._cache.pin_pages(indices)
+                self._cache.unpin_all()
+                return
+            ranges = _clamp_page_ranges(
+                coalesce_page_indices(
+                    sorted(missing), self._coalesce_gap_pages, page_size,
+                ),
+                len(self._mv),
+            )
+        await asyncio.gather(
+            *(self._fetch_coalesced_range_async(r) for r in ranges),
+        )
+        with self._lock:
+            self._cache.pin_pages(indices)
+            self._cache.unpin_all()
+
+    async def _fetch_coalesced_range_async(self, page_range: dict[str, int]) -> None:
+        self._fetches_issued += 1
+        blob = await self._fetch_range_bytes_async(
+            page_range["byte_start"], page_range["byte_length"],
+        )
+        page_size = self._page_size
+        cache = self._cache
+        for p in range(page_range["page_start"], page_range["page_end"] + 1):
+            if cache.has(p):
+                continue
+            page_off = p * page_size - page_range["byte_start"]
+            page_len = min(page_size, len(blob) - page_off)
+            if page_len <= 0:
+                continue
+            cache.set(p, blob[page_off:page_off + page_len])
+
+    async def _fetch_range_bytes_async(self, byte_start: int, byte_length: int) -> bytes:
+        result = self._fetch_range(byte_start, byte_length)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    def cache_stats(self) -> dict[str, Any]:
+        with self._lock:
+            strategy = self._strategy
+            pattern = self._detector.pattern()
+        stats = self._cache.stats()
+        return {
+            **stats,
+            "fetches_issued": self._fetches_issued,
+            "strategy": strategy,
+            "pattern": pattern,
+        }
+
+    def warmup(self) -> None:
+        if self._eager_done is not None:
+            self._eager_done.wait()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            cancel = self._eager_cancel
+            thread = self._eager_thread
+        if cancel is not None:
+            cancel.set()
+        if thread is not None:
+            thread.join()
+
+
 def _murmur3_64(data: memoryview) -> int:
     """MurmurHash3-64 used to validate the schema DictHash."""
     MASK = 0xFFFFFFFFFFFFFFFF
@@ -275,10 +630,7 @@ class NxsReader:
         "keys", "key_sigils", "key_index",
         "record_count", "_tail_start",
         "_schema_end",
-        "_prefetch_lock",
-        "_prefetch_hint", "_prefetch_page_size", "_coalesce_gap_pages",
-        "_page_cache", "_in_flight", "_fetches_issued", "_fetch_range",
-        "_prefetch_strategy", "_prefetch_pattern",
+        "_prefetch",
     )
 
     def __init__(
@@ -289,8 +641,11 @@ class NxsReader:
         max_pages: int = DEFAULT_MAX_PAGES,
         page_size: int = DEFAULT_PAGE_SIZE,
         coalesce_gap_pages: int = DEFAULT_COALESCE_GAP_PAGES,
+        prefetch_depth: int = DEFAULT_PREFETCH_DEPTH,
         fetch_range: Optional[Callable[..., Any]] = None,
     ) -> None:
+        if page_size <= 0:
+            raise NxsError("ERR_PARSE", "prefetch page_size must be greater than 0")
         if isinstance(buffer, memoryview):
             self.buf = buffer.tobytes() if not buffer.readonly else buffer
             self.mv = buffer
@@ -338,6 +693,7 @@ class NxsReader:
             max_pages=max_pages,
             page_size=page_size,
             coalesce_gap_pages=coalesce_gap_pages,
+            prefetch_depth=prefetch_depth,
             fetch_range=fetch_range,
         )
 
@@ -348,22 +704,15 @@ class NxsReader:
         max_pages: int,
         page_size: int,
         coalesce_gap_pages: int,
+        prefetch_depth: int,
         fetch_range: Optional[Callable[..., Any]],
     ) -> None:
-        self._prefetch_lock = threading.Lock()
-        self._prefetch_hint = hint
-        self._prefetch_page_size = page_size
-        self._coalesce_gap_pages = coalesce_gap_pages
-        self._page_cache = PageCache(max_pages, page_size)
-        self._in_flight = InFlightMap()
-        self._fetches_issued = 0
-        self._prefetch_strategy = "lazy"
-        self._prefetch_pattern = "unknown"
         if fetch_range is not None:
-            self._fetch_range = fetch_range
+            fetch_fn = fetch_range
         else:
             mv = self.mv
-            def _default_fetch(byte_start: int, byte_length: int) -> bytes:
+
+            def fetch_fn(byte_start: int, byte_length: int) -> bytes:
                 end = byte_start + byte_length
                 if byte_start < 0 or end > len(mv):
                     raise NxsError(
@@ -371,7 +720,20 @@ class NxsReader:
                         f"fetch range [{byte_start}, {end})",
                     )
                 return bytes(mv[byte_start:end])
-            self._fetch_range = _default_fetch
+
+        self._prefetch = PrefetchEngine(
+            hint=hint,
+            max_pages=max_pages,
+            page_size=page_size,
+            coalesce_gap_pages=coalesce_gap_pages,
+            prefetch_depth=prefetch_depth,
+            file_size=len(self.mv),
+            tail_start=self._tail_start,
+            record_count=self.record_count,
+            mv=self.mv,
+            record_offset=self._record_byte_offset,
+            fetch_range=fetch_fn,
+        )
 
     def _record_byte_offset(self, i: int) -> int:
         entry = self._tail_start + i * 10
@@ -385,27 +747,7 @@ class NxsReader:
                 f"prefetch_viewport [{start_index}, {end_index}] "
                 f"out of [0, {self.record_count})",
             )
-        with self._prefetch_lock:
-            page_size = self._prefetch_page_size
-            indices = page_indices_for_viewport(
-                start_index, end_index, page_size, self._record_byte_offset,
-            )
-            missing = {
-                p for p in set(indices)
-                if not self._page_cache.has(p) and not self._in_flight.has(p)
-            }
-            if not missing:
-                self._page_cache.pin_pages(indices)
-                self._page_cache.unpin_all()
-                return
-            ranges = _clamp_page_ranges(
-                coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
-                len(self.mv),
-            )
-            for r in ranges:
-                self._fetch_coalesced_range(r)
-            self._page_cache.pin_pages(indices)
-            self._page_cache.unpin_all()
+        self._prefetch.prefetch_viewport(start_index, end_index)
 
     async def prefetch_viewport_async(self, start_index: int, end_index: int) -> None:
         """Async variant: parallel coalesced range fetches when fetch_range is async."""
@@ -415,84 +757,19 @@ class NxsReader:
                 f"prefetch_viewport [{start_index}, {end_index}] "
                 f"out of [0, {self.record_count})",
             )
-        with self._prefetch_lock:
-            page_size = self._prefetch_page_size
-            indices = page_indices_for_viewport(
-                start_index, end_index, page_size, self._record_byte_offset,
-            )
-            missing = {
-                p for p in set(indices)
-                if not self._page_cache.has(p) and not self._in_flight.has(p)
-            }
-            if not missing:
-                self._page_cache.pin_pages(indices)
-                self._page_cache.unpin_all()
-                return
-            ranges = _clamp_page_ranges(
-                coalesce_page_indices(sorted(missing), self._coalesce_gap_pages, page_size),
-                len(self.mv),
-            )
-        await asyncio.gather(
-            *(self._fetch_coalesced_range_async(r) for r in ranges),
-        )
-        with self._prefetch_lock:
-            self._page_cache.pin_pages(indices)
-            self._page_cache.unpin_all()
+        await self._prefetch.prefetch_viewport_async(start_index, end_index)
 
-    def _fetch_coalesced_range(self, page_range: dict[str, int]) -> None:
-        blob = self._fetch_range_bytes(page_range["byte_start"], page_range["byte_length"])
-        page_size = self._prefetch_page_size
-        cache = self._page_cache
-        for p in range(page_range["page_start"], page_range["page_end"] + 1):
-            if cache.has(p):
-                continue
-            page_off = p * page_size - page_range["byte_start"]
-            page_len = min(page_size, len(blob) - page_off)
-            if page_len <= 0:
-                continue
-            cache.set(p, blob[page_off:page_off + page_len])
+    def warmup(self) -> None:
+        """Block until eager or background prefetch work completes."""
+        self._prefetch.warmup()
 
-    async def _fetch_coalesced_range_async(self, page_range: dict[str, int]) -> None:
-        blob = await self._fetch_range_bytes_async(
-            page_range["byte_start"], page_range["byte_length"],
-        )
-        page_size = self._prefetch_page_size
-        cache = self._page_cache
-        for p in range(page_range["page_start"], page_range["page_end"] + 1):
-            if cache.has(p):
-                continue
-            page_off = p * page_size - page_range["byte_start"]
-            page_len = min(page_size, len(blob) - page_off)
-            if page_len <= 0:
-                continue
-            cache.set(p, blob[page_off:page_off + page_len])
-
-    def _fetch_range_bytes(self, byte_start: int, byte_length: int) -> bytes:
-        self._fetches_issued += 1
-        result = self._fetch_range(byte_start, byte_length)
-        if inspect.isawaitable(result):
-            raise TypeError(
-                "async fetch_range requires prefetch_viewport_async(); "
-                "use a synchronous fetch_range with prefetch_viewport()",
-            )
-        return result
-
-    async def _fetch_range_bytes_async(self, byte_start: int, byte_length: int) -> bytes:
-        self._fetches_issued += 1
-        result = self._fetch_range(byte_start, byte_length)
-        if inspect.isawaitable(result):
-            return await result
-        return result
+    def close(self) -> None:
+        """Cancel in-flight eager prefetch and wait for the background thread."""
+        self._prefetch.close()
 
     def cache_stats(self) -> dict[str, Any]:
         """Diagnostic cache and prefetch counters."""
-        stats = self._page_cache.stats()
-        return {
-            **stats,
-            "fetches_issued": self._fetches_issued,
-            "strategy": self._prefetch_strategy,
-            "pattern": self._prefetch_pattern,
-        }
+        return self._prefetch.cache_stats()
 
     def _read_schema(self, offset: int) -> None:
         mv = self.mv
@@ -524,6 +801,7 @@ class NxsReader:
         if i < 0 or i >= self.record_count:
             raise NxsError("ERR_OUT_OF_BOUNDS",
                            f"record {i} out of [0, {self.record_count})")
+        self._prefetch.on_access(i)
         # Each entry: u16 keyId + u64 offset = 10 bytes
         entry = self._tail_start + i * 10
         abs_offset = _U64.unpack_from(self.mv, entry + 2)[0]

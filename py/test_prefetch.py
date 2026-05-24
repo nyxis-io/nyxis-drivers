@@ -8,12 +8,14 @@ import time
 
 from nxs import (
     DEFAULT_PAGE_SIZE,
+    HINT_FULL,
     InFlightMap,
     NxsReader,
     PageCache,
     coalesce_page_indices,
 )
 from nxs_writer import NxsSchema, NxsWriter
+from pattern import AccessPatternDetector
 
 
 def build_records(n: int) -> bytes:
@@ -54,6 +56,10 @@ def main() -> int:
 
     print("\nNXS Python Prefetch — Tests\n")
 
+    case("pattern unknown until min observations", lambda: _test_pattern_unknown())
+    case("pattern sequential small deltas", lambda: _test_pattern_sequential())
+    case("pattern random large jumps", lambda: _test_pattern_random())
+    case("predict_next sequential", lambda: _test_predict_next())
     case(
         "coalesce_page_indices [3,4,6,7,12] gap=1 → 3 ranges",
         lambda: _test_coalesce(),
@@ -74,6 +80,11 @@ def main() -> int:
         lambda: _test_dedup(),
     )
     case("cache_stats returns expected keys", lambda: _test_cache_stats())
+    case("hint full small file eager at open", lambda: _test_hint_full_eager())
+    case(
+        "sequential upgrade to eager after 150 record() calls",
+        lambda: _test_sequential_upgrade(),
+    )
 
     async def run_async_tests() -> None:
         await case_async(
@@ -85,6 +96,38 @@ def main() -> int:
 
     print(f"\n{passed} passed, {failed} failed\n")
     return 0 if failed == 0 else 1
+
+
+def _test_pattern_unknown() -> None:
+    d = AccessPatternDetector()
+    for i in range(8):
+        d.observe(i)
+    assert d.pattern() == "unknown", f"expected unknown, got {d.pattern()}"
+    d.observe(8)
+    assert d.pattern() != "unknown", "expected classified pattern after 9th access"
+
+
+def _test_pattern_sequential() -> None:
+    d = AccessPatternDetector()
+    for i in range(20):
+        d.observe(i)
+    assert d.pattern() == "sequential", f"expected sequential, got {d.pattern()}"
+
+
+def _test_pattern_random() -> None:
+    d = AccessPatternDetector()
+    for i in range(8):
+        d.observe(i)
+    for k in range(12):
+        d.observe(k * 200)
+    assert d.pattern() == "random", f"expected random, got {d.pattern()}"
+
+
+def _test_predict_next() -> None:
+    d = AccessPatternDetector()
+    for i in range(10):
+        d.observe(i)
+    assert d.predict_next(4, 100) == [10, 11, 12, 13]
 
 
 def _test_coalesce() -> None:
@@ -200,8 +243,28 @@ def _test_cache_stats() -> None:
     ):
         assert key in stats, f"missing key {key}"
     assert stats["pages_max"] == 32
-    assert stats["strategy"] == "lazy"
+    assert stats["strategy"] == "adaptive"
     assert stats["pattern"] == "unknown"
+
+
+def _test_hint_full_eager() -> None:
+    buf = build_records(200)
+    reader = NxsReader(buf, hint=HINT_FULL)
+    reader.warmup()
+    assert reader.cache_stats()["strategy"] == "eager"
+
+
+def _test_sequential_upgrade() -> None:
+    buf = build_records(200)
+    reader = NxsReader(buf)
+    for i in range(150):
+        reader.record(i)
+    reader.warmup()
+    stats = reader.cache_stats()
+    assert stats["strategy"] == "eager", f"expected eager after upgrade, got {stats['strategy']}"
+    assert stats["pattern"] == "sequential", (
+        f"expected sequential pattern, got {stats['pattern']}"
+    )
 
 
 async def _test_async_fetch() -> None:

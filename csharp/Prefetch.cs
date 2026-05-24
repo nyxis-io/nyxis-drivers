@@ -23,17 +23,52 @@ public static class PrefetchDefaults
     public const int DefaultPageSize = 65536;
     public const int DefaultMaxPages = 128;
     public const int DefaultCoalesceGapPages = 1;
+    public const int DefaultPrefetchDepth = 4;
+    public const int EagerThresholdMb = 10;
+    public const int LazyThresholdMb = 50;
 }
 
-/// <summary>Prefetch options on <see cref="NxsReader"/> construction (phase 1).</summary>
+public enum PrefetchStrategy { Lazy, Adaptive, Eager }
+
+public static class PrefetchStrategyNames
+{
+    public static string Name(PrefetchStrategy s) => s switch
+    {
+        PrefetchStrategy.Adaptive => "adaptive",
+        PrefetchStrategy.Eager => "eager",
+        _ => "lazy",
+    };
+}
+
+public static class PrefetchStrategySelect
+{
+    public static PrefetchStrategy Initial(AccessHint hint, int fileSize)
+    {
+        int fileSizeMb = fileSize / (1024 * 1024);
+        if (hint == AccessHint.Full && fileSizeMb <= PrefetchDefaults.EagerThresholdMb)
+            return PrefetchStrategy.Eager;
+        if (fileSizeMb > PrefetchDefaults.LazyThresholdMb)
+            return PrefetchStrategy.Lazy;
+        return PrefetchStrategy.Adaptive;
+    }
+
+    public static (int Start, int Length) RowDataSector(int tailStart, int fileSize)
+    {
+        const int sectorStart = 32;
+        if (tailStart > sectorStart && tailStart <= fileSize)
+            return (sectorStart, tailStart - sectorStart);
+        return (sectorStart, 0);
+    }
+}
+
+/// <summary>Prefetch options on <see cref="NxsReader"/> construction.</summary>
 public sealed class NxsOpenOptions
 {
     public AccessHint Hint { get; init; } = AccessHint.Unknown;
     public int MaxPages { get; init; } = PrefetchDefaults.DefaultMaxPages;
     public int PageSize { get; init; } = PrefetchDefaults.DefaultPageSize;
     public int CoalesceGapPages { get; init; } = PrefetchDefaults.DefaultCoalesceGapPages;
-
-    /// <summary>Injectable byte-range fetcher for tests or remote I/O.</summary>
+    public int PrefetchDepth { get; init; } = PrefetchDefaults.DefaultPrefetchDepth;
     public Func<long, long, CancellationToken, Task<byte[]>>? FetchRange { get; init; }
 }
 

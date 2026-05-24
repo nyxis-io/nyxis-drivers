@@ -31,7 +31,7 @@ Documentation = "https://github.com/nyxis-io/nyxis/blob/main/SPEC.md"
 
 [tool.setuptools]
 # Flat layout: top-level modules (not a nxs/ package directory)
-py-modules = ["nxs", "nxs_writer"]
+py-modules = ["nxs", "nxs_writer", "pattern"]
 
 [tool.setuptools.package-data]
 # Keys must be package/module names or "*"; empty string is invalid (setuptools validation).

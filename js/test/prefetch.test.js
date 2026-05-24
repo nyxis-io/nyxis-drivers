@@ -5,7 +5,9 @@ import {
   PageCache,
   InFlightMap,
   DEFAULT_PAGE_SIZE,
+  HINT_FULL,
 } from "../prefetch.js";
+import { AccessPatternDetector } from "../pattern.js";
 import { NxsReader } from "../nxs.js";
 import { NxsSchema, NxsWriter } from "../nxs_writer.js";
 
@@ -49,6 +51,36 @@ function buildRecords(n) {
 }
 
 console.log("\nNXS Prefetch — Tests\n");
+
+test("pattern unknown until min observations", () => {
+  const d = new AccessPatternDetector();
+  for (let i = 0; i < 8; i++) d.observe(i);
+  if (d.pattern() !== "unknown") throw new Error(`expected unknown, got ${d.pattern()}`);
+  d.observe(8);
+  if (d.pattern() === "unknown") throw new Error("expected classified pattern after 9th access");
+});
+
+test("pattern sequential small deltas", () => {
+  const d = new AccessPatternDetector();
+  for (let i = 0; i < 20; i++) d.observe(i);
+  if (d.pattern() !== "sequential") throw new Error(`expected sequential, got ${d.pattern()}`);
+});
+
+test("pattern random large jumps", () => {
+  const d = new AccessPatternDetector();
+  for (let i = 0; i < 8; i++) d.observe(i);
+  for (let k = 0; k < 12; k++) d.observe(k * 200);
+  if (d.pattern() !== "random") throw new Error(`expected random, got ${d.pattern()}`);
+});
+
+test("predict_next sequential", () => {
+  const d = new AccessPatternDetector();
+  for (let i = 0; i < 10; i++) d.observe(i);
+  const next = d.predictNext(4, 100);
+  if (JSON.stringify(next) !== JSON.stringify([10, 11, 12, 13])) {
+    throw new Error(`predict_next: ${JSON.stringify(next)}`);
+  }
+});
 
 test("coalescePageIndices [3,4,6,7,12] gap=1 → 3 ranges", () => {
   const r = coalescePageIndices([3, 4, 6, 7, 12], 1, DEFAULT_PAGE_SIZE);
@@ -138,6 +170,29 @@ await testAsync("prefetch_deduplication — parallel viewport same page", async 
     reader.prefetch_viewport(0, 4),
   ]);
   if (calls > 3) throw new Error(`too many fetches: ${calls}`);
+});
+
+await testAsync("hint full small file eager at open", async () => {
+  const buf = buildRecords(200);
+  const reader = new NxsReader(buf, { hint: HINT_FULL });
+  await reader.warmup();
+  if (reader.cache_stats().strategy !== "eager") {
+    throw new Error(`expected eager strategy, got ${reader.cache_stats().strategy}`);
+  }
+});
+
+await testAsync("sequential upgrade to eager after 150 record() calls", async () => {
+  const buf = buildRecords(200);
+  const reader = new NxsReader(buf);
+  for (let i = 0; i < 150; i++) reader.record(i);
+  await reader.warmup();
+  const stats = reader.cache_stats();
+  if (stats.strategy !== "eager") {
+    throw new Error(`expected eager after upgrade, got ${stats.strategy}`);
+  }
+  if (stats.pattern !== "sequential") {
+    throw new Error(`expected sequential pattern, got ${stats.pattern}`);
+  }
 });
 
 await testAsync("NxsReader.open requires fetch", async () => {

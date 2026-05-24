@@ -1,6 +1,6 @@
 CC      = cc
 CFLAGS  = -std=c99 -O2 -Wall -Wextra
-LDFLAGS = -lm
+LDFLAGS = -lm -pthread
 
 .PHONY: all clean test test-prefetch bench profile-selective
 
