@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // ── Format constants ─────────────────────────────────────────────────────────
@@ -57,6 +58,12 @@ type Reader struct {
 	pageLength   []uint32
 
 	prefetch *prefetchEngine
+
+	colMu         sync.Mutex
+	colFetchRange func(off, length int64) ([]byte, error)
+	colWarmed     map[int]bool
+	colOverlay    map[int][]byte
+	colFetches    int
 }
 
 type readerConfig struct {
@@ -207,6 +214,7 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 	if err := r.parseLayoutTail(); err != nil {
 		return nil, err
 	}
+	r.initColumnPrefetch(cfg)
 	r.initPrefetch(cfg)
 	return r, nil
 }
@@ -261,13 +269,21 @@ func (r *Reader) Close() {
 
 // CacheStats returns diagnostic cache and prefetch counters.
 func (r *Reader) CacheStats() CacheStats {
+	var stats CacheStats
 	if r.prefetch == nil {
-		return CacheStats{
+		stats = CacheStats{
 			Strategy: "disabled",
 			Pattern:  "unknown",
 		}
+	} else {
+		stats = r.prefetch.cacheStats()
 	}
-	return r.prefetch.cacheStats()
+	if r.layout == LayoutColumnar {
+		r.colMu.Lock()
+		stats.ColumnFetchesIssued = r.colFetches
+		r.colMu.Unlock()
+	}
+	return stats
 }
 
 func (r *Reader) readSchema(offset int) (int, error) {

@@ -100,14 +100,15 @@ const (
 
 // CacheStats reports page-cache and prefetch counters.
 type CacheStats struct {
-	PagesCached     int
-	PagesMax        int
-	MemoryUsedBytes int
-	CacheHits       int
-	CacheMisses     int
-	FetchesIssued   int
-	Strategy        string
-	Pattern         string
+	PagesCached         int
+	PagesMax            int
+	MemoryUsedBytes     int
+	CacheHits           int
+	CacheMisses         int
+	FetchesIssued       int
+	ColumnFetchesIssued int
+	Strategy            string
+	Pattern             string
 }
 
 // PageRange is an inclusive page index span with byte offsets.

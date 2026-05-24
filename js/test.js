@@ -419,6 +419,28 @@ test("Query combinators — or/not work correctly", () => {
   assertEq(ltCount + gtCount + eqCount, 1000, "lt + gt + eq = total");
 });
 
+test("columnar prefetch_column — single fetch before colSumF64", () => {
+  const colPath = join(fixtureDir, "../../conformance/columnar_flat8_dense_100.nxb");
+  const alt = join(fixtureDir, "../conformance/columnar_flat8_dense_100.nxb");
+  const path = existsSync(colPath) ? colPath : existsSync(alt) ? alt : null;
+  if (!path) return;
+  const bytes = readFileSync(path);
+  let fetches = 0;
+  const r = new NxsReader(bytes, {
+    fetchRange: (off, len) => {
+      fetches++;
+      return bytes.subarray(off, off + len);
+    },
+  });
+  r.prefetch_column("score");
+  assertEq(fetches, 1, "prefetch_column fetches");
+  let want = 0;
+  for (let i = 0; i < 100; i++) want += i * 0.5;
+  assertClose(r.colSumF64("score"), want, 1e-6, "col sum after prefetch");
+  assertEq(fetches, 1, "col_sum_f64 must not refetch");
+  assertEq(r.cache_stats().column_fetches_issued, 1, "column_fetches_issued");
+});
+
 test("columnar layout — colSumF64 and colBuffer (conformance vector)", () => {
   const colPath = join(fixtureDir, "../../conformance/columnar_flat8_dense_100.nxb");
   const alt = join(fixtureDir, "../conformance/columnar_flat8_dense_100.nxb");
