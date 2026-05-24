@@ -42,6 +42,12 @@ jobs:
       - name: Publish to RubyGems
         working-directory: ruby
         run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/.*spec.version.*=.*"\(.*\)".*/\1/p' nyxis.gemspec | head -1)
+          if curl -sf "https://rubygems.org/api/v2/rubygems/nyxis/versions/${VERSION}.json" >/dev/null; then
+            echo "nyxis ${VERSION} already on RubyGems — skipping push (re-run / workflow_dispatch)"
+            exit 0
+          fi
           mkdir -p ~/.gem
           cat > ~/.gem/credentials << EOF
           ---
