@@ -56,20 +56,39 @@ jobs:
 
       - name: Smoke test (install from registry)
         run: |
-          set +e
+          set -euo pipefail
           VERSION=$(sed -n 's/.*<Version>\(.*\)<\/Version>.*/\1/p' csharp/nxs.csproj | head -1)
+          PACKAGE=nyxis
+          FLAT_URL="https://api.nuget.org/v3-flatcontainer/${PACKAGE}/index.json"
+
+          echo "Waiting for ${PACKAGE} ${VERSION} on NuGet.org flat index (publish already succeeded)..."
+          indexed=0
+          for attempt in $(seq 1 80); do
+            if curl -sf "$FLAT_URL" | jq -e --arg v "$VERSION" '.versions | index($v) != null' >/dev/null; then
+              echo "Version ${VERSION} listed on nuget.org (attempt ${attempt}/80)"
+              indexed=1
+              break
+            fi
+            echo "Waiting for NuGet flat index (attempt ${attempt}/80, ~20 min max)..."
+            sleep 15
+          done
+
+          if [ "$indexed" -eq 0 ]; then
+            echo "::warning::Nyxis ${VERSION} not yet visible on NuGet.org flat index after ~20 minutes. The push step succeeded; indexing can lag further on nuget.org."
+            exit 0
+          fi
+
+          dotnet nuget locals all --clear
           mkdir /tmp/smoke-nuget && cd /tmp/smoke-nuget
-          dotnet new console -n SmokeTest
+          dotnet new console -n SmokeTest --force
           cd SmokeTest
-          # NuGet.org v3 registration often lags 30s–minutes after push
-          for attempt in $(seq 1 36); do
-            dotnet add package nyxis --version "${VERSION}" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-              echo "Smoke test: package installable (attempt ${attempt})"
+          for attempt in $(seq 1 12); do
+            if dotnet add package "$PACKAGE" --version "$VERSION"; then
+              echo "Smoke test: dotnet add package ${PACKAGE} ${VERSION} OK (attempt ${attempt})"
               exit 0
             fi
-            echo "Waiting for NuGet index (attempt ${attempt}/36)..."
+            echo "dotnet add not ready yet (attempt ${attempt}/12)..."
             sleep 10
           done
-          echo "::error::Nyxis ${VERSION} not yet visible on NuGet.org — indexing delay exceeded ~6 minutes"
+          echo "::error::Nyxis ${VERSION} is indexed but dotnet add package failed after retries"
           exit 1
