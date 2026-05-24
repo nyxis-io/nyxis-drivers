@@ -348,7 +348,8 @@ module Nxs
 
         off = @col_buf_off[slot].to_i
         length = @col_buf_len[slot].to_i
-        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if off + length > @data.bytesize
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if off.negative? || length.negative?
+        raise NxsError.new('ERR_OUT_OF_BOUNDS', 'column buffer') if !@col_remote_fetch && off + length > @data.bytesize
 
         fetch = @col_fetch_range
       end
@@ -671,8 +672,9 @@ module Nxs
 
     def cache_stats
       stats = @page_cache.stats
-      strategy, pattern, col_fetches = @prefetch_mu.synchronize do
-        [@prefetch_strategy, @detector.pattern, @col_fetches]
+      col_fetches = @col_mu.synchronize { @col_fetches }
+      strategy, pattern = @prefetch_mu.synchronize do
+        [@prefetch_strategy, @detector.pattern]
       end
       stats.merge(
         fetches_issued: @fetches_issued,
@@ -944,6 +946,7 @@ module Nxs
       @col_warmed = {}
       @col_overlay = {}
       @col_fetches = 0
+      @col_remote_fetch = !fetch_range.nil?
       data = @data
       @col_fetch_range = fetch_range || ->(off, len) { data[off, len] }
     end

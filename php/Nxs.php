@@ -394,6 +394,7 @@ class Reader
     private int    $colFetches = 0;
     /** @var callable(int, int): string|null */
     private $colFetchRange = null;
+    private bool $colRemoteFetch = false;
     private int    $pageCount    = 0;
     private array  $pageRecStart = [];
     private array  $pageRecCount = [];
@@ -482,6 +483,7 @@ class Reader
         $this->colFetches = 0;
         $fetch = $options['fetch_range'] ?? null;
         $bytes = $this->bytes;
+        $this->colRemoteFetch = $fetch !== null;
         $this->colFetchRange = $fetch ?? static function (int $off, int $len) use ($bytes): string {
             if ($off < 0 || $off + $len > strlen($bytes)) {
                 throw new NxsException('ERR_OUT_OF_BOUNDS: column fetch');
@@ -505,7 +507,10 @@ class Reader
         }
         $off = (int)$this->colBufOff[$slot];
         $length = (int)$this->colBufLen[$slot];
-        if ($off + $length > strlen($this->bytes)) {
+        if ($off < 0 || $length < 0) {
+            throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
+        }
+        if (!$this->colRemoteFetch && $off + $length > strlen($this->bytes)) {
             throw new NxsException('ERR_OUT_OF_BOUNDS: column buffer');
         }
         $blob = ($this->colFetchRange)($off, $length);

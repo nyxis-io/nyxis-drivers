@@ -35,7 +35,7 @@ extension NXSReader {
     /// Prefetch one column buffer (columnar layout only; §7.4).
     public func prefetchColumn(_ key: String) throws {
         guard col.layout == .columnar, let warm = columnWarm else {
-            throw NXSError.keyNotFound("prefetch_column requires columnar layout")
+            throw NXSError.incompatibleFlags("prefetch_column requires columnar layout")
         }
         let slot = try slot(key)
         try warm.prefetchColumn(slot: slot, colOff: col.colBufOff, colLen: col.colBufLen)

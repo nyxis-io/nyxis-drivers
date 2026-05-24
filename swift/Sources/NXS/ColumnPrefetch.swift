@@ -5,6 +5,7 @@ import Foundation
 final class ColumnWarmState {
     private let data: Data
     private let fetch: (Int, Int) throws -> Data
+    private let customFetch: Bool
     private var warmed = Set<Int>()
     private var overlay = [Int: Data]()
     private let lock = NSLock()
@@ -12,6 +13,7 @@ final class ColumnWarmState {
 
     init(data: Data, fetchRange: ((Int, Int) throws -> Data)?) {
         self.data = data
+        customFetch = fetchRange != nil
         if let custom = fetchRange {
             fetch = custom
         } else {
@@ -34,7 +36,11 @@ final class ColumnWarmState {
         }
         off = Int(colOff[slot])
         len = Int(colLen[slot])
-        if off < 0 || len < 0 || off + len > data.count {
+        if off < 0 || len < 0 {
+            lock.unlock()
+            throw NXSError.outOfBounds("column buffer")
+        }
+        if !customFetch && off + len > data.count {
             lock.unlock()
             throw NXSError.outOfBounds("column buffer")
         }
@@ -53,20 +59,17 @@ final class ColumnWarmState {
     }
 
     func sector(slot: Int, colOff: [UInt64], colLen: [UInt64]) throws -> Data {
+        let need = Int(colLen[slot])
         lock.lock()
-        if let o = overlay[slot] {
-            let need = Int(colLen[slot])
-            if o.count >= need {
-                lock.unlock()
-                return Data(o[..<need])
-            }
+        if let o = overlay[slot], o.count >= need {
+            lock.unlock()
+            return Data(o[..<need])
         }
         lock.unlock()
         let off = Int(colOff[slot])
-        let length = Int(colLen[slot])
-        guard off + length <= data.count else {
-            throw NXSError.outOfBounds("column buffer")
+        if off >= 0, off + need <= data.count {
+            return Data(data[off..<(off + need)])
         }
-        return Data(data[off..<(off + length)])
+        throw NXSError.outOfBounds("column buffer")
     }
 }

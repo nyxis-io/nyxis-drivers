@@ -903,7 +903,11 @@ Reader_prefetch_column(ReaderObject *self, PyObject *key)
     if (!field) return NULL;
     nxs_err_t err = nxs_prefetch_column(&self->nxs, field);
     if (err != NXS_OK) {
-        PyErr_SetString(PyExc_RuntimeError, nxs_err_msg(err));
+        if (err == NXS_ERR_KEY_NOT_FOUND) {
+            PyErr_SetString(PyExc_KeyError, field);
+        } else {
+            PyErr_SetString(PyExc_ValueError, nxs_err_msg(err));
+        }
         return NULL;
     }
     Py_RETURN_NONE;

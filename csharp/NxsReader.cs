@@ -220,7 +220,7 @@ public sealed class NxsReader
                     return blob ?? throw new NxsException("ERR_OUT_OF_BOUNDS", "column fetch returned null");
                 };
             }
-            _columnWarm = new ColumnWarmState(_data, colFetch);
+            _columnWarm = new ColumnWarmState(_data, colFetch, customFetch: colFetch != null);
         }
     }
 
@@ -382,7 +382,7 @@ public sealed class NxsReader
 
     public byte[]? ColBuffer(string key)
     {
-        if (LayoutKind == Layout.Row) return null;
+        if (LayoutKind != Layout.Columnar) return null;
         int slot = Slot(key);
         if (IsVarSigil(KeySigils[slot])) return null;
         var (_, vals) = ColFieldParts(slot);
@@ -391,7 +391,7 @@ public sealed class NxsReader
 
     public byte[]? ColNullBitmap(string key)
     {
-        if (LayoutKind == Layout.Row) return null;
+        if (LayoutKind != Layout.Columnar) return null;
         int slot = Slot(key);
         var (bm, _) = ColFieldParts(slot);
         return bm;
@@ -563,11 +563,11 @@ public sealed class NxsReader
 
     private (byte[] bm, byte[] vals) ColFieldParts(int slot)
     {
+        if (LayoutKind != Layout.Columnar || _columnWarm == null)
+            throw new NxsException("ERR_LAYOUT", "column field parts require columnar layout");
         if (slot < 0 || slot >= _colBufOff.Length)
             throw new NxsException("ERR_KEY_NOT_FOUND", $"slot {slot}");
-        byte[] sector = _columnWarm != null
-            ? _columnWarm.Sector(slot, _colBufOff, _colBufLen)
-            : throw new NxsException("ERR_LAYOUT", "column sector unavailable");
+        byte[] sector = _columnWarm.Sector(slot, _colBufOff, _colBufLen);
         int bmLen = NullBitmapBytes(_recordCount);
         if (sector.Length < bmLen)
             throw new NxsException("ERR_OUT_OF_BOUNDS", "null bitmap");

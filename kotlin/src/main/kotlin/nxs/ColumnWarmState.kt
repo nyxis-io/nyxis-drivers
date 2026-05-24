@@ -10,6 +10,7 @@ internal class ColumnWarmState(
 
     @Volatile var fetches: Int = 0
     private val lock = Any()
+    private val customFetch = fetchRange != null
     private val fetch: (Long, Long) -> ByteArray =
         fetchRange ?: { off, len ->
             val end = off + len
@@ -33,7 +34,10 @@ internal class ColumnWarmState(
             if (slot in warmed) return
             off = reader.colBufOff[slot]
             len = reader.colBufLen[slot]
-            if (off + len > data.size.toLong()) throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
+            if (off < 0 || len < 0) throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
+            if (!customFetch && off + len > data.size.toLong()) {
+                throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
+            }
         }
         val blob = fetch(off, len)
         synchronized(lock) {
@@ -48,15 +52,16 @@ internal class ColumnWarmState(
         reader: NxsReader,
         slot: Int,
     ): ByteArray {
+        val len = reader.colBufLen[slot].toInt()
         synchronized(lock) {
             overlay[slot]?.let { o ->
-                val len = reader.colBufLen[slot].toInt()
                 if (o.size >= len) return o.copyOfRange(0, len)
             }
         }
         val off = reader.colBufOff[slot].toInt()
-        val len = reader.colBufLen[slot].toInt()
-        if (off + len > data.size) throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
-        return data.copyOfRange(off, off + len)
+        if (off >= 0 && off + len <= data.size) {
+            return data.copyOfRange(off, off + len)
+        }
+        throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
     }
 }
