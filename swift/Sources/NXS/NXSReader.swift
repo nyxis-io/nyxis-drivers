@@ -80,6 +80,7 @@ public final class NXSReader {
 
     let prefetchLock = NSLock()
     let prefetch: PrefetchState
+    var columnWarm: ColumnWarmState?
 
     public init(_ data: Data, options: NXSOpenOptions = NXSOpenOptions()) throws {
         self.data = data
@@ -124,6 +125,12 @@ public final class NXSReader {
             recordOffset: { i in Int64(rdU64(data, tail + i * 10 + 2)) }
         )
         prefetch.startEagerBackgroundIfNeeded()
+        if col.layout == .columnar {
+            let colFetch: ((Int, Int) throws -> Data)? = options.fetchRange.map { fr in
+                { off, len in try fr(Int64(off), Int64(len)) }
+            }
+            columnWarm = ColumnWarmState(data: data, fetchRange: colFetch)
+        }
     }
 
     public func slot(_ key: String) throws -> Int {

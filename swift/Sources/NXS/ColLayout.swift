@@ -229,16 +229,22 @@ extension NXSReader {
         guard slot >= 0 && slot < col.colBufOff.count else {
             throw NXSError.keyNotFound("slot \(slot)")
         }
-        let off = Int(col.colBufOff[slot])
-        let length = Int(col.colBufLen[slot])
-        guard off + length <= data.count else {
-            throw NXSError.outOfBounds("column buffer")
+        let sector: Data
+        if let warm = columnWarm {
+            sector = try warm.sector(slot: slot, colOff: col.colBufOff, colLen: col.colBufLen)
+        } else {
+            let off = Int(col.colBufOff[slot])
+            let length = Int(col.colBufLen[slot])
+            guard off + length <= data.count else {
+                throw NXSError.outOfBounds("column buffer")
+            }
+            sector = Data(data[off..<(off + length)])
         }
         let bmLen = nxsNullBitmapBytes(UInt32(col.recordCount))
-        guard length >= bmLen else {
+        guard sector.count >= bmLen else {
             throw NXSError.outOfBounds("null bitmap")
         }
-        return (Data(data[off..<(off + bmLen)]), Data(data[(off + bmLen)..<(off + length)]))
+        return (Data(sector[..<bmLen]), Data(sector[bmLen...]))
     }
 
     func colVarParts(slot: Int) throws -> (bm: Data, offsets: Data, values: Data) {

@@ -241,6 +241,40 @@ check(
     json_encode($statsUp)
 );
 
+// prefetch_column (columnar §7.4)
+$colPaths = [
+    __DIR__ . '/../../nyxis/conformance/columnar_flat8_dense_100.nxb',
+    __DIR__ . '/../conformance/columnar_flat8_dense_100.nxb',
+];
+$colPath = null;
+foreach ($colPaths as $p) {
+    if (is_file($p)) {
+        $colPath = $p;
+        break;
+    }
+}
+if ($colPath !== null) {
+    $colBytes = file_get_contents($colPath);
+    $colFetches = 0;
+    $colReader = new Nxs\Reader($colBytes, [
+        'fetch_range' => static function (int $off, int $len) use ($colBytes, &$colFetches): string {
+            $colFetches++;
+            return substr($colBytes, $off, $len);
+        },
+    ]);
+    $colReader->prefetch_column('score');
+    check('prefetch_column issues one fetch', $colFetches === 1);
+    $sum = $colReader->sumF64('score');
+    $colReader->prefetch_column('score');
+    check(
+        'prefetch_column idempotent + sumF64',
+        $colFetches === 1 && abs($sum - 2475.0) < 1e-6
+            && ($colReader->cache_stats()['column_fetches_issued'] ?? 0) === 1
+    );
+} else {
+    echo "  (skip prefetch_column — columnar fixture missing)\n";
+}
+
 echo str_repeat('─', 56) . "\n";
 $total = $pass + $fail;
 if ($fail === 0) {

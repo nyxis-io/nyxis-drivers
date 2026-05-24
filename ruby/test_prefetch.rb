@@ -219,6 +219,31 @@ puts
     rescue Nxs::NxsError => e
       e.code == 'ERR_OUT_OF_BOUNDS'
     end
+  end,
+
+  check('prefetch_column — single fetch before col_sum_f64') do
+    paths = [
+      File.join(__dir__, '../../nyxis/conformance/columnar_flat8_dense_100.nxb'),
+      File.join(__dir__, '../conformance/columnar_flat8_dense_100.nxb'),
+    ]
+    path = paths.find { |p| File.file?(p) }
+    next true unless path
+
+    data = File.binread(path)
+    fetches = 0
+    reader = Nxs::Reader.new(
+      data,
+      fetch_range: lambda { |off, len|
+        fetches += 1
+        data.byteslice(off, len)
+      },
+    )
+    reader.prefetch_column('score')
+    return false unless fetches == 1
+
+    sum = reader.col_sum_f64('score')
+    reader.prefetch_column('score')
+    fetches == 1 && (sum - 2475.0).abs < 1e-6 && reader.cache_stats[:column_fetches_issued] == 1
   end
 ].each { |r| r ? (passes += 1) : (fails += 1) }
 

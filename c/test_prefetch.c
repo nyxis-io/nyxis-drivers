@@ -254,6 +254,40 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* prefetch_column on columnar fixture */
+    {
+        const char *paths[] = {
+            "../../nyxis/conformance/columnar_flat8_dense_100.nxb",
+            "../../conformance/columnar_flat8_dense_100.nxb",
+            NULL
+        };
+        uint8_t *buf = NULL;
+        size_t sz = 0;
+        for (int pi = 0; paths[pi]; pi++) {
+            buf = read_file(paths[pi], &sz);
+            if (buf) break;
+        }
+        if (buf) {
+            nxs_reader_t r;
+            memset(&r, 0, sizeof(r));
+            CHECK("columnar open", nxs_open(&r, buf, sz) == NXS_OK);
+            CHECK("prefetch_column ok", nxs_prefetch_column(&r, "score") == NXS_OK);
+            nxs_cache_stats_t stats;
+            nxs_cache_stats(&r, &stats);
+            CHECK("column_fetches_issued == 1", stats.column_fetches_issued == 1);
+            double sum = nxs_col_sum_f64(&r, "score");
+            CHECK("col_sum after prefetch", sum > 2400.0 && sum < 2500.0);
+            CHECK("prefetch_column idempotent",
+                  nxs_prefetch_column(&r, "score") == NXS_OK);
+            nxs_cache_stats(&r, &stats);
+            CHECK("column_fetches still 1", stats.column_fetches_issued == 1);
+            nxs_close(&r);
+            free(buf);
+        } else {
+            printf("  - columnar_flat8_dense_100.nxb missing; skipping prefetch_column test\n");
+        }
+    }
+
     printf("\n%d passed, %d failed\n\n", passed, failed);
     return failed > 0 ? 1 : 0;
 }

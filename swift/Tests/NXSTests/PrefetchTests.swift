@@ -174,4 +174,33 @@ final class PrefetchTests: XCTestCase {
         XCTAssertEqual(stats.strategy, "eager")
         XCTAssertEqual(stats.pattern, "sequential")
     }
+
+    func testPrefetchColumnSingleFetch() throws {
+        let candidates = [
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("../../nyxis/conformance/columnar_flat8_dense_100.nxb"),
+            URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .appendingPathComponent("../../../conformance/columnar_flat8_dense_100.nxb"),
+        ]
+        guard let url = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else {
+            throw XCTSkip("columnar_flat8_dense_100.nxb not found")
+        }
+        let data = try Data(contentsOf: url)
+        var fetches = 0
+        let r = try NXSReader(data, options: NXSOpenOptions(fetchRange: { off, len in
+            fetches += 1
+            return Data(data[Int(off)..<(Int(off) + Int(len))])
+        }))
+        try r.prefetchColumn("score")
+        XCTAssertEqual(fetches, 1)
+        let sum = try r.colSumF64(key: "score")
+        XCTAssertEqual(sum, 2475.0, accuracy: 1e-6)
+        try r.prefetchColumn("score")
+        XCTAssertEqual(fetches, 1)
+        XCTAssertEqual(r.cacheStats().columnFetchesIssued, 1)
+    }
 }

@@ -301,14 +301,17 @@ internal fun NxsReader.colNumericBytes(
 
 private fun NxsReader.colFieldParts(slot: Int): Pair<ByteArray, ByteArray> {
     if (slot < 0 || slot >= colBufOff.size) throw NxsError("ERR_KEY_NOT_FOUND", "slot")
-    val off = colBufOff[slot].toInt()
-    val length = colBufLen[slot].toInt()
-    if (off + length > data.size) throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
+    val sector =
+        columnWarm?.sector(this, slot)
+            ?: run {
+                val off = colBufOff[slot].toInt()
+                val length = colBufLen[slot].toInt()
+                if (off + length > data.size) throw NxsError("ERR_OUT_OF_BOUNDS", "column buffer")
+                data.copyOfRange(off, off + length)
+            }
     val bmLen = nullBitmapBytes(recordCount)
-    if (length < bmLen) throw NxsError("ERR_OUT_OF_BOUNDS", "null bitmap")
-    val bm = data.copyOfRange(off, off + bmLen)
-    val vals = data.copyOfRange(off + bmLen, off + length)
-    return bm to vals
+    if (sector.size < bmLen) throw NxsError("ERR_OUT_OF_BOUNDS", "null bitmap")
+    return sector.copyOfRange(0, bmLen) to sector.copyOfRange(bmLen, sector.size)
 }
 
 fun NxsReader.colSumF64(key: String): Double {

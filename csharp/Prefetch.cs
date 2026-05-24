@@ -79,8 +79,9 @@ public readonly record struct CacheStats(
     int CacheHits,
     int CacheMisses,
     int FetchesIssued,
-    string Strategy,
-    string Pattern);
+    int ColumnFetchesIssued = 0,
+    string Strategy = "lazy",
+    string Pattern = "unknown");
 
 public readonly record struct PageRange(int PageStart, int PageEnd, long ByteStart, long ByteLength);
 

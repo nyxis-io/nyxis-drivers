@@ -889,6 +889,27 @@ Reader_col_numpy_f64(ReaderObject *self, PyObject *key)
 }
 
 static PyObject *
+Reader_prefetch_column(ReaderObject *self, PyObject *key)
+{
+    if (!self->has_nxs) {
+        PyErr_SetString(PyExc_RuntimeError, "prefetch_column requires C reader open");
+        return NULL;
+    }
+    if (!PyUnicode_Check(key)) {
+        PyErr_SetString(PyExc_TypeError, "key must be str");
+        return NULL;
+    }
+    const char *field = PyUnicode_AsUTF8(key);
+    if (!field) return NULL;
+    nxs_err_t err = nxs_prefetch_column(&self->nxs, field);
+    if (err != NXS_OK) {
+        PyErr_SetString(PyExc_RuntimeError, nxs_err_msg(err));
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *
 Reader_col_sum_f64(ReaderObject *self, PyObject *key)
 {
     PyObject *tmp = NULL;
@@ -1072,6 +1093,8 @@ static PyMethodDef Reader_methods[] = {
     {"scan_f64", (PyCFunction)Reader_scan_f64, METH_O, "List of all f64 values for key."},
     {"scan_i64", (PyCFunction)Reader_scan_i64, METH_O, "List of all i64 values for key."},
     {"sum_f64",  (PyCFunction)Reader_sum_f64,  METH_O, "Sum of an f64 field across all records."},
+    {"prefetch_column", (PyCFunction)Reader_prefetch_column, METH_O,
+     "Prefetch one columnar column buffer (§7.4)."},
     {"col_sum_f64", (PyCFunction)Reader_col_sum_f64, METH_O, "Columnar/PAX sum of f64 field."},
     {"col_buffer", (PyCFunction)Reader_col_buffer, METH_O,
      "dict(values, bitmap, count) memoryviews for columnar/PAX numeric field."},

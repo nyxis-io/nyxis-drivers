@@ -40,6 +40,7 @@ public struct CacheStats {
     public let cacheHits: Int
     public let cacheMisses: Int
     public let fetchesIssued: Int
+    public let columnFetchesIssued: Int
     public let strategy: String
     public let pattern: String
 }

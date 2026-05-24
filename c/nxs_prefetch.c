@@ -822,6 +822,8 @@ void nxs_cache_stats(const nxs_reader_t *r, nxs_cache_stats_t *stats) {
     memset(stats, 0, sizeof(*stats));
     stats->strategy = "lazy";
     stats->pattern = "unknown";
+    if (r && r->layout == NXS_LAYOUT_COLUMNAR)
+        stats->column_fetches_issued = (uint64_t)r->col_fetches;
     if (!r || !r->prefetch) {
         stats->pages_max = NXS_PREFETCH_DEFAULT_MAX_PAGES;
         return;

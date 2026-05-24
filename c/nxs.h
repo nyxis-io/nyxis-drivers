@@ -62,6 +62,8 @@ typedef struct {
     // columnar: per-field buffer location (indexed by slot)
     uint64_t       col_buf_off[NXS_MAX_KEYS];
     uint64_t       col_buf_len[NXS_MAX_KEYS];
+    uint8_t        col_warmed[NXS_MAX_KEYS];
+    uint32_t       col_fetches;
 
     // PAX: page table (heap-allocated in nxs_open, freed in nxs_close)
     uint32_t       page_count;
@@ -104,6 +106,9 @@ void nxs_pause_prefetch(nxs_reader_t *r);
 
 /** Re-enable speculative prefetch after nxs_pause_prefetch. */
 void nxs_resume_prefetch(nxs_reader_t *r);
+
+/** Prefetch one column buffer (columnar layout only; §7.4). */
+nxs_err_t nxs_prefetch_column(nxs_reader_t *r, const char *field);
 
 /** Cap page-cache resident memory; evicts unpinned pages (requires nxs_open_ex). */
 void nxs_reader_set_cache_limit(nxs_reader_t *r, size_t max_bytes);

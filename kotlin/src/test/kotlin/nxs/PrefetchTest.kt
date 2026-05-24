@@ -228,4 +228,35 @@ class PrefetchTest {
             reader.close()
         }
     }
+
+    @Test
+    fun prefetchColumn_singleFetchBeforeColSum() {
+        val candidates =
+            listOf(
+                java.nio.file.Paths.get("../../nyxis/conformance/columnar_flat8_dense_100.nxb"),
+                java.nio.file.Paths.get("../conformance/columnar_flat8_dense_100.nxb"),
+            )
+        val path = candidates.firstOrNull { java.nio.file.Files.isRegularFile(it) } ?: return
+        val data = java.nio.file.Files.readAllBytes(path)
+        var fetches = 0
+        val reader =
+            NxsReader(
+                data,
+                OpenOptions(fetchRange = { off, len ->
+                    fetches++
+                    data.copyOfRange(off.toInt(), (off + len).toInt())
+                }),
+            )
+        try {
+            reader.prefetchColumn("score")
+            assertEquals(1, fetches)
+            val sum = reader.sumF64("score")
+            reader.prefetchColumn("score")
+            assertEquals(1, fetches)
+            assertEquals(2475.0, sum, 1e-6)
+            assertEquals(1, reader.cacheStats().columnFetchesIssued)
+        } finally {
+            reader.close()
+        }
+    }
 }

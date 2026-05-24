@@ -53,6 +53,7 @@ class NxsReader
         private val prefetchHint: AccessHint = options.hint
         private val openOptions: OpenOptions = options
         private var prefetch: PrefetchEngine? = null
+        private var columnWarm: ColumnWarmState? = null
 
         init {
             if (data.size < 32) throw NxsError("ERR_OUT_OF_BOUNDS", "file too small")
@@ -96,6 +97,13 @@ class NxsReader
             keyIndex = ki
 
             parseLayoutTail()
+            if (layout == Layout.COLUMNAR) {
+                columnWarm =
+                    ColumnWarmState(
+                        data,
+                        openOptions.fetchRange,
+                    )
+            }
             if (layout == Layout.ROW) {
                 val fetchRange: (Long, Long) -> ByteArray =
                     openOptions.fetchRange ?: { off, len ->
@@ -163,9 +171,19 @@ class NxsReader
             prefetch?.prefetchViewport(startIndex, endIndex)
         }
 
+        fun prefetchColumn(key: String) {
+            columnWarm?.prefetchColumn(this, key)
+                ?: throw NxsError("ERR_LAYOUT", "prefetch_column requires columnar layout")
+        }
+
         fun cacheStats(): CacheStats {
-            val pf = prefetch ?: return CacheStats(0, 0, 0, 0, 0, 0, "disabled", "unknown")
-            return pf.cacheStats()
+            val colFetches = columnWarm?.fetches ?: 0
+            val pf = prefetch
+            if (pf == null) {
+                return CacheStats(0, 0, 0, 0, 0, 0, colFetches, "disabled", "unknown")
+            }
+            val s = pf.cacheStats()
+            return s.copy(columnFetchesIssued = colFetches)
         }
 
         private val buf: ByteBuffer get() = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)

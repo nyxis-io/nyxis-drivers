@@ -66,6 +66,7 @@ typedef struct {
     uint64_t     cache_hits;
     uint64_t     cache_misses;
     uint64_t     fetches_issued;
+    uint64_t     column_fetches_issued;
     const char  *strategy;
     const char  *pattern;
 } nxs_cache_stats_t;

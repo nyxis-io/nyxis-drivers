@@ -32,6 +32,15 @@ extension NXSReader {
         )
     }
 
+    /// Prefetch one column buffer (columnar layout only; §7.4).
+    public func prefetchColumn(_ key: String) throws {
+        guard col.layout == .columnar, let warm = columnWarm else {
+            throw NXSError.keyNotFound("prefetch_column requires columnar layout")
+        }
+        let slot = try slot(key)
+        try warm.prefetchColumn(slot: slot, colOff: col.colBufOff, colLen: col.colBufLen)
+    }
+
     public func cacheStats() -> CacheStats {
         let (pagesCached, memoryUsed) = prefetch.cache.stats()
         return CacheStats(
@@ -41,6 +50,7 @@ extension NXSReader {
             cacheHits: prefetch.cache.hits,
             cacheMisses: prefetch.cache.misses,
             fetchesIssued: prefetch.fetchesIssued,
+            columnFetchesIssued: columnWarm?.fetches ?? 0,
             strategy: prefetch.currentStrategy(),
             pattern: prefetch.currentPattern()
         )
