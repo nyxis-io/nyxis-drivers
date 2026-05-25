@@ -1,69 +1,107 @@
-# Nyxis drivers
+# Nyxis Drivers
 
-MIT-licensed language SDKs for reading and writing [Nyxis](https://github.com/nyxis-io/nyxis) `.nxb` binary payloads and running benchmarks against shared fixtures.
+MIT-licensed SDKs for reading, writing, prefetching, and benchmarking [Nyxis](https://github.com/nyxis-io/nyxis) `.nxb` binary payloads.
 
-The **spec, Rust compiler, conformance vectors, demos, and bench UI** live in [`nyxis-io/nyxis`](https://github.com/nyxis-io/nyxis) (BSL 1.1). This repo is the embeddable surface for applications and edge runtimes.
+This repository is the embeddable application surface for Nyxis. The core spec, Rust compiler, conformance vectors, browser demos, benchmark harnesses, and MCP server live in [`nyxis-io/nyxis`](https://github.com/nyxis-io/nyxis).
 
-## Layout
+## Supported Drivers
 
-| Directory | Language | Notes |
+| Directory | Language | Surface |
 | --- | --- | --- |
-| [`c/`](./c/) | C99 | Native reader; used by Python/Ruby/PHP extensions |
-| [`go/`](./go/) | Go 1.26+ | `github.com/nyxis-io/nyxis-drivers/go` |
-| [`py/`](./py/) | Python 3 | Pure reader + optional C extension |
-| [`js/`](./js/) | JavaScript | Node reader; WASM compile + decode; WASM build consumes core artifacts |
-| [`devtools-extension/`](./devtools-extension/) | Browser | **Nyxis Inspector** — DevTools panel decodes `.nxb` Network responses to `.nxs` text |
-| [`ruby/`](./ruby/) | Ruby | Pure + C extension |
-| [`php/`](./php/) | PHP | Pure + C extension |
-| [`kotlin/`](./kotlin/) | Kotlin/JVM | Gradle project |
-| [`csharp/`](./csharp/) | C# | .NET |
-| [`swift/`](./swift/) | Swift | macOS/iOS reader |
+| [`c/`](./c/) | C99 | Native reader/writer; shared by extension-backed dynamic languages |
+| [`go/`](./go/) | Go 1.26+ | Reader, writer, reducers, adaptive prefetch |
+| [`py/`](./py/) | Python 3 | Pure reader/writer plus optional C extension |
+| [`js/`](./js/) | JavaScript | Node/browser reader, writer, WASM compile/decode helpers |
+| [`ruby/`](./ruby/) | Ruby | Pure reader/writer plus C extension |
+| [`php/`](./php/) | PHP | Pure reader/writer plus C extension |
+| [`kotlin/`](./kotlin/) | Kotlin/JVM | JVM reader and reducers |
+| [`csharp/`](./csharp/) | C# | .NET reader and reducers |
+| [`swift/`](./swift/) | Swift | macOS/iOS reader and reducers |
+| [`devtools-extension/`](./devtools-extension/) | Browser | Nyxis Inspector DevTools panel for `.nxb` network responses |
 
-Each language folder has its own README with install snippets and API examples.
+Each language directory has its own README with install commands, API examples, and language-specific test commands.
 
-## Adaptive prefetch (phase 2)
+## Install
 
-Row-layout readers support optional viewport prefetch via open options:
+| Ecosystem | Command or source |
+| --- | --- |
+| C | Download source artifacts from GitHub Releases or use [`c/`](./c/) directly |
+| Go | `go get github.com/nyxis-io/nyxis-drivers/go` |
+| Python | `pip install nyxis` |
+| JavaScript | `npm install nyxis` |
+| Ruby | `gem install nyxis` |
+| PHP | `composer require nyxis/nyxis` |
+| Kotlin | See [`kotlin/README.md`](./kotlin/README.md) |
+| C# | `dotnet add package nyxis` |
+| Swift | See [`swift/README.md`](./swift/README.md) |
 
-- **`hint`** — advisory only (`unknown`, `sequential`, `random`, `full`, `partial`); runtime pattern detection may override.
-- **Strategies** — `lazy` (>50 MB files), `adaptive` (default for mid-size), `eager` (`full` hint + file ≤10 MB, or after 100 sequential accesses).
-- **`prefetch_viewport(start, end)`** — coalesced page fetch for a record range.
-- **`warmup()`** — wait for in-flight eager background load (where supported).
-- **`cache_stats()`** — returns `strategy`, `pattern`, cache hits/misses, and fetch counts.
+## Quick Start
 
-PHP eager load is synchronous-only (no background thread); see [`php/README.md`](./php/README.md).
-
-Cross-driver conformance vectors live in [`nyxis/conformance/prefetch/`](https://github.com/nyxis-io/nyxis/tree/main/conformance/prefetch). Run `make conformance-prefetch PREFETCH=1` from the core repo.
-
-## Quick start
-
-Clone **nyxis** as a sibling (or set `CORE` to your checkout):
+Clone the core repo as a sibling, generate fixtures with the Rust compiler, then run driver tests:
 
 ```bash
 git clone https://github.com/nyxis-io/nyxis.git ../nyxis
 git clone https://github.com/nyxis-io/nyxis-drivers.git
 cd nyxis-drivers
+
+make fixtures
+make test
 ```
 
-Generate fixtures from the core compiler, then run all driver tests:
+Run a single driver while iterating:
 
 ```bash
-make fixtures    # writes to ../nyxis/bench/fixtures by default
-make test        # all languages
-make test-go     # single language
+make test-go
+make test-js
+make test-py
 ```
 
-In the [nyxis monorepo workspace](https://github.com/nyxis-io/nyxis), use `make -C nyxis-drivers test` from the parent tree.
+In the multi-repo workspace, run from the parent directory:
+
+```bash
+make -C nyxis fixtures
+make -C nyxis-drivers test
+```
+
+## Reader Model
+
+All drivers read the same `.nxb` files produced by the Rust compiler in `nyxis`. Readers open a byte slice, mmap region, or language-native buffer; read the preamble and embedded schema; then use the tail-index to locate records without parsing the full payload.
+
+Common operations across drivers:
+
+- Open a `.nxb` payload and read `record_count`.
+- Fetch record `i` in O(1) through the tail-index.
+- Decode individual fields by key or slot.
+- Run bulk reducers such as `sum_f64`, `min_f64`, `max_f64`, and `sum_i64`.
+- Write `.nxb` bytes from schema-defined slots.
+
+## Adaptive Prefetch
+
+Row-layout readers support optional viewport prefetch for browser, edge, and remote-file access patterns:
+
+| Option | Behavior |
+| --- | --- |
+| `hint` | Advisory access pattern: `unknown`, `sequential`, `random`, `full`, or `partial` |
+| `lazy` | Default for large files where the reader should fetch only touched pages |
+| `adaptive` | Mid-size default that promotes based on observed access patterns |
+| `eager` | Full prefetch for small files, explicit `full` hints, or sustained sequential reads |
+| `prefetch_viewport(start, end)` | Coalesces page fetches for a visible record range |
+| `warmup()` | Waits for in-flight eager background load where supported |
+| `cache_stats()` | Reports strategy, detected pattern, cache hits/misses, and fetch counts |
+
+PHP eager loading is synchronous because the extension does not start a background worker. See [`php/README.md`](./php/README.md).
+
+Prefetch conformance vectors live in [`nyxis/conformance/prefetch/`](https://github.com/nyxis-io/nyxis/tree/main/conformance/prefetch). Run them from the core repo with:
+
+```bash
+make conformance-prefetch PREFETCH=1
+```
 
 ## Conformance
 
-Cross-repo conformance is driven from **nyxis**: vectors are generated in `nyxis/conformance/`, runners import drivers from this repo. See [CONFORMANCE.md](https://github.com/nyxis-io/nyxis/blob/main/CONFORMANCE.md) in the core repo (or the copy in a monorepo checkout).
+Cross-repo conformance is driven from `nyxis`: the core repo generates vectors in `nyxis/conformance/`, then runners import drivers from this repo. See [`CONFORMANCE.md`](https://github.com/nyxis-io/nyxis/blob/main/CONFORMANCE.md) for the vector format and test matrix.
 
-## CI
-
-Workflows check out private **`nyxis-io/nyxis`** to build fixtures. Both repos need the **`NYXIS_CI_AUTOMATION_TOKEN`** secret (classic PAT with `repo`, or fine-grained **Contents: Read** on both repositories). Details: [`.github/workflows/README.md`](./.github/workflows/README.md).
-
-## Magic bytes (v1)
+## Magic Bytes
 
 | Layer | Tag | Value |
 | --- | --- | --- |
@@ -73,6 +111,10 @@ Workflows check out private **`nyxis-io/nyxis`** to build fixtures. Both repos n
 
 Regenerate fixtures after upgrading from legacy `NXSB`/`NXSO`/`NXSL` layouts.
 
+## CI
+
+Driver workflows check out `nyxis` to build fixtures and conformance vectors. Both repositories need the `NYXIS_CI_AUTOMATION_TOKEN` secret for cross-repo jobs. Details are in [`.github/workflows/README.md`](./.github/workflows/README.md).
+
 ## License
 
-[MIT](./LICENSE) — Copyright (c) 2026-Present Micael Malta.
+[MIT](./LICENSE) - Copyright (c) 2026-Present Micael Malta.
