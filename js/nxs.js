@@ -15,6 +15,7 @@
 // Adaptive prefetch (optional): prefetch_viewport, cache_stats — see prefetch.js.
 
 import { AccessPatternDetector, PATTERN_SEQUENTIAL } from "./pattern.js";
+import { SparseBytes, byteAt } from "./sparse_bytes.js";
 import {
   HINT_UNKNOWN,
   PageCache,
@@ -40,6 +41,7 @@ export {
   HINT_FULL,
   HINT_PARTIAL,
 } from "./prefetch.js";
+export { SparseBytes } from "./sparse_bytes.js";
 
 const MAGIC_FILE   = 0x4E595842; // NYXB
 const MAGIC_OBJ    = 0x4E59584F; // NYXO
@@ -93,7 +95,7 @@ const _utf8Decoder = new TextDecoder("utf-8");
  */
 function _decodeMaybeShared(bytes, offset, end) {
   const view = bytes.subarray(offset, end);
-  const buf = bytes.buffer;
+  const buf = bytes._isSparseBytes ? view.buffer : bytes.buffer;
   // `buffer.constructor === SharedArrayBuffer` is the reliable check; older
   // engines don't even define the global, so guard the reference.
   if (typeof SharedArrayBuffer !== "undefined" && buf instanceof SharedArrayBuffer) {
@@ -117,13 +119,13 @@ function decodeUtf8Fast(bytes, offset, length) {
   // Unroll 4-at-a-time for V8 to hoist
   const end4 = offset + (length & ~3);
   while (i < end4) {
-    if ((bytes[i] | bytes[i+1] | bytes[i+2] | bytes[i+3]) & 0x80) {
+    if ((byteAt(bytes, i) | byteAt(bytes, i + 1) | byteAt(bytes, i + 2) | byteAt(bytes, i + 3)) & 0x80) {
       return _decodeMaybeShared(bytes, offset, end);
     }
     i += 4;
   }
   while (i < end) {
-    if (bytes[i] & 0x80) {
+    if (byteAt(bytes, i) & 0x80) {
       return _decodeMaybeShared(bytes, offset, end);
     }
     i++;
@@ -155,11 +157,16 @@ const _scratchU8  = new Uint8Array(_scratchBuf);
 const _scratchF64 = new Float64Array(_scratchBuf);
 
 function rdU16(bytes, off) {
-  return bytes[off] | (bytes[off + 1] << 8);
+  return byteAt(bytes, off) | (byteAt(bytes, off + 1) << 8);
 }
 
 function rdU32(bytes, off) {
-  return (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
+  return (
+    byteAt(bytes, off) |
+    (byteAt(bytes, off + 1) << 8) |
+    (byteAt(bytes, off + 2) << 16) |
+    (byteAt(bytes, off + 3) << 24)
+  ) >>> 0;
 }
 
 function nullBitmapBytesLen(n) {
@@ -207,21 +214,21 @@ function fieldSectorLen(bytes, sectorOff, rc, sigil) {
 
 function rdI64Safe(bytes, off) {
   // Two 32-bit reads combined into a JS number. Safe for |v| < 2^53.
-  const lo = (bytes[off] | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
-  const hi =  (bytes[off + 4] | (bytes[off + 5] << 8) | (bytes[off + 6] << 16) | (bytes[off + 7] << 24)) | 0;
+  const lo = rdU32(bytes, off);
+  const hi = rdU32(bytes, off + 4) | 0;
   return hi * 0x100000000 + lo;
 }
 
 function rdF64(bytes, off) {
   // Copy 8 bytes into the aliased Float64Array; read [0].
-  _scratchU8[0] = bytes[off];
-  _scratchU8[1] = bytes[off + 1];
-  _scratchU8[2] = bytes[off + 2];
-  _scratchU8[3] = bytes[off + 3];
-  _scratchU8[4] = bytes[off + 4];
-  _scratchU8[5] = bytes[off + 5];
-  _scratchU8[6] = bytes[off + 6];
-  _scratchU8[7] = bytes[off + 7];
+  _scratchU8[0] = byteAt(bytes, off);
+  _scratchU8[1] = byteAt(bytes, off + 1);
+  _scratchU8[2] = byteAt(bytes, off + 2);
+  _scratchU8[3] = byteAt(bytes, off + 3);
+  _scratchU8[4] = byteAt(bytes, off + 4);
+  _scratchU8[5] = byteAt(bytes, off + 5);
+  _scratchU8[6] = byteAt(bytes, off + 6);
+  _scratchU8[7] = byteAt(bytes, off + 7);
   return _scratchF64[0];
 }
 
@@ -243,7 +250,7 @@ function murmur3_64(bytes, offset, length) {
   for (let p = offset; p < end; p += 8) {
     let k = 0n;
     for (let i = 0; i < 8 && p + i < end; i++) {
-      k |= BigInt(bytes[p + i]) << BigInt(i * 8);
+      k |= BigInt(byteAt(bytes, p + i)) << BigInt(i * 8);
     }
     k = (k * C1) & MASK;
     k ^= k >> 33n;
@@ -266,8 +273,21 @@ export class NxsReader {
    * @param {object} [options] — prefetch: hint, maxPages, pageSize, coalesceGapPages, fetchRange
    */
   constructor(buffer, options = {}) {
-    this.bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+    this._sparse = buffer instanceof SparseBytes ? buffer : null;
+    this.bytes = this._sparse
+      ? this._sparse.asIndexed()
+      : buffer instanceof Uint8Array
+        ? buffer
+        : new Uint8Array(buffer);
+    if (this._sparse) {
+      this.view = new DataView(
+        this._sparse._resident[0].data.buffer,
+        this._sparse._resident[0].data.byteOffset,
+        this._sparse._resident[0].data.byteLength,
+      );
+    } else {
+      this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
+    }
 
     if (this.bytes.length < 32) {
       throw new NxsError("ERR_OUT_OF_BOUNDS", "file too small");
@@ -286,8 +306,10 @@ export class NxsReader {
     this.tailPtr   = Number(this.view.getBigUint64(16, true));
     // bytes 24-31 reserved
 
-    // Footer check
-    const footer = this.view.getUint32(this.bytes.length - 4, true);
+    // Footer check (sparse: footer lives in the tail resident span)
+    const footer = this._sparse
+      ? rdU32(this.bytes, this.bytes.length - 4)
+      : this.view.getUint32(this.bytes.length - 4, true);
     if (footer !== MAGIC_FOOTER) {
       throw new NxsError("ERR_BAD_MAGIC", "footer magic mismatch");
     }
@@ -297,7 +319,22 @@ export class NxsReader {
       if (this.bytes.length < 44) {
         throw new NxsError("ERR_OUT_OF_BOUNDS", "streamable footer missing tail pointer");
       }
-      this.tailPtr = Number(this.view.getBigUint64(this.bytes.length - 12, true));
+      this.tailPtr = this._sparse
+        ? Number(rdU64AsNumber(this.bytes, this.bytes.length - 12))
+        : Number(this.view.getBigUint64(this.bytes.length - 12, true));
+    }
+    if (this._sparse) {
+      const tailSpan = this._sparse._resident.find(
+        (s) => this.tailPtr >= s.start && this.tailPtr < s.start + s.data.length,
+      );
+      if (!tailSpan) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", "tail index not in resident span");
+      }
+      this._tailView = new DataView(
+        tailSpan.data.buffer,
+        tailSpan.data.byteOffset + (this.tailPtr - tailSpan.start),
+        tailSpan.data.byteLength - (this.tailPtr - tailSpan.start),
+      );
     }
 
     // Schema
@@ -571,7 +608,69 @@ export class NxsReader {
 
   /** Absolute data-sector offset for row-layout record `i`. */
   _recordByteOffset(i) {
+    if (this._tailView) {
+      return Number(this._tailView.getBigUint64(4 + i * 10 + 2, true));
+    }
     return rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
+  }
+
+  /**
+   * Open a large remote `.nxb` via HTTP Range: header + tail resident, data sector on demand.
+   * @param {string} url
+   * @param {object} [options] — hint, maxPages, fetch, signal (fetchRange is built-in)
+   */
+  static async openRemote(url, options = {}) {
+    const fetchImpl = options.fetch ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") {
+      throw new TypeError("NxsReader.openRemote requires fetch");
+    }
+    const head = await fetchImpl(url, { method: "HEAD", signal: options.signal });
+    if (!head.ok) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `HEAD failed: ${head.status}`);
+    }
+    const fileSize = Number(head.headers.get("content-length"));
+    if (!Number.isFinite(fileSize) || fileSize < 44) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", "Content-Length required for openRemote");
+    }
+
+    const fetchRange = async (byteStart, byteLength, signal) => {
+      const end = byteStart + byteLength - 1;
+      const res = await fetchImpl(url, {
+        headers: { Range: `bytes=${byteStart}-${end}` },
+        signal: signal ?? options.signal,
+      });
+      if (!(res.status === 206 || (byteStart === 0 && res.ok))) {
+        throw new NxsError("ERR_OUT_OF_BOUNDS", `range fetch failed: ${res.status}`);
+      }
+      return new Uint8Array(await res.arrayBuffer());
+    };
+
+    const probeLen = Math.min(4096, fileSize);
+    const probe = await fetchRange(fileSize - probeLen, probeLen);
+    const probeView = new DataView(probe.buffer, probe.byteOffset, probe.byteLength);
+    if (probeView.getUint32(probe.byteLength - 4, true) !== MAGIC_FOOTER) {
+      throw new NxsError("ERR_BAD_MAGIC", "footer magic mismatch");
+    }
+    let tailPtr = Number(probeView.getBigUint64(probe.byteLength - 12, true));
+    const headerLen = Math.min(262144, tailPtr > 0 ? tailPtr : fileSize);
+    const header = await fetchRange(0, headerLen);
+    const hView = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    if (hView.getUint32(0, true) !== MAGIC_FILE) {
+      throw new NxsError("ERR_BAD_MAGIC", "preamble");
+    }
+    const preambleTail = Number(hView.getBigUint64(16, true));
+    if (preambleTail > 0) tailPtr = preambleTail;
+    if (tailPtr <= 0 || tailPtr >= fileSize) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", "invalid tail pointer");
+    }
+    const tail = await fetchRange(tailPtr, fileSize - tailPtr);
+    const sparse = new SparseBytes(
+      fileSize,
+      [{ start: 0, data: header }, { start: tailPtr, data: tail }],
+      fetchRange,
+      options.pageSize,
+    );
+    return new NxsReader(sparse, { ...options, fetchRange });
   }
 
   /**
@@ -647,7 +746,7 @@ export class NxsReader {
       return Promise.all(waits);
     }
 
-    const job = this._doCoalescedRangeFetch(range);
+    const job = this._doCoalescedRangeFetch(range, { pinFetched: true });
     for (const p of pages) {
       inFlight.set(
         p,
@@ -663,15 +762,18 @@ export class NxsReader {
     return job;
   }
 
-  async _doCoalescedRangeFetch(range) {
+  async _doCoalescedRangeFetch(range, { pinFetched = false } = {}) {
     const { pageSize, cache } = this._prefetch;
     const blob = await this._fetchRangeBytes(range.byteStart, range.byteLength);
+    if (this._sparse) {
+      this._sparse.fillRange(range.byteStart, blob);
+    }
     for (let p = range.pageStart; p <= range.pageEnd; p++) {
       if (cache.has(p)) continue;
       const pageOff = p * pageSize - range.byteStart;
       const pageLen = Math.min(pageSize, blob.byteLength - pageOff);
       if (pageLen <= 0) continue;
-      cache.set(p, blob.subarray(pageOff, pageOff + pageLen));
+      cache.set(p, blob.subarray(pageOff, pageOff + pageLen), { pinned: pinFetched });
     }
   }
 
@@ -736,13 +838,13 @@ export class NxsReader {
     offset += 2;
     // TypeManifest
     for (let i = 0; i < keyCount; i++) {
-      this.keySigils.push(this.bytes[offset + i]);
+      this.keySigils.push(byteAt(this.bytes, offset + i));
     }
     offset += keyCount;
     // StringPool — null-terminated UTF-8 strings
     for (let i = 0; i < keyCount; i++) {
       let end = offset;
-      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      while (end < this.bytes.length && byteAt(this.bytes, end) !== 0) end++;
       this.keys.push(_decodeMaybeShared(this.bytes, offset, end));
       offset = end + 1;
     }
@@ -756,6 +858,11 @@ export class NxsReader {
   }
 
   _readTailIndex() {
+    if (this._tailView) {
+      this.recordCount = this._tailView.getUint32(0, true);
+      this._tailStart = this.tailPtr + 4;
+      return;
+    }
     let p = this.tailPtr;
     this.recordCount = this.view.getUint32(p, true);
     p += 4;
@@ -1745,7 +1852,7 @@ export class NxsPaxStreamReader {
     const keys = [];
     for (let i = 0; i < keyCount; i++) {
       let end = offset;
-      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      while (end < this.bytes.length && byteAt(this.bytes, end) !== 0) end++;
       if (end >= this.bytes.length) return false;
       keys.push(_decodeMaybeShared(this.bytes, offset, end));
       offset = end + 1;
@@ -1775,15 +1882,26 @@ export class NxsPaxStreamReader {
 
 // ── Row streaming reader ───────────────────────────────────────────────────
 
+const STREAM_BUF_MAX = 64 * 1024 * 1024;
+const STREAM_BUF_TARGET = 48 * 1024 * 1024;
+/** Parsed records in the last N bytes are never compacted away. */
+const STREAM_BUF_KEEP_BEFORE_CURSOR = 16 * 1024 * 1024;
+
 export class NxsStreamReader {
-  constructor({ onSchema, onRecord, onEnd, onError } = {}) {
+  constructor({ onSchema, onRecord, onEnd, onError, onCompact, compactionEnabled = true } = {}) {
     this.onSchema = onSchema;
     this.onRecord = onRecord;
     this.onEnd = onEnd;
     this.onError = onError;
+    this.onCompact = onCompact;
+    /** When false, the full byte stream is retained (required before `finish()` → `NxsReader`). */
+    this.compactionEnabled = compactionEnabled;
+    this._streamComplete = false;
     this.bytes = new Uint8Array(0);
     this._buffer = new Uint8Array(0);
     this._length = 0;
+    /** File byte offset of `bytes[0]` (sliding window during streaming). */
+    this._baseOffset = 0;
     this.keys = [];
     this.keySigils = [];
     this.keyIndex = new Map();
@@ -1791,6 +1909,27 @@ export class NxsStreamReader {
     this._nextOffset = 0;
     this._headerParsed = false;
     this._recordCount = 0;
+    /** Bumped on each buffer slide so UIs can invalidate cached row views. */
+    this.compactGeneration = 0;
+  }
+
+  /** Earliest absolute file offset still present in the in-memory window. */
+  get earliestRetainedOffset() {
+    return this._baseOffset;
+  }
+
+  /** Absolute file offset for a record's buffer-relative `offset`. */
+  fileOffsetOf(relativeOffset) {
+    return this._baseOffset + relativeOffset;
+  }
+
+  /** Buffer-relative offset, or `null` if that record was compacted out. */
+  relativeOffsetOrNull(fileOffset) {
+    const rel = fileOffset - this._baseOffset;
+    if (rel < 0 || rel + 8 > this._length) return null;
+    const len = rdU32(this.bytes, rel + 4);
+    if (len < 8 || rel + len > this._length) return null;
+    return rel;
   }
 
   push(chunk) {
@@ -1802,14 +1941,27 @@ export class NxsStreamReader {
       this.bytes = this._buffer.subarray(0, this._length);
       this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
       this._parseAvailable();
+      if (!this._streamComplete) this._compactBuffer();
     } catch (err) {
       this.onError?.(err);
       throw err;
     }
   }
 
+  /** Parse trailing bytes; does not compact (call after the download stream ends). */
+  endOfStream() {
+    this._streamComplete = true;
+    this._parseAvailable();
+  }
+
   finish() {
     this._parseAvailable();
+    if (this._baseOffset !== 0) {
+      throw new NxsError(
+        "ERR_INCOMPLETE",
+        "cannot seal to NxsReader: buffer was compacted (NYXB header not at offset 0); disable compaction for this download",
+      );
+    }
     const reader = new NxsReader(this.bytes);
     this.onEnd?.(reader);
     return reader;
@@ -1848,7 +2000,7 @@ export class NxsStreamReader {
     const keys = [];
     for (let i = 0; i < keyCount; i++) {
       let end = offset;
-      while (end < this.bytes.length && this.bytes[end] !== 0) end++;
+      while (end < this.bytes.length && byteAt(this.bytes, end) !== 0) end++;
       if (end >= this.bytes.length) return false;
       keys.push(_decodeMaybeShared(this.bytes, offset, end));
       offset = end + 1;
@@ -1877,10 +2029,40 @@ export class NxsStreamReader {
   _ensureCapacity(required) {
     if (required <= this._buffer.length) return;
     let nextCap = this._buffer.length || 4096;
-    while (nextCap < required) nextCap *= 2;
+    while (nextCap < required) {
+      const doubled = nextCap * 2;
+      nextCap = doubled <= STREAM_BUF_MAX * 2
+        ? doubled
+        : Math.max(required, required + 65536);
+      if (nextCap >= required) break;
+    }
     const next = new Uint8Array(nextCap);
     next.set(this.bytes);
     this._buffer = next;
+  }
+
+  _compactBuffer() {
+    if (!this.compactionEnabled || this._length <= STREAM_BUF_MAX) return;
+    let cut = this._length - STREAM_BUF_TARGET;
+    const maxCut = this._nextOffset - STREAM_BUF_KEEP_BEFORE_CURSOR;
+    if (this._headerParsed) {
+      cut = Math.min(cut, maxCut);
+    } else {
+      cut = Math.min(cut, this._length - STREAM_BUF_MAX);
+      if (cut < this._schemaEnd) return;
+    }
+    if (cut <= 0) return;
+    const newLen = this._length - cut;
+    const next = new Uint8Array(newLen);
+    next.set(this._buffer.subarray(cut, this._length));
+    this._buffer = next;
+    this._baseOffset += cut;
+    this.compactGeneration++;
+    this.onCompact?.(cut, this._baseOffset);
+    this._length = newLen;
+    this._nextOffset -= cut;
+    this.bytes = this._buffer.subarray(0, this._length);
+    this.view = new DataView(this.bytes.buffer, this.bytes.byteOffset, this.bytes.byteLength);
   }
 }
 
@@ -2098,12 +2280,13 @@ export class NxsObject {
   }
 
   _decodeValue(offset, _sigilHint) {
-    const { view, bytes } = this.reader;
+    const bytes = this.reader.bytes;
 
     // If we have no hint, peek: if first 4 bytes are a known magic, it's
     // a nested object or list. Otherwise assume an 8-byte atomic value.
+    // Use rdU32 (not DataView): sparse openRemote keeps view scoped to header only.
     if (offset + 4 <= bytes.length) {
-      const maybeMagic = view.getUint32(offset, true);
+      const maybeMagic = rdU32(bytes, offset);
       if (maybeMagic === MAGIC_OBJ) return new NxsObject(this.reader, offset);
       if (maybeMagic === MAGIC_LIST) return this._decodeList(offset);
     }
@@ -2118,17 +2301,18 @@ export class NxsObject {
   }
 
   _readI64(offset) {
-    return Number(this.reader.view.getBigInt64(offset, true));
+    return rdI64Safe(this.reader.bytes, offset);
   }
   _readF64(offset) {
-    return this.reader.view.getFloat64(offset, true);
+    return rdF64(this.reader.bytes, offset);
   }
   _readBool(offset) {
-    return this.reader.bytes[offset] !== 0;
+    return byteAt(this.reader.bytes, offset) !== 0;
   }
   _readStr(offset) {
-    const len = this.reader.view.getUint32(offset, true);
-    return decodeUtf8Fast(this.reader.bytes, offset + 4, len);
+    const bytes = this.reader.bytes;
+    const len = rdU32(bytes, offset);
+    return decodeUtf8Fast(bytes, offset + 4, len);
   }
 
   // ── Typed accessors (fast path when caller knows the type) ──────────────
@@ -2180,7 +2364,7 @@ export class NxsObject {
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
-    return r.bytes[off] !== 0;
+    return byteAt(r.bytes, off) !== 0;
   }
 
   getStrBySlot(slot) {
@@ -2209,19 +2393,19 @@ export class NxsObject {
   }
 
   _decodeList(offset) {
-    const { view } = this.reader;
-    const magic = view.getUint32(offset, true);
+    const bytes = this.reader.bytes;
+    const magic = rdU32(bytes, offset);
     if (magic !== MAGIC_LIST) throw new NxsError("ERR_BAD_MAGIC", "list magic");
     // Length at offset+4, ElemSigil at offset+8, ElemCount at offset+9
-    const elemSigil = this.reader.bytes[offset + 8];
-    const elemCount = view.getUint32(offset + 9, true);
+    const elemSigil = byteAt(bytes, offset + 8);
+    const elemCount = rdU32(bytes, offset + 9);
     // Data starts at offset + 16 (after 3-byte padding)
     const dataStart = offset + 16;
     const out = new Array(elemCount);
     for (let i = 0; i < elemCount; i++) {
       const elemOff = dataStart + i * 8;
-      if (elemSigil === SIGIL_INT) out[i] = Number(view.getBigInt64(elemOff, true));
-      else if (elemSigil === SIGIL_FLOAT) out[i] = view.getFloat64(elemOff, true);
+      if (elemSigil === SIGIL_INT) out[i] = rdI64Safe(bytes, elemOff);
+      else if (elemSigil === SIGIL_FLOAT) out[i] = rdF64(bytes, elemOff);
       else out[i] = null; // unsupported in reader for POC
     }
     return out;

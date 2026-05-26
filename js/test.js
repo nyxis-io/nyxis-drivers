@@ -257,6 +257,50 @@ test("stream reader emits records before finish", () => {
   assertEq(final.record(1).getStr("username"), "bob", "final reader");
 });
 
+test("stream reader endOfStream does not compact", () => {
+  const schema = new NxsSchema(["id"]);
+  const w = new NxsWriter(schema);
+  w.beginObject();
+  w.writeI64(0, 42n);
+  w.endObject();
+  const bytes = w.finish();
+  const sr = new NxsStreamReader({ compactionEnabled: true });
+  sr.push(bytes);
+  const lenBefore = sr.bytes.length;
+  sr.endOfStream();
+  if (sr.bytes.length !== lenBefore) throw new Error("endOfStream should not drop bytes");
+  if (sr.finish().record(0).getI64("id") !== 42) throw new Error("seal after endOfStream");
+});
+
+test("stream reader compaction preserves parse cursor tail", () => {
+  const sr = new NxsStreamReader({ compactionEnabled: true });
+  sr._headerParsed = true;
+  sr._schemaEnd = 64;
+  sr._buffer = new Uint8Array(65 * 1024 * 1024);
+  sr._length = sr._buffer.length;
+  sr.bytes = sr._buffer.subarray(0, sr._length);
+  sr._nextOffset = 1024 * 1024;
+  sr._compactBuffer();
+  if (sr._nextOffset < 0) throw new Error("parse cursor went negative");
+  if (sr._length !== 65 * 1024 * 1024) {
+    throw new Error("compacted without enough parsed tail to preserve");
+  }
+});
+
+test("stream reader with compaction disabled can finish", () => {
+  const schema = new NxsSchema(["id", "name"]);
+  const w = new NxsWriter(schema);
+  w.beginObject();
+  w.writeI64(0, 1n);
+  w.writeStr(1, "a");
+  w.endObject();
+  const bytes = w.finish();
+  const sr = new NxsStreamReader({ compactionEnabled: false });
+  sr.push(bytes);
+  const r = sr.finish();
+  assertEq(r.record(0).getStr("name"), "a", "sealed after full buffer");
+});
+
 test("stream reader rejects invalid object length", () => {
   const schema = new NxsSchema(["id"]);
   const w = new NxsWriter(schema);
