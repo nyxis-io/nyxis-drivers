@@ -656,6 +656,10 @@ Reader_record(ReaderObject *self, PyObject *arg)
         return (PyObject *)obj;
     }
     Py_ssize_t entry = self->tail_start + i * 10;
+    if (entry + 10 > self->size) {
+        PyErr_SetString(PyExc_ValueError, "ERR_OUT_OF_BOUNDS: tail entry");
+        return NULL;
+    }
     uint64_t abs_offset = rd_u64(self->data + entry + 2);
     return (PyObject *)make_object(self, (Py_ssize_t)abs_offset);
 }

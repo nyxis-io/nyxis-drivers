@@ -75,11 +75,11 @@ static int plan_bool_word_bytes(const nxs_cell_plan_t *plan) {
 static size_t read_str_cell_len(const uint8_t *data, size_t size, size_t off,
                                 int prefix_len) {
     if (prefix_len == 2) {
-        if (off + 2 > size) return (size_t)-1;
+        if (off > size || size - off < 2) return (size_t)-1;
         return rd_u16(data + off);
     }
     if (prefix_len == 4) {
-        if (off + 4 > size) return (size_t)-1;
+        if (off > size || size - off < 4) return (size_t)-1;
         return rd_u32(data + off);
     }
     return (size_t)-1;
@@ -294,10 +294,16 @@ int nxs_parse_extended_schema(const uint8_t *data, size_t size, size_t pos,
             for (int i = 0; i < (int)value_count; i++) {
                 const uint8_t *start = data + pos;
                 while (pos < size && data[pos] != 0) pos++;
-                if (pos >= size) return NXS_ERR_OUT_OF_BOUNDS;
+                if (pos >= size) {
+                    nxs_ext_schema_free(out);
+                    return NXS_ERR_OUT_OF_BOUNDS;
+                }
                 size_t len = (size_t)(data + pos - start);
                 char *s = malloc(len + 1);
-                if (!s) return NXS_ERR_ALLOC;
+                if (!s) {
+                    nxs_ext_schema_free(out);
+                    return NXS_ERR_ALLOC;
+                }
                 memcpy(s, start, len);
                 s[len] = '\0';
                 out->value_pool[i] = s;
@@ -622,7 +628,7 @@ int nxs_materialise_str_at(const uint8_t *data, size_t size, size_t off,
     if (!buf || buf_len == 0) return NXS_ERR_OUT_OF_BOUNDS;
     uint8_t sig = r->key_sigils[slot];
     if (is_promoted(ext, slot) || sig == NXS_SIGIL_KEYWORD) {
-        if (off + 2 > size) return NXS_ERR_OUT_OF_BOUNDS;
+        if (off > size || size - off < 2) return NXS_ERR_OUT_OF_BOUNDS;
         uint16_t idx = rd_u16(data + off);
         const char *s = value_pool_at(ext, idx);
         if (!s) return NXS_ERR_OUT_OF_BOUNDS;
@@ -634,7 +640,8 @@ int nxs_materialise_str_at(const uint8_t *data, size_t size, size_t off,
     }
     int prefix = str_len_prefix(ext, slot);
     size_t len = read_str_cell_len(data, size, off, prefix);
-    if (len == (size_t)-1 || off + (size_t)prefix + len > size)
+    if (len == (size_t)-1 || (size_t)prefix > size - off ||
+        len > size - off - (size_t)prefix)
         return NXS_ERR_OUT_OF_BOUNDS;
     size_t copy = len < buf_len - 1 ? len : buf_len - 1;
     memcpy(buf, data + off + (size_t)prefix, copy);

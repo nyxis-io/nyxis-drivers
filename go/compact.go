@@ -357,6 +357,9 @@ func precomputeDenseFixedOffsets(s *extendedSchema, p *rowCellPlan) ([]int, int)
 }
 
 func readStrCellLen(data []byte, off, prefixLen int) int {
+	if off < 0 || off+prefixLen > len(data) {
+		return -1
+	}
 	switch prefixLen {
 	case 2:
 		return int(binary.LittleEndian.Uint16(data[off : off+2]))
@@ -671,11 +674,23 @@ func deltaRecordOffset(data []byte, layout *deltaTailLayout, index int) int64 {
 }
 
 func materialiseStrAt(data []byte, off, slot int, s *extendedSchema) string {
+	if off < 0 || off >= len(data) {
+		return ""
+	}
 	if s.isPromoted(slot) {
-		idx := binary.LittleEndian.Uint16(data[off : off+2])
+		if off+2 > len(data) {
+			return ""
+		}
+		idx := int(binary.LittleEndian.Uint16(data[off : off+2]))
+		if idx < 0 || idx >= len(s.valuePool) {
+			return ""
+		}
 		return s.valuePool[idx]
 	}
 	prefix := s.strLenPrefix(slot)
 	l := readStrCellLen(data, off, prefix)
+	if l < 0 || off+prefix+l > len(data) {
+		return ""
+	}
 	return string(data[off+prefix : off+prefix+l])
 }
