@@ -313,7 +313,10 @@ int nxs_parse_extended_schema(const uint8_t *data, size_t size, size_t pos,
         }
     }
 
-    if (pos > size) return NXS_ERR_OUT_OF_BOUNDS;
+    if (pos > size) {
+        nxs_ext_schema_free(out);
+        return NXS_ERR_OUT_OF_BOUNDS;
+    }
     out->schema_end = pos;
     *end_out = pos;
     return NXS_OK;
