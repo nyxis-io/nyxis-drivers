@@ -29,6 +29,7 @@ const MAGIC_FOOTER = 0x2153584E; // NXS!
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
 const FLAG_COLUMNAR        = 0x0001;
 const FLAG_PAX             = 0x0004;
+const FLAG_V13_COMPACT_MASK = 0x01F0;
 const MAGIC_PAGE           = 0x4E585350; // NYSP
 
 const FOOTER_ROW_BYTES     = 12;
@@ -448,6 +449,9 @@ class Reader
         $flags         = rdU16($bytes, 6);
         $dictHash      = rdU64($bytes, 8);
         $preambleTail  = rdU64($bytes, 16);
+        if (($flags & FLAG_V13_COMPACT_MASK) !== 0) {
+            throw new NxsException('ERR_UNSUPPORTED_FLAGS: v1.3 compact preamble bits not implemented');
+        }
 
         // ── Footer check ───────────────────────────────────────────────────
         $footer = rdU32($bytes, $len - 4);

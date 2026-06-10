@@ -21,6 +21,7 @@ private const val MAGIC_FILE: Int = 0x4E595842.toInt()
 private const val MAGIC_OBJ: Int = 0x4E59584F.toInt()
 private const val MAGIC_FOOTER: Int = 0x2153584E.toInt()
 private const val FLAG_SCHEMA: Int = 0x0002
+private const val FLAG_V13_COMPACT_MASK: Int = 0x01F0
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +67,9 @@ class NxsReader
             flags = buf.getShort(6)
             dictHash = buf.getLong(8)
             tailPtr = buf.getLong(16)
+            if (flags.toInt() and FLAG_V13_COMPACT_MASK != 0) {
+                throw NxsError("ERR_UNSUPPORTED_FLAGS", "v1.3 compact preamble bits not implemented")
+            }
 
             val ks = mutableListOf<String>()
             val ki = mutableMapOf<String, Int>()

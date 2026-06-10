@@ -77,6 +77,7 @@ nxs_err_msg(nxs_err_t err)
     case NXS_ERR_INCOMPATIBLE: return "ERR_INCOMPATIBLE_FLAGS";
     case NXS_ERR_BAD_PAGE_MAGIC: return "ERR_INVALID_PAGE_MAGIC";
     case NXS_ERR_UNSUPPORTED: return "ERR_UNSUPPORTED";
+    case NXS_ERR_UNSUPPORTED_FLAGS: return "ERR_UNSUPPORTED_FLAGS";
     case NXS_ERR_UNSUPPORTED_TYPE: return "ERR_UNSUPPORTED_FIELD_TYPE";
     default: return "ERR_UNKNOWN";
     }

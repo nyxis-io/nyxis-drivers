@@ -30,6 +30,7 @@ static inline double rd_f64(const uint8_t *p) {
 #define MAGIC_FOOTER 0x2153584Eu
 #define FLAG_SCHEMA     0x0002u
 #define FLAG_COLUMNAR   0x0001u
+#define FLAG_V13_COMPACT_MASK 0x01F0u
 #define FLAG_PAX        0x0004u
 #define MAGIC_PAGE      0x4E585350u /* NXSP */
 
@@ -436,6 +437,8 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
     r->dict_hash= rd_u64(data + 8);
     r->tail_ptr = rd_u64(data + 16);
 
+    if (r->flags & FLAG_V13_COMPACT_MASK)
+        return NXS_ERR_UNSUPPORTED_FLAGS;
     if ((r->flags & FLAG_COLUMNAR) && (r->flags & FLAG_PAX))
         return NXS_ERR_INVALID_FLAGS;
     if ((r->flags & FLAG_COLUMNAR) && r->tail_ptr == 0)

@@ -27,6 +27,7 @@ const (
 	magicFooter uint32 = 0x2153584E // NXS!
 
 	flagSchemaEmbedded uint16 = 0x0002
+	flagV13CompactMask uint16 = 0x01F0
 )
 
 // Layout values are defined in col.go (LayoutRow, LayoutColumnar, LayoutPAX).
@@ -199,6 +200,9 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 		Flags:    binary.LittleEndian.Uint16(data[6:8]),
 		DictHash: binary.LittleEndian.Uint64(data[8:16]),
 		TailPtr:  binary.LittleEndian.Uint64(data[16:24]),
+	}
+	if r.Flags&flagV13CompactMask != 0 {
+		return nil, fmt.Errorf("ERR_UNSUPPORTED_FLAGS: v1.3 compact preamble bits 0x%04X", r.Flags&flagV13CompactMask)
 	}
 	// Schema
 	if r.Flags&flagSchemaEmbedded != 0 {

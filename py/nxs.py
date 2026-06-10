@@ -698,6 +698,13 @@ class NxsReader:
         self.dict_hash = _U64.unpack_from(self.mv, 8)[0]
         self.tail_ptr  = _U64.unpack_from(self.mv, 16)[0]
 
+        # v1.3 compact preamble bits (see nyxis/SPEC.md §12)
+        if self.flags & 0x01F0:
+            raise NxsError(
+                "ERR_UNSUPPORTED_FLAGS",
+                f"v1.3 compact preamble bits 0x{self.flags & 0x01F0:04x}",
+            )
+
         # Footer check
         footer = _U32.unpack_from(self.mv, len(self.mv) - 4)[0]
         if footer != MAGIC_FOOTER:

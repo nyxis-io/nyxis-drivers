@@ -50,6 +50,7 @@ const MAGIC_FOOTER = 0x2153584E; // NXS!
 
 const FLAG_COLUMNAR = 0x0001;
 const FLAG_PAX      = 0x0004;
+const FLAG_V13_COMPACT_MASK = 0x01f0;
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
 const FOOTER_COL_BYTES = 20;
 const FOOTER_PAX_BYTES = 28;
@@ -301,6 +302,9 @@ export class NxsReader {
 
     this.version   = this.view.getUint16(4, true);
     this.flags     = this.view.getUint16(6, true);
+    if (this.flags & FLAG_V13_COMPACT_MASK) {
+      throw new NxsError("ERR_UNSUPPORTED_FLAGS", "v1.3 compact preamble bits not implemented");
+    }
     this._layout   = "row";
     this.dictHash  = this.view.getBigUint64(8, true);
     this.tailPtr   = Number(this.view.getBigUint64(16, true));
@@ -369,6 +373,16 @@ export class NxsReader {
     } else {
       this._layout = "row";
       this._readTailIndex();
+      if (!this._sparse && this.recordCount > 0) {
+        const tailSpanLen = 4 + this.recordCount * 10;
+        if (this.tailPtr + tailSpanLen <= this.bytes.byteLength) {
+          this._tailView = new DataView(
+            this.bytes.buffer,
+            this.bytes.byteOffset + this.tailPtr,
+            tailSpanLen,
+          );
+        }
+      }
     }
 
     const bytes = this.bytes;
@@ -2428,7 +2442,12 @@ export class NxsCursor extends NxsObject {
     if (i < 0 || i >= this.reader.recordCount) {
       throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of range`);
     }
-    this._reset(rdU64AsNumber(this.reader.bytes, this.reader._tailStart + i * 10 + 2));
+    const tv = this.reader._tailView;
+    if (tv) {
+      this._reset(Number(tv.getBigUint64(4 + i * 10 + 2, true)));
+    } else {
+      this._reset(rdU64AsNumber(this.reader.bytes, this.reader._tailStart + i * 10 + 2));
+    }
     return this;
   }
 
