@@ -22,6 +22,12 @@ const SIGIL_KEYWORD = 0x24;
 const SIGIL_STR = 0x22;
 const SIGIL_TIME = 0x40;
 
+const _scratchBuf = new ArrayBuffer(8);
+const _scratchU8 = new Uint8Array(_scratchBuf);
+const _scratchF32 = new Float32Array(_scratchBuf);
+const _scratchF64 = new Float64Array(_scratchBuf);
+const _utf8Decoder = new TextDecoder("utf-8");
+
 function rdU16(bytes, off) {
   return byteAt(bytes, off) | (byteAt(bytes, off + 1) << 8);
 }
@@ -49,7 +55,7 @@ function decodeUtf8(bytes, offset, length) {
   let i = offset;
   while (i < end) {
     if (byteAt(bytes, i) & 0x80) {
-      return new TextDecoder("utf-8").decode(bytes.subarray(offset, end));
+      return _utf8Decoder.decode(bytes.subarray(offset, end));
     }
     i++;
   }
@@ -205,7 +211,7 @@ function precomputeDenseFixedOffsets(schema, plan) {
   const out = new Array(n).fill(null);
   let pos = 0;
   let varStart = null;
-  for (const fi of denseWireOrder(schema, plan)) {
+  for (const fi of plan.wireOrder) {
     if (plan.packedBools && plan.boolSlots.includes(fi)) {
       if (plan.firstBool === fi) {
         const bw = plan.boolWordBytes();
@@ -240,6 +246,7 @@ export class RowCellPlan {
     this.denseWireReorder = (flags & FLAG_DENSE_WIRE_REORDER) !== 0;
     this.boolSlots = boolSlots(schema);
     this.firstBool = this.boolSlots.length ? this.boolSlots[0] : null;
+    this.wireOrder = denseWireOrder(schema, this);
     if (this.denseWireReorder && this.denseAllowed) {
       const { denseFixedBodyOffsets, denseVarBodyStart } = precomputeDenseFixedOffsets(schema, this);
       this.denseFixedBodyOffsets = denseFixedBodyOffsets;
@@ -255,8 +262,8 @@ export class RowCellPlan {
     return Math.max(1, Math.ceil(this.boolSlots.length / 8));
   }
 
-  denseWireOrder(schema) {
-    return denseWireOrder(schema, this);
+  denseWireOrder(_schema) {
+    return this.wireOrder;
   }
 }
 
@@ -295,7 +302,7 @@ function advanceDensePastCell(data, bodyBase, pos, fi, schema, plan) {
 export function decodeIntCell(data, offset, width) {
   switch (width) {
     case 1:
-      return byteAt(data, offset);
+      return (byteAt(data, offset) << 24) >> 24;
     case 2: {
       const v = rdU16(data, offset);
       return v > 0x7fff ? v - 0x10000 : v;
@@ -314,19 +321,22 @@ export function decodeIntCell(data, offset, width) {
 
 export function decodeF64Cell(data, offset, width) {
   if (width === 4) {
-    const buf = new ArrayBuffer(4);
-    const u8 = new Uint8Array(buf);
-    u8[0] = byteAt(data, offset);
-    u8[1] = byteAt(data, offset + 1);
-    u8[2] = byteAt(data, offset + 2);
-    u8[3] = byteAt(data, offset + 3);
-    return new Float32Array(buf)[0];
+    _scratchU8[0] = byteAt(data, offset);
+    _scratchU8[1] = byteAt(data, offset + 1);
+    _scratchU8[2] = byteAt(data, offset + 2);
+    _scratchU8[3] = byteAt(data, offset + 3);
+    return _scratchF32[0];
   }
   if (width === 8) {
-    const buf = new ArrayBuffer(8);
-    const u8 = new Uint8Array(buf);
-    for (let i = 0; i < 8; i++) u8[i] = byteAt(data, offset + i);
-    return new Float64Array(buf)[0];
+    _scratchU8[0] = byteAt(data, offset);
+    _scratchU8[1] = byteAt(data, offset + 1);
+    _scratchU8[2] = byteAt(data, offset + 2);
+    _scratchU8[3] = byteAt(data, offset + 3);
+    _scratchU8[4] = byteAt(data, offset + 4);
+    _scratchU8[5] = byteAt(data, offset + 5);
+    _scratchU8[6] = byteAt(data, offset + 6);
+    _scratchU8[7] = byteAt(data, offset + 7);
+    return _scratchF64[0];
   }
   return undefined;
 }
@@ -405,35 +415,6 @@ function resolveSlotV12(data, objOffset, slot) {
   return objOffset + rel;
 }
 
-function sparseBitmaskEnd(data, objOffset, fieldCount) {
-  let p = objOffset + 9;
-  let cur = 0;
-  for (;;) {
-    const b = byteAt(data, p++);
-    for (let i = 0; i < 7; i++) {
-      cur++;
-      if (cur >= fieldCount) return p;
-    }
-    if ((b & 0x80) === 0) break;
-  }
-  return p;
-}
-
-function isBitSetSparse(data, objOffset, slot) {
-  let p = objOffset + 9;
-  let cur = 0;
-  for (;;) {
-    const b = byteAt(data, p++);
-    const bits = b & 0x7f;
-    for (let bit = 0; bit < 7; bit++) {
-      if (cur === slot) return ((bits >> bit) & 1) === 1;
-      cur++;
-    }
-    if ((b & 0x80) === 0) break;
-  }
-  return false;
-}
-
 function sparseOffsetTableSlots(presentSlots, plan) {
   if (!plan.packedBools) return presentSlots.slice();
   const out = [];
@@ -452,13 +433,34 @@ function sparseOffsetTableSlots(presentSlots, plan) {
 }
 
 function resolveSlotV13Sparse(data, objOffset, slot, schema, plan) {
-  if (!isBitSetSparse(data, objOffset, slot)) return null;
+  let p = objOffset + 9;
+  let cur = 0;
+  let slotPresent = false;
   const presentSlots = [];
-  for (let fi = 0; fi < schema.keys.length; fi++) {
-    if (isBitSetSparse(data, objOffset, fi)) presentSlots.push(fi);
+  const fieldCount = schema.keys.length;
+
+  let done = false;
+  while (!done) {
+    const b = byteAt(data, p++);
+    const bits = b & 0x7f;
+    for (let bit = 0; bit < 7; bit++) {
+      if ((bits >> bit) & 1) {
+        presentSlots.push(cur);
+        if (cur === slot) slotPresent = true;
+      }
+      cur++;
+      if (cur >= fieldCount) {
+        done = true;
+        break;
+      }
+    }
+    if ((b & 0x80) === 0) break;
   }
+
+  if (!slotPresent) return null;
+
   const otSlots = sparseOffsetTableSlots(presentSlots, plan);
-  const tableBase = sparseBitmaskEnd(data, objOffset, schema.keys.length);
+  const tableBase = p;
   if (plan.packedBools && plan.boolSlots.includes(slot)) {
     const boolTableFi = otSlots.find((fi) => plan.boolSlots.includes(fi));
     const tableIdx = otSlots.indexOf(boolTableFi);
