@@ -11,6 +11,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -28,9 +29,31 @@ typedef enum {
     NXS_ERR_INVALID_FLAGS  = 0x10,
     NXS_ERR_INCOMPATIBLE   = 0x11,
     NXS_ERR_UNSUPPORTED    = 0x12,
+    NXS_ERR_UNSUPPORTED_FLAGS = 0x14,
     NXS_ERR_BAD_PAGE_MAGIC = 0x13,
     NXS_ERR_UNSUPPORTED_TYPE = 0x15,
 } nxs_err_t;
+
+/** Preamble bits for v1.3 compact row encoding (reject if decoder < 1.3). */
+#define NXS_FLAG_V13_COMPACT_MASK 0x01F0u
+/** Cited in ERR_UNSUPPORTED_FLAGS when a v1.2 reader opens a compact file. */
+#define NXS_DECODER_MIN_V13 "1.3.0"
+
+/**
+ * Format ERR_UNSUPPORTED_FLAGS for v1.3 compact files into \p buf.
+ * Returns snprintf result (chars that would have been written).
+ */
+static inline int nxs_format_v13_compact_err(char *buf, size_t cap, uint16_t flags) {
+    if (cap == 0) {
+        return 0;
+    }
+    return snprintf(
+        buf,
+        cap,
+        "ERR_UNSUPPORTED_FLAGS: this file uses NXS v1.3 compact encoding (flags 0x%04x); upgrade your nyxis driver to >= %s",
+        (unsigned)(flags & NXS_FLAG_V13_COMPACT_MASK),
+        NXS_DECODER_MIN_V13);
+}
 
 typedef enum {
     NXS_LAYOUT_ROW = 0,

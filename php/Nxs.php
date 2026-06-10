@@ -29,6 +29,7 @@ const MAGIC_FOOTER = 0x2153584E; // NXS!
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
 const FLAG_COLUMNAR        = 0x0001;
 const FLAG_PAX             = 0x0004;
+const FLAG_V13_COMPACT_MASK = 0x01F0;
 const MAGIC_PAGE           = 0x4E585350; // NYSP
 
 const FOOTER_ROW_BYTES     = 12;
@@ -448,6 +449,15 @@ class Reader
         $flags         = rdU16($bytes, 6);
         $dictHash      = rdU64($bytes, 8);
         $preambleTail  = rdU64($bytes, 16);
+        if (($flags & FLAG_V13_COMPACT_MASK) !== 0) {
+            $bits = $flags & FLAG_V13_COMPACT_MASK;
+            throw new NxsException(
+                sprintf(
+                    'ERR_UNSUPPORTED_FLAGS: this file uses NXS v1.3 compact encoding (flags 0x%04x); upgrade your nyxis driver to >= 1.3.0',
+                    $bits,
+                ),
+            );
+        }
 
         // ── Footer check ───────────────────────────────────────────────────
         $footer = rdU32($bytes, $len - 4);

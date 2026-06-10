@@ -698,6 +698,15 @@ class NxsReader:
         self.dict_hash = _U64.unpack_from(self.mv, 8)[0]
         self.tail_ptr  = _U64.unpack_from(self.mv, 16)[0]
 
+        # v1.3 compact preamble bits (see nyxis/SPEC.md §12)
+        if self.flags & 0x01F0:
+            bits = self.flags & 0x01F0
+            raise NxsError(
+                "ERR_UNSUPPORTED_FLAGS",
+                f"this file uses NXS v1.3 compact encoding (flags 0x{bits:04x}); "
+                "upgrade your nyxis driver to >= 1.3.0",
+            )
+
         # Footer check
         footer = _U32.unpack_from(self.mv, len(self.mv) - 4)[0]
         if footer != MAGIC_FOOTER:

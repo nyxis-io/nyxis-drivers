@@ -30,6 +30,7 @@ module Nxs
   FLAG_COLUMNAR = 0x0001
   FLAG_PAX      = 0x0004
   FLAG_SCHEMA   = 0x0002
+  FLAG_V13_COMPACT_MASK = 0x01F0
 
   FOOTER_ROW_BYTES = 12
   FOOTER_COL_BYTES = 20
@@ -284,8 +285,15 @@ module Nxs
       raise NxsError.new('ERR_BAD_MAGIC', 'footer magic mismatch') if footer != MAGIC_FOOTER
 
       # Preamble: Version(2) + Flags(2) + DictHash(8) + TailPtr(8) + Reserved(8)
-      @flags         = @data.unpack1('@6 S<')
-      preamble_tail  = @data.unpack1('@16 Q<')
+      @flags = @data.unpack1('@6 S<')
+      if (@flags & FLAG_V13_COMPACT_MASK) != 0
+        bits = @flags & FLAG_V13_COMPACT_MASK
+        msg = "this file uses NXS v1.3 compact encoding (flags 0x#{bits.to_s(16).rjust(4, '0')}); " \
+              'upgrade your nyxis driver to >= 1.3.0'
+        raise NxsError.new('ERR_UNSUPPORTED_FLAGS', msg)
+      end
+
+      preamble_tail = @data.unpack1('@16 Q<')
       @tail_ptr       = preamble_tail
       layout_flags    = @flags & (FLAG_COLUMNAR | FLAG_PAX)
       if @tail_ptr.zero? && layout_flags.zero?

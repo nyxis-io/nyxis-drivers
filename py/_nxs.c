@@ -77,6 +77,7 @@ nxs_err_msg(nxs_err_t err)
     case NXS_ERR_INCOMPATIBLE: return "ERR_INCOMPATIBLE_FLAGS";
     case NXS_ERR_BAD_PAGE_MAGIC: return "ERR_INVALID_PAGE_MAGIC";
     case NXS_ERR_UNSUPPORTED: return "ERR_UNSUPPORTED";
+    case NXS_ERR_UNSUPPORTED_FLAGS: return "ERR_UNSUPPORTED_FLAGS";
     case NXS_ERR_UNSUPPORTED_TYPE: return "ERR_UNSUPPORTED_FIELD_TYPE";
     default: return "ERR_UNKNOWN";
     }
@@ -113,6 +114,13 @@ Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
     uint16_t flags = rd_u16(self->data + 6);
     self->tail_ptr = rd_u64(self->data + 16);
     self->schema_embedded = (flags & 0x0002) ? 1 : 0;
+
+    if (flags & NXS_FLAG_V13_COMPACT_MASK) {
+        char msg[256];
+        nxs_format_v13_compact_err(msg, sizeof msg, flags);
+        PyErr_SetString(PyExc_ValueError, msg);
+        return -1;
+    }
 
     if (rd_u32(self->data + self->size - 4) != MAGIC_FOOTER) {
         PyErr_SetString(PyExc_ValueError, "ERR_BAD_MAGIC: footer");

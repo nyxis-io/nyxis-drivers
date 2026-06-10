@@ -50,6 +50,7 @@ public sealed class NxsReader
     private const uint MagicFooter = 0x2153584Eu;
     private const uint MagicPage = 0x4E585350u;
     private const ushort FlagColumnar = 0x0001;
+    private const ushort FlagV13CompactMask = 0x01F0;
     private const ushort FlagPAX = 0x0004;
     private const ushort FlagSchema = 0x0002;
 
@@ -114,6 +115,13 @@ public sealed class NxsReader
         DictHash = RdU64(8);
         ulong preambleTail = RdU64(16);
         TailPtr = preambleTail;
+        if ((Flags & FlagV13CompactMask) != 0)
+        {
+            var bits = Flags & FlagV13CompactMask;
+            throw new NxsException(
+                "ERR_UNSUPPORTED_FLAGS",
+                $"this file uses NXS v1.3 compact encoding (flags 0x{bits:x4}); upgrade your nyxis driver to >= 1.3.0");
+        }
 
         if ((Flags & FlagColumnar) != 0 && (Flags & FlagPAX) != 0)
             throw new NxsException("ERR_INVALID_FLAGS", "columnar and PAX both set");
