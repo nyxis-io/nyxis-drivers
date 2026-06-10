@@ -436,7 +436,7 @@ nxs_err_t nxs_open(nxs_reader_t *r, const uint8_t *data, size_t size) {
     r->dict_hash= rd_u64(data + 8);
     r->tail_ptr = rd_u64(data + 16);
 
-    if (r->flags & FLAG_V13_COMPACT_MASK)
+    if (r->flags & NXS_FLAG_V13_COMPACT_MASK)
         return NXS_ERR_UNSUPPORTED_FLAGS;
     if ((r->flags & FLAG_COLUMNAR) && (r->flags & FLAG_PAX))
         return NXS_ERR_INVALID_FLAGS;
