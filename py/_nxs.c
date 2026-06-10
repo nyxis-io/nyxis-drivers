@@ -115,6 +115,13 @@ Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
     self->tail_ptr = rd_u64(self->data + 16);
     self->schema_embedded = (flags & 0x0002) ? 1 : 0;
 
+    if (flags & NXS_FLAG_V13_COMPACT_MASK) {
+        char msg[256];
+        nxs_format_v13_compact_err(msg, sizeof msg, flags);
+        PyErr_SetString(PyExc_ValueError, msg);
+        return -1;
+    }
+
     if (rd_u32(self->data + self->size - 4) != MAGIC_FOOTER) {
         PyErr_SetString(PyExc_ValueError, "ERR_BAD_MAGIC: footer");
         return -1;

@@ -30,7 +30,6 @@ static inline double rd_f64(const uint8_t *p) {
 #define MAGIC_FOOTER 0x2153584Eu
 #define FLAG_SCHEMA     0x0002u
 #define FLAG_COLUMNAR   0x0001u
-#define FLAG_V13_COMPACT_MASK 0x01F0u
 #define FLAG_PAX        0x0004u
 #define MAGIC_PAGE      0x4E585350u /* NXSP */
 

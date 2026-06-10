@@ -95,7 +95,11 @@ public final class NXSReader {
         version  = rdU16(data, 4)
         flags    = rdU16(data, 6)
         if (flags & flagV13CompactMask) != 0 {
-            throw NXSError.unsupportedFlags("v1.3 compact preamble bits not implemented")
+            let bits = flags & flagV13CompactMask
+            let hex = String(format: "%04x", bits)
+            let msg = "this file uses NXS v1.3 compact encoding (flags 0x\(hex)); "
+                + "upgrade your nyxis driver to >= 1.3.0"
+            throw NXSError.unsupportedFlags(msg)
         }
         dictHash = rdU64(data, 8)
         let preambleTailPtr = rdU64(data, 16)

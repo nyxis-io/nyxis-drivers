@@ -450,7 +450,13 @@ class Reader
         $dictHash      = rdU64($bytes, 8);
         $preambleTail  = rdU64($bytes, 16);
         if (($flags & FLAG_V13_COMPACT_MASK) !== 0) {
-            throw new NxsException('ERR_UNSUPPORTED_FLAGS: v1.3 compact preamble bits not implemented');
+            $bits = $flags & FLAG_V13_COMPACT_MASK;
+            throw new NxsException(
+                sprintf(
+                    'ERR_UNSUPPORTED_FLAGS: this file uses NXS v1.3 compact encoding (flags 0x%04x); upgrade your nyxis driver to >= 1.3.0',
+                    $bits,
+                ),
+            );
         }
 
         // ── Footer check ───────────────────────────────────────────────────

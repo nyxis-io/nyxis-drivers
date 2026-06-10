@@ -116,7 +116,12 @@ public sealed class NxsReader
         ulong preambleTail = RdU64(16);
         TailPtr = preambleTail;
         if ((Flags & FlagV13CompactMask) != 0)
-            throw new NxsException("ERR_UNSUPPORTED_FLAGS", "v1.3 compact preamble bits not implemented");
+        {
+            var bits = Flags & FlagV13CompactMask;
+            throw new NxsException(
+                "ERR_UNSUPPORTED_FLAGS",
+                $"this file uses NXS v1.3 compact encoding (flags 0x{bits:x4}); upgrade your nyxis driver to >= 1.3.0");
+        }
 
         if ((Flags & FlagColumnar) != 0 && (Flags & FlagPAX) != 0)
             throw new NxsException("ERR_INVALID_FLAGS", "columnar and PAX both set");

@@ -68,7 +68,12 @@ class NxsReader
             dictHash = buf.getLong(8)
             tailPtr = buf.getLong(16)
             if (flags.toInt() and FLAG_V13_COMPACT_MASK != 0) {
-                throw NxsError("ERR_UNSUPPORTED_FLAGS", "v1.3 compact preamble bits not implemented")
+                val bits = flags and 0x01F0
+                val hex = bits.toString(16).padStart(4, '0')
+                val msg =
+                    "this file uses NXS v1.3 compact encoding (flags 0x$hex); " +
+                        "upgrade your nyxis driver to >= 1.3.0"
+                throw NxsError("ERR_UNSUPPORTED_FLAGS", msg)
             }
 
             val ks = mutableListOf<String>()

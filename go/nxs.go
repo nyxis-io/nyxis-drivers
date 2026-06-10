@@ -202,7 +202,10 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 		TailPtr:  binary.LittleEndian.Uint64(data[16:24]),
 	}
 	if r.Flags&flagV13CompactMask != 0 {
-		return nil, fmt.Errorf("ERR_UNSUPPORTED_FLAGS: v1.3 compact preamble bits 0x%04X", r.Flags&flagV13CompactMask)
+		return nil, fmt.Errorf(
+			"ERR_UNSUPPORTED_FLAGS: this file uses NXS v1.3 compact encoding (flags 0x%04X); upgrade your nyxis driver to >= 1.3.0",
+			r.Flags&flagV13CompactMask,
+		)
 	}
 	// Schema
 	if r.Flags&flagSchemaEmbedded != 0 {

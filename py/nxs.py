@@ -700,9 +700,11 @@ class NxsReader:
 
         # v1.3 compact preamble bits (see nyxis/SPEC.md §12)
         if self.flags & 0x01F0:
+            bits = self.flags & 0x01F0
             raise NxsError(
                 "ERR_UNSUPPORTED_FLAGS",
-                f"v1.3 compact preamble bits 0x{self.flags & 0x01F0:04x}",
+                f"this file uses NXS v1.3 compact encoding (flags 0x{bits:04x}); "
+                "upgrade your nyxis driver to >= 1.3.0",
             )
 
         # Footer check
