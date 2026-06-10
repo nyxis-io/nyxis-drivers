@@ -65,6 +65,11 @@ type Reader struct {
 	colWarmed     map[int]bool
 	colOverlay    map[int][]byte
 	colFetches    int
+
+	extSchema *extendedSchema
+	cellPlan  *rowCellPlan
+	deltaTail *deltaTailLayout
+	schemaEnd int
 }
 
 type readerConfig struct {
@@ -201,19 +206,30 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 		DictHash: binary.LittleEndian.Uint64(data[8:16]),
 		TailPtr:  binary.LittleEndian.Uint64(data[16:24]),
 	}
-	if r.Flags&flagV13CompactMask != 0 {
-		return nil, fmt.Errorf(
-			"ERR_UNSUPPORTED_FLAGS: this file uses NXS v1.3 compact encoding (flags 0x%04X); upgrade your nyxis driver to >= 1.3.0",
-			r.Flags&flagV13CompactMask,
-		)
-	}
 	// Schema
 	if r.Flags&flagSchemaEmbedded != 0 {
-		schemaEnd, err := r.readSchema(32)
-		if err != nil {
-			return nil, err
+		if r.Flags&flagV13CompactMask != 0 {
+			schema, end, err := parseExtendedSchema(data, 32, r.Flags)
+			if err != nil {
+				return nil, err
+			}
+			r.extSchema = schema
+			r.cellPlan = newRowCellPlan(schema, r.Flags)
+			r.Keys = schema.keys
+			r.KeySigils = schema.sigils
+			r.keyIndex = make(map[string]int, len(schema.keys))
+			for i, k := range schema.keys {
+				r.keyIndex[k] = i
+			}
+			r.schemaEnd = end
+		} else {
+			schemaEnd, err := r.readSchema(32)
+			if err != nil {
+				return nil, err
+			}
+			r.schemaEnd = schemaEnd
 		}
-		if murmur3_64(data[32:schemaEnd]) != r.DictHash {
+		if murmur3_64(data[32:r.schemaEnd]) != r.DictHash {
 			return nil, fmt.Errorf("ERR_DICT_MISMATCH: schema hash mismatch")
 		}
 	}
@@ -227,6 +243,9 @@ func NewReader(data []byte, opts ...ReaderOption) (*Reader, error) {
 }
 
 func (r *Reader) recordByteOffset(i int) int64 {
+	if r.deltaTail != nil {
+		return deltaRecordOffset(r.data, r.deltaTail, i)
+	}
 	return int64(binary.LittleEndian.Uint64(r.data[r.tailStart+i*10+2 : r.tailStart+i*10+10]))
 }
 
@@ -381,7 +400,12 @@ func (r *Reader) Record(i int) *Object {
 	if r.prefetch != nil {
 		r.prefetch.onAccess(i)
 	}
-	abs := binary.LittleEndian.Uint64(r.data[r.tailStart+i*10+2 : r.tailStart+i*10+10])
+	var abs int64
+	if r.deltaTail != nil {
+		abs = deltaRecordOffset(r.data, r.deltaTail, i)
+	} else {
+		abs = int64(binary.LittleEndian.Uint64(r.data[r.tailStart+i*10+2 : r.tailStart+i*10+10]))
+	}
 	return &Object{reader: r, offset: int(abs)}
 }
 
@@ -498,6 +522,10 @@ func (o *Object) inlineRank(slot int) (bool, int) {
 
 // resolveSlot returns the absolute byte offset of slot's value, or -1 if absent.
 func (o *Object) resolveSlot(slot int) int {
+	if o.reader.extSchema != nil && o.reader.cellPlan != nil {
+		denseFrames := o.reader.Flags&flagDenseFrames != 0
+		return resolveFieldOffset(o.reader.data, o.offset, slot, o.reader.extSchema, o.reader.cellPlan, denseFrames)
+	}
 	if o.stage == 2 {
 		if o.present[slot] == 0 {
 			return -1
@@ -599,6 +627,9 @@ func (o *Object) GetI64BySlot(slot int) (int64, bool) {
 	if off < 0 {
 		return 0, false
 	}
+	if o.reader.extSchema != nil {
+		return decodeIntCell(o.reader.data, off, o.reader.extSchema.cellWidth(slot)), true
+	}
 	return int64(binary.LittleEndian.Uint64(o.reader.data[off : off+8])), true
 }
 
@@ -614,6 +645,9 @@ func (o *Object) GetF64BySlot(slot int) (float64, bool) {
 	if off < 0 {
 		return 0, false
 	}
+	if o.reader.extSchema != nil {
+		return decodeF64Cell(o.reader.data, off, o.reader.extSchema.cellWidth(slot)), true
+	}
 	return math.Float64frombits(binary.LittleEndian.Uint64(o.reader.data[off : off+8])), true
 }
 
@@ -624,6 +658,10 @@ func (o *Object) GetBoolBySlot(slot int) (bool, bool) {
 			return false, false
 		}
 		return cell[0] != 0, true
+	}
+	if o.reader.extSchema != nil && o.reader.cellPlan != nil &&
+		o.reader.cellPlan.packedBools && containsInt(o.reader.cellPlan.boolSlots, slot) {
+		return readPackedBool(o.reader.data, o.offset, slot, o.reader.extSchema, o.reader.cellPlan)
 	}
 	off := o.resolveSlot(slot)
 	if off < 0 {
@@ -642,6 +680,9 @@ func (o *Object) GetStrBySlot(slot int) (string, bool) {
 	off := o.resolveSlot(slot)
 	if off < 0 {
 		return "", false
+	}
+	if o.reader.extSchema != nil {
+		return materialiseStrAt(o.reader.data, off, slot, o.reader.extSchema), true
 	}
 	length := int(binary.LittleEndian.Uint32(o.reader.data[off : off+4]))
 	return string(o.reader.data[off+4 : off+4+length]), true

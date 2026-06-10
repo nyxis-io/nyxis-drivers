@@ -26,6 +26,7 @@ cc -O3 -Wall -Wextra -Wno-unknown-pragmas -fPIC \
    $LDFLAGS \
    _nxs.c \
    ../c/nxs.c \
+   ../c/compact.c \
    ../c/nxs_prefetch.c \
    ../c/nxs_column_prefetch.c \
    -o "$OUT"

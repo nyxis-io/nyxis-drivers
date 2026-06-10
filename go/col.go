@@ -59,6 +59,16 @@ func (r *Reader) parseLayoutTail() error {
 		}
 		r.TailPtr = binary.LittleEndian.Uint64(r.data[len(r.data)-footerRowBytes : len(r.data)-4])
 	}
+	if r.Flags&flagDeltaTail != 0 {
+		layout, err := parseDeltaTailLayout(r.data, int(r.TailPtr))
+		if err != nil {
+			return err
+		}
+		r.deltaTail = layout
+		r.recordCount = layout.recordCount
+		r.tailStart = int(r.TailPtr)
+		return nil
+	}
 	if int(r.TailPtr)+4 > len(r.data) {
 		return fmt.Errorf("ERR_OUT_OF_BOUNDS: tail index")
 	}

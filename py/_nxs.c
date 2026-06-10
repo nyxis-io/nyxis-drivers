@@ -115,13 +115,6 @@ Reader_init(ReaderObject *self, PyObject *args, PyObject *kwds)
     self->tail_ptr = rd_u64(self->data + 16);
     self->schema_embedded = (flags & 0x0002) ? 1 : 0;
 
-    if (flags & NXS_FLAG_V13_COMPACT_MASK) {
-        char msg[256];
-        nxs_format_v13_compact_err(msg, sizeof msg, flags);
-        PyErr_SetString(PyExc_ValueError, msg);
-        return -1;
-    }
-
     if (rd_u32(self->data + self->size - 4) != MAGIC_FOOTER) {
         PyErr_SetString(PyExc_ValueError, "ERR_BAD_MAGIC: footer");
         return -1;
@@ -226,6 +219,19 @@ object_layout_access(const ObjectView *self)
     if (!self->reader->has_nxs || self->reader->nxs.layout == NXS_LAYOUT_ROW)
         return 0;
     return !object_obj_at_nyxo(self);
+}
+
+/* Route field decode through c/nxs.c (columnar/PAX, v1.3 compact row, delta tail). */
+static int
+object_nxs_field_access(const ObjectView *self)
+{
+    if (!self->reader->has_nxs)
+        return 0;
+    if (self->layout_record)
+        return 1;
+    if (self->reader->nxs.layout != NXS_LAYOUT_ROW)
+        return object_layout_access(self);
+    return (self->reader->nxs.flags & NXS_FLAG_V13_COMPACT_MASK) != 0;
 }
 
 static int
@@ -335,7 +341,7 @@ resolve_slot(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_i64(ObjectView *self, PyObject *key)
 {
-    if (object_layout_access(self)) {
+    if (object_nxs_field_access(self)) {
         const char *k = PyUnicode_AsUTF8(key);
         if (!k) return NULL;
         nxs_object_t obj;
@@ -372,7 +378,7 @@ Object_get_i64(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_f64(ObjectView *self, PyObject *key)
 {
-    if (object_layout_access(self)) {
+    if (object_nxs_field_access(self)) {
         const char *k = PyUnicode_AsUTF8(key);
         if (!k) return NULL;
         nxs_object_t obj;
@@ -409,7 +415,7 @@ Object_get_f64(ObjectView *self, PyObject *key)
 static PyObject *
 Object_get_bool(ObjectView *self, PyObject *key)
 {
-    if (object_layout_access(self)) {
+    if (object_nxs_field_access(self)) {
         const char *k = PyUnicode_AsUTF8(key);
         if (!k) return NULL;
         nxs_object_t obj;
@@ -490,7 +496,7 @@ py_unicode_from_nxs_str(nxs_object_t *obj, const char *key)
 static PyObject *
 Object_get_str(ObjectView *self, PyObject *key)
 {
-    if (object_layout_access(self)) {
+    if (object_nxs_field_access(self)) {
         const char *k = PyUnicode_AsUTF8(key);
         if (!k) return NULL;
         nxs_object_t obj;
@@ -526,7 +532,7 @@ Object_get_str(ObjectView *self, PyObject *key)
 static PyObject *
 Object_field_offset_py(ObjectView *self, PyObject *key)
 {
-    if (object_layout_access(self)) {
+    if (object_nxs_field_access(self)) {
         Py_RETURN_NONE;
     }
     int slot = resolve_slot(self, key);
@@ -640,7 +646,9 @@ Reader_record(ReaderObject *self, PyObject *arg)
                      i, self->record_count);
         return NULL;
     }
-    if (self->has_nxs && self->nxs.layout != NXS_LAYOUT_ROW) {
+    if (self->has_nxs &&
+        (self->nxs.layout != NXS_LAYOUT_ROW ||
+         (self->nxs.flags & NXS_FLAG_V13_COMPACT_MASK))) {
         ObjectView *obj = make_object(self, i);
         if (!obj) return NULL;
         obj->record_index = (uint32_t)i;
