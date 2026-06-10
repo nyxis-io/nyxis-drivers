@@ -17,6 +17,21 @@
 import { AccessPatternDetector, PATTERN_SEQUENTIAL } from "./pattern.js";
 import { SparseBytes, byteAt } from "./sparse_bytes.js";
 import {
+  FLAG_V13_COMPACT_MASK,
+  FLAG_DELTA_TAIL,
+  FLAG_DENSE_FRAMES,
+  parseExtendedSchema,
+  RowCellPlan,
+  parseDeltaTailLayout,
+  deltaRecordOffset,
+  resolveFieldOffset,
+  decodeIntCell,
+  decodeF64Cell,
+  readPackedBool,
+  materialiseStrAt,
+  fieldCellWidth,
+} from "./compact.js";
+import {
   HINT_UNKNOWN,
   PageCache,
   InFlightMap,
@@ -25,7 +40,6 @@ import {
   pageIndicesForViewport,
   initialStrategy,
   rowDataSector,
-  rowRecordOffset,
   DEFAULT_MAX_PAGES,
   DEFAULT_PAGE_SIZE,
   DEFAULT_COALESCE_GAP_PAGES,
@@ -50,7 +64,6 @@ const MAGIC_FOOTER = 0x2153584E; // NXS!
 
 const FLAG_COLUMNAR = 0x0001;
 const FLAG_PAX      = 0x0004;
-const FLAG_V13_COMPACT_MASK = 0x01f0;
 const FLAG_SCHEMA_EMBEDDED = 0x0002;
 const FOOTER_COL_BYTES = 20;
 const FOOTER_PAX_BYTES = 28;
@@ -302,13 +315,10 @@ export class NxsReader {
 
     this.version   = this.view.getUint16(4, true);
     this.flags     = this.view.getUint16(6, true);
-    if (this.flags & FLAG_V13_COMPACT_MASK) {
-      const bits = this.flags & FLAG_V13_COMPACT_MASK;
-      throw new NxsError(
-        "ERR_UNSUPPORTED_FLAGS",
-        `this file uses NXS v1.3 compact encoding (flags 0x${bits.toString(16).padStart(4, "0")}); upgrade your nyxis driver to >= 1.3.0`,
-      );
-    }
+    this._v13Compact = (this.flags & FLAG_V13_COMPACT_MASK) !== 0;
+    this.extSchema = null;
+    this.cellPlan = null;
+    this._deltaTail = null;
     this._layout   = "row";
     this.dictHash  = this.view.getBigUint64(8, true);
     this.tailPtr   = Number(this.view.getBigUint64(16, true));
@@ -349,7 +359,20 @@ export class NxsReader {
     this.keys = [];
     this.keySigils = [];
     if (this.flags & FLAG_SCHEMA_EMBEDDED) {
-      this._readSchema(32);
+      if (this._v13Compact) {
+        const { schema, end } = parseExtendedSchema(this.bytes, 32, this.flags);
+        this.extSchema = schema;
+        this.keys = schema.keys;
+        this.keySigils = schema.sigils;
+        this.cellPlan = new RowCellPlan(schema, this.flags);
+        this._schemaEnd = end;
+        this.keyIndex = new Map();
+        for (let i = 0; i < this.keys.length; i++) {
+          this.keyIndex.set(this.keys[i], i);
+        }
+      } else {
+        this._readSchema(32);
+      }
       const computedHash = murmur3_64(this.bytes, 32, this._schemaEnd - 32);
       if (computedHash !== this.dictHash) {
         throw new NxsError("ERR_DICT_MISMATCH", "schema hash mismatch");
@@ -376,8 +399,14 @@ export class NxsReader {
       this._readPaxFooter();
     } else {
       this._layout = "row";
-      this._readTailIndex();
-      if (!this._sparse && this.recordCount > 0) {
+      if (this.flags & FLAG_DELTA_TAIL) {
+        this._deltaTail = parseDeltaTailLayout(this.bytes, this.tailPtr);
+        this.recordCount = this._deltaTail.recordCount;
+        this._tailStart = this.tailPtr;
+      } else {
+        this._readTailIndex();
+      }
+      if (!this._sparse && this.recordCount > 0 && !this._deltaTail) {
         const tailSpanLen = 4 + this.recordCount * 10;
         if (this.tailPtr + tailSpanLen <= this.bytes.byteLength) {
           this._tailView = new DataView(
@@ -531,7 +560,7 @@ export class NxsReader {
     pf.detector.observe(index);
     this._maybeUpgradeToEager();
     if (this._isEagerReady() || pf.strategy === "eager") return;
-    const off = rowRecordOffset(this.bytes, this._tailStart, index);
+    const off = this._rowRecordOffset(index);
     if (off != null) {
       this._touchPage(Math.floor(off / pf.pageSize));
     }
@@ -563,7 +592,7 @@ export class NxsReader {
     const predicted = pf.detector.predictNext(pf.prefetchDepth, this.recordCount);
     const pageSet = new Set();
     for (const idx of predicted) {
-      const off = rowRecordOffset(this.bytes, this._tailStart, idx);
+      const off = this._rowRecordOffset(idx);
       if (off != null) pageSet.add(Math.floor(off / pf.pageSize));
     }
     const missing = [...pageSet].filter((p) => !pf.cache.has(p) && !pf.inFlight.has(p));
@@ -886,6 +915,14 @@ export class NxsReader {
     p += 4;
     // Record array: [KeyID u16][AbsoluteOffset u64] × N
     this._tailStart = p;
+  }
+
+  /** Row-layout absolute NYXO offset for record `index` (classic or delta tail-index). */
+  _rowRecordOffset(index) {
+    if (this._deltaTail) {
+      return deltaRecordOffset(this.bytes, this._deltaTail, index);
+    }
+    return rdU64AsNumber(this.bytes, this._tailStart + index * 10 + 2);
   }
 
   _readColumnarFooter() {
@@ -1241,8 +1278,10 @@ export class NxsReader {
       return new NxsObject(this, i, i);
     }
     this._onAccess(i);
-    // Each tail-index entry: u16 keyId + u64 offset = 10 bytes
-    const absOffset = rdU64AsNumber(this.bytes, this._tailStart + i * 10 + 2);
+    const absOffset = this._rowRecordOffset(i);
+    if (absOffset == null) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} offset out of bounds`);
+    }
     return new NxsObject(this, absOffset);
   }
 
@@ -1263,10 +1302,8 @@ export class NxsReader {
   scan(fn) {
     const cur = new NxsCursor(this);
     const n = this.recordCount;
-    const bytes = this.bytes;
-    const tailStart = this._tailStart;
     for (let i = 0; i < n; i++) {
-      cur._reset(rdU64AsNumber(bytes, tailStart + i * 10 + 2));
+      cur._reset(this._rowRecordOffset(i));
       fn(cur, i);
     }
   }
@@ -2248,7 +2285,13 @@ export class NxsObject {
    * or -1 if absent.
    */
   _resolveSlot(slot) {
-    const bytes = this.reader.bytes;
+    const r = this.reader;
+    if (r.extSchema && r.cellPlan) {
+      const denseFrames = (r.flags & FLAG_DENSE_FRAMES) !== 0;
+      const off = resolveFieldOffset(r.bytes, this.offset, slot, r.extSchema, r.cellPlan, denseFrames);
+      return off == null ? -1 : off;
+    }
+    const bytes = r.bytes;
     if (this._stage === 2) {
       if (!this._present[slot]) return -1;
       return this.offset + rdU16(bytes, this._offsetTableStart + this._rank[slot] * 2);
@@ -2354,6 +2397,9 @@ export class NxsObject {
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
+    if (r.extSchema) {
+      return decodeIntCell(r.bytes, off, fieldCellWidth(r.extSchema, slot));
+    }
     return rdI64Safe(r.bytes, off);
   }
 
@@ -2368,6 +2414,9 @@ export class NxsObject {
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
+    if (r.extSchema) {
+      return decodeF64Cell(r.bytes, off, fieldCellWidth(r.extSchema, slot));
+    }
     return rdF64(r.bytes, off);
   }
 
@@ -2379,6 +2428,9 @@ export class NxsObject {
       const cell = r._colNumericBytes(ri, slot);
       if (!cell) return undefined;
       return cell[0] !== 0;
+    }
+    if (r.extSchema && r.cellPlan?.packedBools && r.cellPlan.boolSlots.includes(slot)) {
+      return readPackedBool(r.bytes, this.offset, slot, r.extSchema, r.cellPlan);
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
@@ -2393,6 +2445,9 @@ export class NxsObject {
     }
     const off = this._resolveSlot(slot);
     if (off < 0) return undefined;
+    if (r.extSchema) {
+      return materialiseStrAt(r.bytes, off, slot, r.extSchema);
+    }
     const bytes = r.bytes;
     return decodeUtf8Fast(bytes, off + 4, rdU32(bytes, off));
   }
@@ -2446,12 +2501,11 @@ export class NxsCursor extends NxsObject {
     if (i < 0 || i >= this.reader.recordCount) {
       throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} out of range`);
     }
-    const tv = this.reader._tailView;
-    if (tv) {
-      this._reset(Number(tv.getBigUint64(4 + i * 10 + 2, true)));
-    } else {
-      this._reset(rdU64AsNumber(this.reader.bytes, this.reader._tailStart + i * 10 + 2));
+    const off = this.reader._rowRecordOffset(i);
+    if (off == null) {
+      throw new NxsError("ERR_OUT_OF_BOUNDS", `record ${i} offset out of bounds`);
     }
+    this._reset(off);
     return this;
   }
 
