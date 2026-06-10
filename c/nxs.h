@@ -64,7 +64,9 @@ typedef enum {
 // ── Reader ────────────────────────────────────────────────────────────────────
 #define NXS_MAX_KEYS 256
 
-typedef struct {
+#include "compact.h"
+
+typedef struct nxs_reader_t {
     const uint8_t *data;
     size_t         size;
     uint16_t       version;
@@ -104,9 +106,16 @@ typedef struct {
     // scratch for key string copies
     char           _pool[NXS_MAX_KEYS * 64];
 
+    // v1.3 compact row decode (see compact.h / compact.c)
+    uint8_t        v13_compact;
+    nxs_ext_schema_t ext_schema;
+    nxs_cell_plan_t  cell_plan;
+    nxs_delta_tail_t delta_tail;
+    uint8_t        has_delta_tail;
+
     // adaptive prefetch (Phase 1); see nxs_prefetch.h
     struct nxs_prefetch_state *prefetch;
-} nxs_reader_t;
+} nxs_reader_t; /* struct tag matches compact.h forward declaration */
 
 // Open a reader over a memory-mapped / pre-loaded buffer.
 // The buffer must remain valid for the lifetime of the reader.

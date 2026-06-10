@@ -7,7 +7,7 @@ option(NXS_BUILD_BENCH "Build the NXS benchmark executable" ON)
 option(NXS_INSTALL     "Install NXS headers and library" ON)
 
 # ── Library ───────────────────────────────────────────────────────────────────
-add_library(nxs STATIC nxs.c nxs_prefetch.c)
+add_library(nxs STATIC nxs.c compact.c nxs_prefetch.c)
 target_include_directories(nxs PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
     $<INSTALL_INTERFACE:include>
@@ -15,7 +15,7 @@ target_include_directories(nxs PUBLIC
 set_target_properties(nxs PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
-    PUBLIC_HEADER nxs.h
+    PUBLIC_HEADER "nxs.h;compact.h"
 )
 
 # ── Test executable ───────────────────────────────────────────────────────────
@@ -39,7 +39,7 @@ if(NXS_INSTALL)
         ARCHIVE       DESTINATION ${CMAKE_INSTALL_LIBDIR}
         PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     )
-    install(FILES nxs.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    install(FILES nxs.h compact.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 # ── Package config ────────────────────────────────────────────────────────────
