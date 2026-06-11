@@ -287,6 +287,43 @@ test("stream reader compaction preserves parse cursor tail", () => {
   }
 });
 
+test("stream reader seals v1.3 compact fixture via finish()", () => {
+  const sr = new NxsStreamReader({ compactionEnabled: false });
+  sr.push(buf);
+  const r = sr.finish();
+  assertEq(r.recordCount, 1000, "compact stream seal count");
+  assertEq(r.record(42).getStr("username"), json[42].username, "compact stream seal field");
+});
+
+test("stream reader emits compact records before finish", () => {
+  const seen = [];
+  const sr = new NxsStreamReader({
+    compactionEnabled: false,
+    onRecord(obj, idx) {
+      seen.push({ idx, username: obj.getStr("username") });
+    },
+  });
+  let pushed = 0;
+  const step = 4096;
+  while (pushed < buf.length) {
+    const end = Math.min(pushed + step, buf.length);
+    sr.push(buf.subarray(pushed, end));
+    pushed = end;
+    if (seen.length >= 3) break;
+  }
+  if (seen.length === 0) {
+    throw new Error("expected compact records during incremental download");
+  }
+  assertEq(seen[0].username, json[0].username, "first streamed compact username");
+  while (pushed < buf.length) {
+    const end = Math.min(pushed + step, buf.length);
+    sr.push(buf.subarray(pushed, end));
+    pushed = end;
+  }
+  const r = sr.finish();
+  assertEq(r.recordCount, 1000, "compact stream finish count");
+});
+
 test("stream reader with compaction disabled can finish", () => {
   const schema = new NxsSchema(["id", "name"]);
   const w = new NxsWriter(schema);
