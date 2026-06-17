@@ -1406,7 +1406,7 @@ export class NxsReader {
   buildFieldIndex(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm?.fns.build_field_index) {
+    if (this._wasm?.fns.build_field_index && !this.extSchema) {
       return this._buildFieldIndexWasm(slot);
     }
     return this._buildFieldIndexJs(slot);
@@ -1465,7 +1465,7 @@ export class NxsReader {
    */
   batchResolveOffsets(slot, recordIndices) {
     const count = recordIndices.length;
-    if (this._wasm?.fns.batch_resolve_offsets) {
+    if (this._wasm?.fns.batch_resolve_offsets && !this.extSchema) {
       return this._batchResolveOffsetsWasm(slot, recordIndices);
     }
     const out = new Uint32Array(count);
@@ -1590,7 +1590,7 @@ export class NxsReader {
     }
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       return this._wasm.fns.sum_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1603,7 +1603,7 @@ export class NxsReader {
   minF64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       const v = this._wasm.fns.min_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1620,7 +1620,7 @@ export class NxsReader {
   maxF64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       const v = this._wasm.fns.max_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1637,7 +1637,7 @@ export class NxsReader {
   sumI64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       // WASM returns i64 which Node surfaces as BigInt; convert to Number
       // (safe for the fixture dataset).
       return Number(this._wasm.fns.sum_i64(
@@ -2219,7 +2219,12 @@ export class NxsFieldIndex {
   getBoolAt(i) {
     const off = this._off(i);
     if (off < 0) return undefined;
-    return this.reader.bytes[off] !== 0;
+    const r = this.reader;
+    if (r.extSchema && r.cellPlan?.packedBools && r.cellPlan.boolSlots.includes(this.slot)) {
+      const bitPos = r.cellPlan.boolSlots.indexOf(this.slot);
+      return ((r.bytes[off] >> (bitPos % 8)) & 1) === 1;
+    }
+    return r.bytes[off] !== 0;
   }
 }
 
