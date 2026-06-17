@@ -1406,13 +1406,16 @@ export class NxsReader {
   buildFieldIndex(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm?.fns.build_field_index) {
+    if (this._wasm?.fns.build_field_index && !this.extSchema) {
       return this._buildFieldIndexWasm(slot);
     }
     return this._buildFieldIndexJs(slot);
   }
 
   _buildFieldIndexJs(slot) {
+    if (this.extSchema) {
+      return this._buildFieldIndexCompact(slot);
+    }
     const layout = this._computeFastLayout(slot);
     if (!layout.present) return null;
     const n = this.recordCount;
@@ -1423,6 +1426,19 @@ export class NxsReader {
     for (let i = 0; i < n; i++) {
       const abs = rdU64AsNumber(bytes, tailStart + i * 10 + 2);
       offsets[i] = abs + rdU16(bytes, abs + offsetTablePos);
+    }
+    return new NxsFieldIndex(this, slot, offsets);
+  }
+
+  /** v1.3 compact row: resolve per-record value offsets via the compact cell plan. */
+  _buildFieldIndexCompact(slot) {
+    const n = this.recordCount;
+    const offsets = new Uint32Array(n);
+    const cur = this.cursor();
+    for (let i = 0; i < n; i++) {
+      cur.seek(i);
+      const off = cur._resolveSlot(slot);
+      offsets[i] = off < 0 ? ABSENT_OFFSET : off >>> 0;
     }
     return new NxsFieldIndex(this, slot, offsets);
   }
@@ -1449,7 +1465,7 @@ export class NxsReader {
    */
   batchResolveOffsets(slot, recordIndices) {
     const count = recordIndices.length;
-    if (this._wasm?.fns.batch_resolve_offsets) {
+    if (this._wasm?.fns.batch_resolve_offsets && !this.extSchema) {
       return this._batchResolveOffsetsWasm(slot, recordIndices);
     }
     const out = new Uint32Array(count);
@@ -1574,7 +1590,7 @@ export class NxsReader {
     }
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       return this._wasm.fns.sum_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1587,7 +1603,7 @@ export class NxsReader {
   minF64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       const v = this._wasm.fns.min_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1604,7 +1620,7 @@ export class NxsReader {
   maxF64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       const v = this._wasm.fns.max_f64(
         this._wasmDataBase, this._wasmSize,
         this._wasmTailStart,
@@ -1621,7 +1637,7 @@ export class NxsReader {
   sumI64(key) {
     const slot = this._slotOf(key);
     if (slot < 0) throw new NxsError("ERR_KEY", `key ${key} not in schema`);
-    if (this._wasm) {
+    if (this._wasm && !this.extSchema) {
       // WASM returns i64 which Node surfaces as BigInt; convert to Number
       // (safe for the fixture dataset).
       return Number(this._wasm.fns.sum_i64(
@@ -1963,6 +1979,9 @@ export class NxsStreamReader {
     this._schemaEnd = 0;
     this._nextOffset = 0;
     this._headerParsed = false;
+    this._v13Compact = false;
+    this.extSchema = null;
+    this.cellPlan = null;
     this._recordCount = 0;
     /** Bumped on each buffer slide so UIs can invalidate cached row views. */
     this.compactGeneration = 0;
@@ -2046,6 +2065,26 @@ export class NxsStreamReader {
     this.tailPtr = Number(this.view.getBigUint64(16, true));
     if ((this.flags & 0x0002) === 0) {
       throw new NxsError("ERR_DICT_MISMATCH", "stream reader requires embedded schema");
+    }
+
+    this._v13Compact = (this.flags & FLAG_V13_COMPACT_MASK) !== 0;
+    if (this._v13Compact) {
+      const { schema, end } = parseExtendedSchema(this.bytes, 32, this.flags);
+      if (end > this.bytes.length) return false;
+      this.extSchema = schema;
+      this.keys = schema.keys;
+      this.keySigils = schema.sigils;
+      this.cellPlan = new RowCellPlan(schema, this.flags);
+      this._schemaEnd = end;
+      this.keyIndex = new Map(this.keys.map((key, index) => [key, index]));
+      const computedHash = murmur3_64(this.bytes, 32, this._schemaEnd - 32);
+      if (computedHash !== this.dictHash) {
+        throw new NxsError("ERR_DICT_MISMATCH", "schema hash mismatch");
+      }
+      this._nextOffset = this._schemaEnd;
+      this._headerParsed = true;
+      this.onSchema?.(this.keys, this.keySigils);
+      return true;
     }
 
     const keyCount = this.view.getUint16(32, true);
@@ -2149,26 +2188,43 @@ export class NxsFieldIndex {
   getStrAt(i) {
     const off = this._off(i);
     if (off < 0) return undefined;
-    const bytes = this.reader.bytes;
+    const r = this.reader;
+    if (r.extSchema) {
+      return materialiseStrAt(r.bytes, off, this.slot, r.extSchema);
+    }
+    const bytes = r.bytes;
     return decodeUtf8Fast(bytes, off + 4, rdU32(bytes, off));
   }
 
   getF64At(i) {
     const off = this._off(i);
     if (off < 0) return undefined;
-    return rdF64(this.reader.bytes, off);
+    const r = this.reader;
+    if (r.extSchema) {
+      return decodeF64Cell(r.bytes, off, fieldCellWidth(r.extSchema, this.slot));
+    }
+    return rdF64(r.bytes, off);
   }
 
   getI64At(i) {
     const off = this._off(i);
     if (off < 0) return undefined;
-    return rdI64Safe(this.reader.bytes, off);
+    const r = this.reader;
+    if (r.extSchema) {
+      return decodeIntCell(r.bytes, off, fieldCellWidth(r.extSchema, this.slot));
+    }
+    return rdI64Safe(r.bytes, off);
   }
 
   getBoolAt(i) {
     const off = this._off(i);
     if (off < 0) return undefined;
-    return this.reader.bytes[off] !== 0;
+    const r = this.reader;
+    if (r.extSchema && r.cellPlan?.packedBools && r.cellPlan.boolSlots.includes(this.slot)) {
+      const bitPos = r.cellPlan.boolSlots.indexOf(this.slot);
+      return ((r.bytes[off] >> (bitPos % 8)) & 1) === 1;
+    }
+    return r.bytes[off] !== 0;
   }
 }
 
@@ -2332,9 +2388,18 @@ export class NxsObject {
 
   /** Decode all fields into a plain JS object (the eager path). */
   toObject() {
+    const r = this.reader;
+    if (r.extSchema) {
+      const obj = {};
+      for (const [key] of r.keyIndex) {
+        const v = this.get(key);
+        if (v !== undefined) obj[key] = v;
+      }
+      return obj;
+    }
     this._buildRankCache();
     const obj = {};
-    for (const [key, slot] of this.reader.keyIndex) {
+    for (const [key, slot] of r.keyIndex) {
       if (this._present[slot]) obj[key] = this.get(key);
     }
     return obj;
