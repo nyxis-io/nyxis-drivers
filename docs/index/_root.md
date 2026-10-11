@@ -15,6 +15,7 @@ MIT language SDKs for the NXS binary format (`.nxb`): zero-copy readers, slot-in
 | Read or write `.nxb` from Go | go/_root.md |
 | Go columnar/PAX layouts and `ColSumF64` | go/prefetch_col.md |
 | Go adaptive prefetch engine | go/prefetch_col.md |
+| Durable Go write-ahead log / standalone NYXO objects | go/wal.md |
 | Read or write `.nxb` in JavaScript (Node/browser) | js/_root.md |
 | JS prefetch, WASM compile, decode-to-`.nxs` | js/prefetch_compile.md |
 | Read or write `.nxb` in pure Python | py/_root.md |
@@ -53,13 +54,14 @@ MIT language SDKs for the NXS binary format (`.nxb`): zero-copy readers, slot-in
 | py/c_ext.md | normal | sensitive | `_nxs.c` uses buffer-protocol pointers over caller memory |
 | langs/ruby.md | normal | sensitive | `nxs_ext.c` inline LEB128 over Ruby string buffers |
 | langs/php.md | normal | sensitive | `nxs_ext.c` Zend lifecycle over PHP string data |
+| go/wal.md | normal | sensitive | Durability-critical: sync order, recovery truncation, sticky failure |
 
 ## Buildings
 
 | Subdomain | Description | Rooms |
 |-----------|-------------|-------|
 | c/ | C99 reader/writer, adaptive prefetch, column prefetch, benches, tests | reader.md, prefetch.md |
-| go/ | Go reader/writer, fast reducers, query, columnar/PAX, prefetch | reader.md, prefetch_col.md |
+| go/ | Go reader/writer, fast reducers, query, columnar/PAX, prefetch, WAL | reader.md, prefetch_col.md, wal.md |
 | js/ | ESM reader/writer, prefetch, WASM compile/decode, tests | reader.md, prefetch_compile.md |
 | py/ | Pure-Python reader/writer, C extension, prefetch | reader.md, c_ext.md, prefetch.md |
 | langs/ | Ruby, PHP, Kotlin, C#, Swift SDKs | ruby.md, php.md, kotlin.md, csharp.md, swift.md |

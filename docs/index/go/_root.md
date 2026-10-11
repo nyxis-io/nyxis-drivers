@@ -23,6 +23,8 @@ Source paths: go/
 | Run Go tests | reader.md |
 | Columnar/PAX layout or prefetch | prefetch_col.md |
 | Predicate queries over records | reader.md |
+| Encode/decode one NYXO object without a file | wal.md |
+| Durable append-only journal (`.nxsw` v2 WAL) | wal.md |
 
 ## Rooms
 
@@ -30,3 +32,4 @@ Source paths: go/
 |------|-------------|-------|
 | reader.md | go/nxs.go, fast.go, writer.go, query.go, nxs_test.go, query_test.go, bench_wal_test.go, cmd/bench/main.go | 8 |
 | prefetch_col.md | go/prefetch.go, pattern.go, column_prefetch.go, col.go, pax_stream.go, *_test.go | 9 |
+| wal.md | go/object.go, object_test.go, wal/*.go, wal/FORMAT.md | 15 |

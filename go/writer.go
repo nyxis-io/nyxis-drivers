@@ -127,8 +127,13 @@ func (w *Writer) Reset() {
 	if len(w.frames) != 0 {
 		panic("nxs: Reset with unclosed objects")
 	}
-	w.buf = w.buf[:0]
+	w.reset()
+}
+
+// reset is Reset without the unclosed-object check; it discards open frames.
+func (w *Writer) reset() {
 	w.frames = w.frames[:0]
+	w.buf = w.buf[:0]
 	w.recordOffsets = w.recordOffsets[:0]
 	for i := range w.slotSigils {
 		w.slotSigils[i] = sigilStr
