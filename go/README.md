@@ -80,7 +80,7 @@ w.EndObject()
 bytes := w.Finish()   // []byte
 
 // Convenience: write from a slice of maps
-bytes2 := nxs.WriterFromRecords(
+bytes2 := nxs.FromRecords(
     []string{"id", "username", "score"},
     []map[string]any{{"id": int64(1), "username": "bob", "score": 8.2}},
 )
@@ -101,6 +101,61 @@ _ = sw.Close()
 ```
 
 TypeManifest sigils match SPEC (`=`, `~`, `?`, `"`, `<`, `^`, `@`).
+
+## Standalone objects
+
+`ObjectEncoder` builds one NYXO object without a file preamble or tail-index; its bytes equal the object region `Writer` emits for the same record. A standalone object carries no schema header, so sigils are fixed per slot up front. A write whose sigil differs from the slot's, an out-of-range slot, or a slot written twice makes `Bytes` return an error.
+
+```go
+keys := []string{"id", "name", "seen_at"}
+sigils := []byte{'=', '"', '@'}
+
+enc := nxs.NewObjectEncoder(keys, sigils)
+enc.WriteI64(0, 42)
+enc.WriteStr(1, "alice")
+enc.WriteTime(2, time.Now().UnixNano())
+obj, err := enc.Bytes() // valid until enc.Reset()
+
+o, err := nxs.DecodeObject(keys, sigils, obj) // bounds-checks every field
+name, ok := o.GetStr("name")
+seen, _ := o.GetTime("seen_at")
+_, ok = o.GetStr("not_in_schema") // ok == false
+```
+
+Use `NewObjectDecoder(keys, sigils)` to decode many objects that share a schema. `Object` also gains `GetBytes` (`<`), `GetTime` (`@`), and `Has` (presence; the value of a `^` slot).
+
+## Write-ahead log (`wal`)
+
+Package `github.com/nyxis-io/nyxis-drivers/go/wal` is a durable append-only log of NYXO objects (`.nxsw` v2) for use as an ingestion journal. Records are CRC32C-framed, acknowledged only after a sync covers them, and recovered after a crash by truncating the torn tail of the live segment. See [`wal/FORMAT.md`](wal/FORMAT.md) for the layout, recovery rules, and failure semantics.
+
+```go
+import "github.com/nyxis-io/nyxis-drivers/go/wal"
+
+schema := wal.Schema{Fields: []wal.Field{
+    {Key: "id", Sigil: '='},
+    {Key: "body", Sigil: '"'},
+}}
+w, report, err := wal.Open("data/journal", schema, wal.Options{}) // SyncGroup by default
+defer w.Close()
+
+off, err := w.Append(ctx, func(rec *nxs.ObjectEncoder) {
+    rec.WriteI64(0, 1)
+    rec.WriteStr(1, "hello")
+}) // returns once the record is durable
+
+s, err := wal.OpenScanner("data/journal", wal.Offset{}) // or w.NewLiveScanner(after)
+for s.Next() {
+    id, _ := s.Record().GetI64("id")
+    _ = id
+}
+err = s.Err()
+```
+
+- **Sync policies.** `SyncGroup` (default): one flusher writes everything queued while the previous sync ran, then syncs once; `GroupWindow` adds an optional wait to grow batches. `SyncEachAppend`: one sync per append. `SyncManual`: appends become durable on `Sync`.
+- **Sticky failure.** After any short write or sync error, `Append`, `Sync`, and `Rotate` return `ErrWALFailed`. `Close` truncates the live segment to the durable end (retry it if it errors), then `Open` again.
+- **Schema evolution.** Opening with the previous schema plus trailing fields seals the live segment and starts a new one. Older records read new keys as absent. Upgrades are roll-forward only: an older binary gets `ErrSchemaMismatch`.
+- **Exclusive access.** `Open` holds an `flock` on `<dir>/LOCK`; a second opener gets `ErrLocked`. `OpenScanner` does not lock.
+- **Platforms.** Linux uses `fdatasync`; darwin uses `F_FULLFSYNC` (via `os.File.Sync`). Locking is implemented for Linux and darwin.
 
 ## Query engine
 
@@ -141,6 +196,9 @@ city, _ := obj.GetStrPath("address.city")
 
 ```bash
 go test ./...
+go test -race ./wal/
+go test -run TestCrash_NoAckedRecordLost -wal.crash.iters=10000 ./wal/   # nightly crash run
+go test -run '^$' -bench . ./wal/                                          # WAL throughput and latency
 ```
 
 ## Benchmarks
@@ -163,6 +221,8 @@ cargo run --release --bin gen_fixtures -- ../js/fixtures 1000000
 | `nxs.go` | Reader, schema parsing, tail-index, field accessors |
 | `fast.go` | Uniform-schema fast path and parallel reducers |
 | `writer.go` | `NxsWriter` / `NxsSchema` — direct binary writer |
+| `object.go` | `ObjectEncoder` / `DecodeObject` — standalone NYXO objects |
+| `wal/` | `.nxsw` v2 write-ahead log (`FORMAT.md`, recovery, group commit) |
 | `nxs_test.go` | Test suite |
 | `cmd/bench/main.go` | Benchmark binary |
 
