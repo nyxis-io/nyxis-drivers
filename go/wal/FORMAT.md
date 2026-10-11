@@ -51,9 +51,12 @@ frame := [payload_len u32][crc32c(payload) u32][payload]
 - `payload` is one NYXO object as produced by `nxs.ObjectEncoder`; objects are
   always a multiple of 8 bytes, so frames stay 8-byte aligned.
 - `crc32c` is Castagnoli (`hash/crc32.MakeTable(crc32.Castagnoli)`).
-- A frame is valid when `8 <= payload_len <= MaxRecordBytes`, `payload_len` is
-  a multiple of 8, the whole payload is present, the CRC matches, and the
-  payload decodes as an object of the segment schema.
+- A frame is valid when `payload_len >= 8`, `payload_len` is a multiple of 8,
+  the whole payload is present, and the CRC matches. A CRC-valid payload that
+  does not decode as an object of the segment schema is corruption.
+- `Append` rejects records larger than `MaxRecordBytes` (`ErrRecordTooLarge`).
+  Recovery does not use that option, so reopening with a smaller limit can
+  never truncate frames that were acknowledged under a larger one.
 - An `Offset` is `(segment, pos)` where `pos` is the byte offset of the frame
   header in the segment file. The zero `Offset` precedes every record.
 
